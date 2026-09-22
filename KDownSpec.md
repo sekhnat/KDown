@@ -1359,30 +1359,62 @@ Lease IDs/generation numbers prevent stale worker callbacks from mutating newly 
 
 ## 32. Transport abstraction
 
-Conceptual interface:
+The transport boundary has two layers: the production wire adapter and the
+HTTP execution seam.
+
+The production wire adapter owns TLS, redirects and credential forwarding,
+proxy behavior, connection pooling, HTTP/2 multiplexing, request framing,
+and wire parsing. Tests whose evidence depends on those behaviors or on
+malformed wire input must exercise a real network server and this adapter.
+
+The HTTP execution seam is a transport-independent port above the wire
+adapter. Job orchestration depends on this seam instead of the concrete
+client, connection, response-body, or framing types:
 
 ```text
-Transport {
-    probe(request, cancellation) -> ResourceMetadata
+HttpExecutor {
+    probe(request, cancellation)
+        -> ProbeOutcome            // metadata + HTTP notices
+     | HttpFailure                 // classified error + retry timing + challenge
 
-    open_range(
-        request,
-        range,
-        validators,
-        cancellation
-    ) -> ByteStreamWithResponseMetadata
-
-    open_full(
-        request,
-        validators,
-        cancellation
-    ) -> ByteStreamWithResponseMetadata
+    transfer(request{spec, intent}, cancellation)
+        -> TransferResponse        // accepted start/end, total, validators, body
+     | HttpFailure
 }
 ```
 
-The scheduler must not contain HTTP-specific header parsing.
+`TransferIntent` is either a fresh full representation or a validated byte
+range carrying the inclusive requested range, the established total, the
+expected validators (issued conditionally with `If-Range` when present),
+and the full-response classification policy.
 
-Transport must return enough metadata for job-level validation before body bytes are accepted.
+The seam owns, for both sequential and segmented transfers, one shared
+status-to-error mapping, retry-timing (`Retry-After`) extraction,
+authentication-challenge extraction, range metadata validation (200/206
+intent rules, start/end/total conflicts), resource-generation validation,
+and range body-overrun rejection. Metadata validation completes before any
+body chunk is delivered to job orchestration.
+
+Body delivery is bounded and transport-neutral: the seam returns a body
+handle that yields zero-copy `bytes::Bytes` chunks strictly on demand (no
+chunk is fetched before the consumer requests the next one), interrupts a
+pending read on cancellation or pause (a pause resumes the same owned
+source byte-exact), and classifies read-idle timeouts with the engine's
+configured interval in both transfer modes.
+
+Job orchestration keeps retry budgets, backoff scheduling, bounded
+credential-provider decisions, coordinated origin backoff, sink writes,
+checkpointing, and state transitions. Segmented selection uses the single
+eligibility decision carried by the returned probe metadata
+(`segment_eligible`) and must not reconstruct that formula.
+
+Two adapters implement the port: the production wire adapter, and a
+deterministic scripted adapter for orchestration tests that performs no
+work and opens no sockets. The scripted adapter produces successful
+metadata and chunks, retryable failures with retry timing, authentication
+challenges, explicit idle timeouts, body faults after any delivered
+prefix, cancellation waits, and validator or total-size changes without
+wall-clock delays.
 
 ---
 

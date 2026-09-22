@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{DurabilityMode, EngineConfig};
-use crate::control::retry::{parse_retry_after, RetryClassifier, RetryDecision};
+use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
 use crate::http::probe::ProbeMetadata;
-use crate::http::range::{validate_range_response, RejectionKind};
-use crate::http::transport::{HttpTransport, RequestSpec};
+use crate::http::{
+    BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, RequestSpec,
+    TransferIntent, TransferRequest,
+};
 use crate::io::sink::{FileSink, FlushLevel, Sink as _};
 use crate::job::controller::{DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
@@ -192,7 +194,7 @@ pub struct SegmentedOutcome {
 /// condition; verification and commit stay with the caller (§16/§14.6).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_segmented(
-    transport: HttpTransport,
+    execution: HttpExecution,
     config: &EngineConfig,
     request: &DownloadRequest,
     state: &Arc<StateMachine>,
@@ -242,7 +244,7 @@ pub(crate) async fn run_segmented(
     let worker_count = job.desired_workers() as usize;
     let mut handles = Vec::with_capacity(worker_count);
     for worker_idx in 0..worker_count {
-        let transport = transport.clone();
+        let execution = execution.clone();
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
         let sink = Arc::clone(&sink);
@@ -260,7 +262,7 @@ pub(crate) async fn run_segmented(
         let identity_owned = identity.to_string();
         handles.push(tokio::spawn(async move {
             worker_loop(
-                transport,
+                execution,
                 classifier,
                 job,
                 sink,
@@ -381,10 +383,26 @@ enum WorkerError {
     GenerationChanged(DownloadError),
 }
 
+/// Map one classified HTTP failure (§32) onto the worker error taxonomy:
+/// generation changes invalidate the whole job (§26); non-retryable
+/// failures abort it; everything else retries the absorbed tail (§17.3)
+/// with the server-provided timing when present (§17.2).
+fn worker_error_from_failure(
+    error: DownloadError,
+    retry_after: Option<Duration>,
+    classifier: &RetryClassifier,
+) -> WorkerError {
+    match error.category() {
+        crate::error::ErrorCategory::ResourceChanged => WorkerError::GenerationChanged(error),
+        _ if classifier.retryable(&error) => WorkerError::Retryable { error, retry_after },
+        _ => WorkerError::Fatal(error),
+    }
+}
+
 /// The worker loop (§13 steps 1-10).
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
-    transport: HttpTransport,
+    execution: HttpExecution,
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
     sink: Arc<AsyncMutex<FileSink>>,
@@ -467,7 +485,7 @@ async fn worker_loop(
             .await;
 
         let result = transfer_lease(
-            &transport,
+            &execution,
             &classifier,
             &job,
             &lease,
@@ -578,11 +596,13 @@ async fn worker_loop(
     }
 }
 
-/// Transfer one lease: range request -> validated body -> positional
-/// writes -> progress reporting.
+/// Transfer one lease: semantic ranged transfer (§32) -> validated body ->
+/// positional writes -> progress reporting. The HTTP layer validates
+/// status/range/generation before the body is returned; the worker only
+/// consumes semantic chunks and decides retry/coordination policy.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_lease(
-    transport: &HttpTransport,
+    execution: &HttpExecution,
     classifier: &RetryClassifier,
     job: &Arc<SegmentedJob>,
     lease: &SegmentLease,
@@ -624,67 +644,44 @@ async fn transfer_lease(
     } else {
         lease.next_offset
     };
-
-    let mut spec = RequestSpec {
+    // Semantic ranged transfer (§32): the intent carries the requested
+    // range, established total, and expected validators (generation
+    // identity, §5.2); HTTP validates the response before any body byte.
+    let spec = RequestSpec {
         url: req_spec.url.clone(),
         headers: req_spec.headers.clone(),
         identity_encoding: req_spec.identity_encoding,
         ..RequestSpec::default()
     };
-    spec.range = Some((start_from, lease.end));
-    // Conditional request for tail retries (§11.3): the strongest validator
-    // protects against generation mixing.
-    if start_from > 0 {
-        spec.validators = Some(job.validators.clone());
-    }
+    let intent = TransferIntent::Range(RangeIntent {
+        range: (start_from, lease.end),
+        established_total: Some(job.total_size),
+        // Expected validators issue the request conditionally (If-Range,
+        // §11.3) and reject generation mixing (§26).
+        expected_validators: Some(job.validators.clone()),
+        full_response: FullResponsePolicy::InvalidRange,
+    });
     let cancel = job.cancel.clone();
-    let mut resp = transport
-        .get_range(&spec, (start_from, lease.end), &cancel)
+    let response = match execution
+        .transfer(TransferRequest { spec, intent }, &cancel)
         .await
-        .map_err(|e| WorkerError::Retryable {
-            error: e,
-            retry_after: None,
-        })?;
-
-    // Metadata validation before body acceptance (§32, §11.2).
-    let established_total = Some(job.total_size);
-    let expected_validators = Some(&job.validators);
-    let validated = validate_range_response(
-        (start_from, lease.end),
-        &resp,
-        established_total,
-        expected_validators,
-    )
-    .map_err(|rej| match rej.kind {
-        RejectionKind::GenerationChanged => WorkerError::GenerationChanged(rej.into_error()),
-        RejectionKind::FullResponseToNonzeroRange => {
-            // Segmented mode cannot proceed: abort for the job (§11.2).
-            WorkerError::Fatal(rej.into_error())
+    {
+        Ok(r) => r,
+        Err(HttpFailure {
+            error, retry_after, ..
+        }) => {
+            return Err(worker_error_from_failure(error, retry_after, classifier));
         }
-        RejectionKind::UnexpectedStatus => {
-            let err = rej.into_error();
-            if classifier.retryable(&err) {
-                let ra = parse_retry_after(resp.header("retry-after"));
-                WorkerError::Retryable {
-                    error: err,
-                    retry_after: ra,
-                }
-            } else {
-                WorkerError::Fatal(err)
-            }
-        }
-        _ => WorkerError::Fatal(rej.into_error()),
-    })?;
-
-    let accepted_len = validated.end - validated.start + 1;
+    };
+    let validated_start = response.start;
+    let validated_end = response.end;
+    let accepted_len = validated_end - validated_start + 1;
     let mut in_range_offset: u64 = 0;
     let mut last_checkpoint = Instant::now();
-    use http_body_util::BodyExt;
-    let Some(mut body) = resp.body() else {
-        return Err(WorkerError::Fatal(DownloadError::Protocol(
-            "range response lost its body".into(),
-        )));
-    };
+    // Bounded body (§32): the configured read-idle policy and overrun
+    // rejection live inside the body; the worker consumes one chunk at a
+    // time and never sees frame types.
+    let mut body = response.body;
     loop {
         if job.cancel.is_cancelled() {
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
@@ -692,76 +689,69 @@ async fn transfer_lease(
         if job.fatal.lock().await.is_some() {
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
         }
-        let frame = tokio::time::timeout(DEFAULT_READ_IDLE, body.frame())
-            .await
-            .map_err(|_| WorkerError::Retryable {
-                error: DownloadError::Connection("read idle timeout".into()),
-                retry_after: None,
-            })?;
-        let Some(frame) = frame else {
-            break; // clean EOF
-        };
-        let data = match frame {
-            Ok(frame) => frame.into_data().map_err(|_| {
-                WorkerError::Fatal(DownloadError::Protocol("unexpected trailer frame".into()))
-            })?,
-            Err(e) => {
-                return Err(WorkerError::Retryable {
-                    error: classify_body(&e.to_string()),
-                    retry_after: None,
-                });
+        match body.next_chunk(&job.cancel).await {
+            Ok(BodyEvent::Data(data)) => {
+                // Write at the absolute offset (positional, §14.2). Rate
+                // tokens first: payload bytes only (§18.2).
+                let abs_offset = validated_start + in_range_offset;
+                job.acquire_rate(data.len() as u64).await;
+                {
+                    let mut s = sink.lock().await;
+                    s.write_at(abs_offset, &data)
+                        .map_err(|se| WorkerError::Fatal(se.0))?;
+                    s.flush(FlushLevel::PageCache).ok();
+                }
+                if let Some(w) = job.counters_slot() {
+                    w.add_network(data.len() as u64);
+                    // Unique completed bytes: only newly-acknowledged file
+                    // bytes count (§19.1, invariant 5).
+                    w.add_completed(data.len() as u64);
+                }
+                in_range_offset += data.len() as u64;
+
+                // Hot-path progress (§13.3, task 6.3): publish the
+                // durable-through offset with Relaxed atomics into this
+                // worker's cell — no scheduler lock on the chunk path. The
+                // scheduler reconciles at lease boundaries and the
+                // checkpoint cadence.
+                let durable_through = validated_start + in_range_offset;
+                job.worker_progress[worker_idx].publish(
+                    lease.id,
+                    lease.generation,
+                    lease.start,
+                    durable_through,
+                );
+
+                // Checkpoint cadence (§15.4): completed ranges only; this is
+                // a lease-boundary-quality reconciliation where the scheduler
+                // lock is taken once per interval, not per chunk (§13.3).
+                if last_checkpoint.elapsed() >= checkpoint_interval {
+                    last_checkpoint = Instant::now();
+                    let ranges = {
+                        let mut sched = job.scheduler.lock().await;
+                        sched.absorb_worker_progress(&job.worker_progress);
+                        sched.completed_ranges()
+                    };
+                    persist_checkpoint(store, identity, job, ranges);
+                }
             }
-        };
-        // Body overrun detection (§11.2).
-        if crate::http::range::body_overrun(in_range_offset, data.len() as u64, accepted_len) {
-            return Err(WorkerError::Fatal(DownloadError::InvalidRangeResponse(
-                format!(
-                    "response body exceeds accepted range [{}, {}]",
-                    validated.start, validated.end
-                ),
-            )));
-        }
-        // Write at the absolute offset (positional, §14.2). Rate tokens
-        // first: payload bytes only (§18.2).
-        let abs_offset = validated.start + in_range_offset;
-        job.acquire_rate(data.len() as u64).await;
-        {
-            let mut s = sink.lock().await;
-            s.write_at(abs_offset, &data)
-                .map_err(|se| WorkerError::Fatal(se.0))?;
-            s.flush(FlushLevel::PageCache).ok();
-        }
-        if let Some(w) = job.counters_slot() {
-            w.add_network(data.len() as u64);
-            // Unique completed bytes: only newly-acknowledged file bytes
-            // count (§19.1, invariant 5).
-            w.add_completed(data.len() as u64);
-        }
-        in_range_offset += data.len() as u64;
-
-        // Hot-path progress (§13.3, task 6.3): publish the durable-through
-        // offset with Relaxed atomics into this worker's cell — no
-        // scheduler lock on the chunk path. The scheduler reconciles at
-        // lease boundaries and the checkpoint cadence.
-        let durable_through = validated.start + in_range_offset;
-        job.worker_progress[worker_idx].publish(
-            lease.id,
-            lease.generation,
-            lease.start,
-            durable_through,
-        );
-
-        // Checkpoint cadence (§15.4): completed ranges only; this is a
-        // lease-boundary-quality reconciliation where the scheduler lock is
-        // taken once per interval, not per chunk (§13.3).
-        if last_checkpoint.elapsed() >= checkpoint_interval {
-            last_checkpoint = Instant::now();
-            let ranges = {
-                let mut sched = job.scheduler.lock().await;
-                sched.absorb_worker_progress(&job.worker_progress);
-                sched.completed_ranges()
-            };
-            persist_checkpoint(store, identity, job, ranges);
+            Ok(BodyEvent::End) => break, // clean EOF
+            Ok(BodyEvent::Paused) => {
+                // §9.3: pause interrupts body delivery; settle the current
+                // state and wait, then resume the same owned source.
+                while job.cancel.is_paused() && !job.cancel.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if job.cancel.is_cancelled() {
+                    return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                }
+            }
+            Err(e) => {
+                // Body faults (reset, truncation, idle timeout, overrun)
+                // arrive classified (§32); the worker maps them onto the
+                // shared retry/coordination policy.
+                return Err(worker_error_from_failure(e, None, classifier));
+            }
         }
     }
     // Final acknowledgment: everything accepted is written. Reconcile this
@@ -769,14 +759,14 @@ async fn transfer_lease(
     {
         let mut sched = job.scheduler.lock().await;
         sched.absorb_worker_progress(&job.worker_progress);
-        let _ = sched.report_progress(lease.id, lease.generation, validated.start + accepted_len);
+        let _ = sched.report_progress(lease.id, lease.generation, validated_start + accepted_len);
     }
     job.worker_progress[worker_idx].clear();
     job.hub
         .emit(crate::metrics::events::Event::SegmentCompleted {
             worker: lease.id as usize,
-            start: validated.start,
-            end: validated.end,
+            start: validated_start,
+            end: validated_end,
         })
         .await;
     Ok(())
@@ -799,17 +789,4 @@ fn persist_checkpoint(
     cp.validators = job.validators.clone();
     cp.completed_ranges = ranges;
     let _ = store.save_atomic(&cp);
-}
-
-/// Default read idle timeout used by the worker loop.
-const DEFAULT_READ_IDLE: Duration = Duration::from_secs(30);
-
-fn classify_body(msg: &str) -> DownloadError {
-    if msg.contains("incomplete") || msg.contains("connection closed") || msg.contains("reset") {
-        DownloadError::Connection(msg.to_string())
-    } else if msg.contains("timed out") {
-        DownloadError::Connection("read timeout".into())
-    } else {
-        DownloadError::Connection(msg.to_string())
-    }
 }

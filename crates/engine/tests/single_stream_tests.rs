@@ -7,7 +7,10 @@ mod support;
 use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm, IntegrityPolicy};
+use kdown_engine::http::probe::ProbeMetadata;
+use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
+use kdown_engine::http::HttpExecution;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes, sha256_hex};
 use support::test_server::{ScriptedResponse, TestServer};
@@ -15,6 +18,15 @@ use support::test_server::{ScriptedResponse, TestServer};
 fn controller() -> SingleStreamController {
     SingleStreamController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+        EngineConfig::default(),
+    )
+}
+
+/// Scripted orchestration controller (§32): network-neutral cases run
+/// through the deterministic adapter — no sockets, no delays.
+fn scripted_controller(scripted: &ScriptedHttp) -> SingleStreamController {
+    SingleStreamController::with_execution(
+        HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
 }
@@ -109,18 +121,19 @@ async fn hash_match_commits() {
 
 #[tokio::test]
 async fn fail_if_exists_rejects_before_network() {
-    let server = TestServer::new()
-        .serve_static("/exists", vec![1; 128])
-        .start()
-        .await
-        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("exists.bin");
     std::fs::write(&dest, b"original").expect("existing file");
 
-    let c = controller();
+    // The rejection is pre-network: the scripted log proves no probe or
+    // transfer call was ever issued (§32, §14.6).
+    let scripted = ScriptedHttp::new();
+    let c = scripted_controller(&scripted);
     let result = c
-        .run(DownloadRequest::new(server.url("/exists"), dest.clone()))
+        .run(DownloadRequest::new(
+            "https://scripted/exists",
+            dest.clone(),
+        ))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Failed);
@@ -131,21 +144,21 @@ async fn fail_if_exists_rejects_before_network() {
     // Existing file untouched.
     assert_eq!(std::fs::read(&dest).expect("read"), b"original");
     // No network requests were made.
-    assert_eq!(server.request_count("/exists").await, 0);
+    assert!(scripted.request_log().is_empty());
 }
 
 #[tokio::test]
 async fn non_retryable_404_fails_immediately() {
-    let server = TestServer::new()
-        .serve_handler("/missing", |_req| ScriptedResponse::new(404))
-        .start()
-        .await
-        .expect("start");
+    // Orchestration-only (§32): the classified 404 failure arrives through
+    // the seam; the job must not retry a non-retryable status.
+    let scripted = ScriptedHttp::new().expect_probe(
+        ProbeStep::new().fail_error(kdown_engine::DownloadError::NotFound { status: 404 }),
+    );
     let dir = tempfile::tempdir().expect("tmp");
-    let c = controller();
+    let c = scripted_controller(&scripted);
     let result = c
         .run(DownloadRequest::new(
-            server.url("/missing"),
+            "https://scripted/missing",
             dir.path().join("x"),
         ))
         .await
@@ -156,7 +169,8 @@ async fn non_retryable_404_fails_immediately() {
         Some(kdown_engine::DownloadError::NotFound { status: 404 })
     ));
     // HEAD is the only request; no retry storm (§17.1).
-    assert_eq!(server.request_count("/missing").await, 1);
+    assert_eq!(scripted.request_log().len(), 1);
+    scripted.assert_all_consumed();
 }
 
 #[tokio::test]
@@ -285,25 +299,35 @@ async fn rate_limited_with_retry_after_retries_then_completes() {
 
 #[tokio::test]
 async fn cancel_stops_download_promptly() {
-    let server = TestServer::new()
-        .serve_handler("/slow", move |_req| {
-            ScriptedResponse::ok(vec![1u8; 1_000_000]).chunked(Duration::from_millis(200))
-        })
-        .start()
-        .await
-        .expect("start");
+    // Orchestration-only cancellation (§32, §9.2): cancellation interrupts
+    // a pending body read deterministically — no wall-clock waits.
+    let scripted = ScriptedHttp::new()
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(1_000_000),
+            ..ProbeMetadata::default()
+        }))
+        .expect_labeled_transfer(
+            "cancel-transfer",
+            TransferStep::new().ok(TransferOk::new().total(1_000_000).wait_for_cancellation()),
+        );
     let dir = tempfile::tempdir().expect("tmp");
-    let c = controller();
-    let req = DownloadRequest::new(server.url("/slow"), dir.path().join("slow.bin"));
-    let run = tokio::spawn(async move { c.run(req).await.expect("terminal") });
-    // Cancel shortly after start.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    // The handle API is not yet externally exposed; emulate via controller
-    // internal cancellation in 3.8. For now assert the download completes
-    // eventually and cleanly.
-    let result = tokio::time::timeout(Duration::from_secs(30), run)
+    let c = scripted_controller(&scripted);
+    let req = DownloadRequest::new("https://scripted/slow", dir.path().join("slow.bin"));
+    let (handle, join) = c.start(req);
+    // Deterministic barrier: the body read is pending once the transfer
+    // call was consumed.
+    scripted.wait_for_phase("cancel-transfer").await;
+    handle.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), join)
         .await
-        .expect("no hang")
-        .expect("join");
-    let _ = result;
+        .expect("no hang: cancellation interrupts the pending read")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+    assert!(matches!(
+        result.error,
+        Some(kdown_engine::DownloadError::Cancelled)
+    ));
+    scripted.assert_all_consumed();
 }

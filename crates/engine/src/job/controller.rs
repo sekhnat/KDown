@@ -13,12 +13,16 @@ use std::time::Duration;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::config::{EngineConfig, HashAlgorithm, IntegrityPolicy, OverwritePolicy, ResumePolicy};
-use crate::control::retry::{parse_retry_after, RetryClassifier, RetryDecision};
+use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
-use crate::http::probe::{interpret, ProbeMetadata};
+use crate::http::probe::ProbeMetadata;
 use crate::http::transport::{HttpTransport, RequestSpec};
 use crate::http::validators::ResourceValidators;
+use crate::http::{
+    BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, ProbeRequest, RangeIntent,
+    TransferIntent, TransferRequest,
+};
 use crate::io::sink::{FileSink, FlushLevel, Sink, TempFileSpec};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
@@ -276,7 +280,11 @@ impl DownloadHandle {
 
 /// The single-stream job controller (§47 run_job, sequential branch).
 pub struct SingleStreamController {
-    transport: HttpTransport,
+    /// The substitutable HTTP execution seam (§32): semantic probe and
+    /// transfer operations without concrete client response types. The
+    /// production adapter is injected by [`new`]/[`with_metrics`]; tests and
+    /// alternate adapters inject via [`with_execution`].
+    execution: HttpExecution,
     config: EngineConfig,
     classifier: RetryClassifier,
     next_id: std::sync::atomic::AtomicU64,
@@ -284,15 +292,34 @@ pub struct SingleStreamController {
 }
 
 impl SingleStreamController {
+    /// Build a controller over the production Hyper wire adapter (§32:
+    /// compatible construction — existing callers compile unchanged).
     #[must_use]
     pub fn new(transport: HttpTransport, config: EngineConfig) -> Self {
+        Self::with_execution(HttpExecution::from_adapter(transport), config)
+    }
+
+    /// Inject an explicit HTTP execution handle (§32): scripted or alternate
+    /// adapters substitute here without adapter-specific branches.
+    #[must_use]
+    pub fn with_execution(execution: HttpExecution, config: EngineConfig) -> Self {
+        Self::with_execution_and_metrics(execution, config, EngineMetrics::shared())
+    }
+
+    /// Execution injection with a shared metrics registry (§19.5).
+    #[must_use]
+    pub fn with_execution_and_metrics(
+        execution: HttpExecution,
+        config: EngineConfig,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let classifier = RetryClassifier::new(config.retry.clone());
         Self {
-            transport,
+            execution,
             config,
             classifier,
             next_id: std::sync::atomic::AtomicU64::new(1),
-            metrics: EngineMetrics::shared(),
+            metrics,
         }
     }
 
@@ -303,14 +330,7 @@ impl SingleStreamController {
         config: EngineConfig,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
-        let classifier = RetryClassifier::new(config.retry.clone());
-        Self {
-            transport,
-            config,
-            classifier,
-            next_id: std::sync::atomic::AtomicU64::new(1),
-            metrics,
-        }
+        Self::with_execution_and_metrics(HttpExecution::from_adapter(transport), config, metrics)
     }
 
     /// Export a consistent metrics snapshot (§19.5).
@@ -372,12 +392,12 @@ impl SingleStreamController {
         let handle_cancel_mode = handle.cancel_mode_cell();
         let inner_counters = counters;
         let inner_hub = hub;
-        let transport = self.transport.clone();
+        let execution = self.execution.clone();
         let config = self.config.clone();
         let classifier = RetryClassifier::new(self.config.retry.clone());
         let join = tokio::spawn(async move {
             let this = Self {
-                transport,
+                execution,
                 config,
                 classifier,
                 next_id: std::sync::atomic::AtomicU64::new(0),
@@ -514,18 +534,34 @@ impl SingleStreamController {
                 .push(("Authorization".to_string(), auth.clone()));
         }
         let meta: ProbeMetadata;
+        let probe_notices: Vec<String>;
         let mut attempt: u32 = 0;
         let mut probe_auth_guard = crate::control::auth::AuthStageGuard::new();
         loop {
+            // Rebuilt per attempt: credential-provider headers (§29) merge
+            // into `spec` before each re-probe.
+            let probe_request = ProbeRequest {
+                spec: spec.clone(),
+                segmentation_threshold: self.config.transfer.segmentation_threshold,
+                verify_range_support: self.config.transfer.verify_range_support,
+            };
             if cancel.is_cancelled() {
                 return self.terminal_cancelled(&state, request, counters, Duration::ZERO);
             }
-            match self.probe_with_retry_after(&spec, &cancel).await {
-                Ok((m, _ra, _ch)) => {
-                    meta = m;
+            // Semantic probe (§32): the HTTP layer owns HEAD interpretation
+            // and any configured validating range request; the controller
+            // never sees raw statuses or headers.
+            match self.execution.probe(probe_request.clone(), &cancel).await {
+                Ok(outcome) => {
+                    meta = outcome.metadata;
+                    probe_notices = outcome.notices;
                     break;
                 }
-                Err((e, retry_after, challenge)) => {
+                Err(HttpFailure {
+                    error: e,
+                    retry_after,
+                    challenge,
+                }) => {
                     // Credential challenge at probe time (§29): consult the
                     // provider (bounded stages), attach headers, re-probe.
                     if let (Some(ch), Some(provider)) = (&challenge, &request.credential_provider) {
@@ -582,6 +618,14 @@ impl SingleStreamController {
             range_support: meta.accept_ranges,
         })
         .await;
+        // HTTP-classified probe notices (§32): e.g. advertised-but-unusable
+        // range support.
+        for detail in &probe_notices {
+            hub.emit(Event::Warning {
+                detail: detail.clone(),
+            })
+            .await;
+        }
 
         // ---- Resume admission, phase 2 (§15.5 steps 2-7) ----
         // One decision: generation safety first (never mixing, §26),
@@ -623,71 +667,14 @@ impl SingleStreamController {
             }
         }
 
-        // ---- Segmentation eligibility (§10.3, task 5.5) ----
-        // Verify range support with a real ranged request only when the
-        // size would qualify for segmentation (§10.2: validate before
-        // choosing the transfer mode).
-        let mut meta = meta;
-        let size_qualifies = meta
-            .total_size
-            .is_some_and(|s| s >= self.config.transfer.segmentation_threshold);
-        if size_qualifies
-            && meta.accept_ranges
-            && self.config.transfer.verify_range_support
-            && !meta.range_verified
-        {
-            let mut vspec = RequestSpec {
-                url: spec.url.clone(),
-                headers: spec.headers.clone(),
-                identity_encoding: true,
-                ..RequestSpec::default()
-            };
-            vspec.range = Some((0, 0));
-            match self.transport.get_range(&vspec, (0, 0), &cancel).await {
-                Ok(vresp) => {
-                    let ok = vresp.status == 206
-                        && vresp
-                            .content_range
-                            .is_some_and(|cr| cr.start == 0 && cr.total.is_some());
-                    if ok {
-                        meta.range_verified = true;
-                        if let Some(cr) = vresp.content_range {
-                            meta.content_range_total = cr.total;
-                            if cr.total != meta.total_size {
-                                // HEAD lied about the size; trust the
-                                // Content-Range total (§10.2).
-                                meta.total_size = cr.total;
-                            }
-                        }
-                    } else {
-                        // Advertised-but-broken range support: capability
-                        // failure for segmentation (§10.2); fall back to
-                        // single stream with verified=false.
-                        meta.accept_ranges = false;
-                        meta.range_verified = false;
-                        hub.emit(Event::Warning {
-                            detail: "server advertises ranges but ranged GET failed; \
-                                     falling back to single stream"
-                                .into(),
-                        })
-                        .await;
-                    }
-                }
-                Err(_) => {
-                    meta.accept_ranges = false;
-                }
-            }
-        }
-        let eligible = {
-            let threshold = self.config.transfer.segmentation_threshold;
-            let size_ok = meta.total_size.is_some_and(|s| s >= threshold);
-            let range_ok = if self.config.transfer.verify_range_support {
-                meta.range_verified
-            } else {
-                meta.accept_ranges
-            };
-            size_ok && range_ok && meta.status == 200
-        };
+        // ---- Segmentation eligibility (§10.3, §32): one decision, owned by
+        // the returned probe metadata. The validating range request (§10.2)
+        // already ran inside the HTTP layer; the controller never reconstructs
+        // the size/status/advertised/verified formula.
+        let eligible = meta.segment_eligible(
+            self.config.transfer.segmentation_threshold,
+            self.config.transfer.verify_range_support,
+        );
 
         // ---- Prepare (§9.1 Preparing, §14) ----
         let _ = state.transition(JobState::Preparing);
@@ -735,7 +722,7 @@ impl SingleStreamController {
                 .expect("w")
                 .add_reused(resumed.reused_bytes);
             let outcome = crate::job::segmented::run_segmented(
-                self.transport.clone(),
+                self.execution.clone(),
                 &self.config,
                 &request,
                 &state,
@@ -804,20 +791,10 @@ impl SingleStreamController {
             }
         }
 
-        // Request: ranged resume with If-Range (§11.3), or full GET when
-        // fresh. Rebuild spec for the transfer (probe spec has no range).
-        let transfer_spec = if resuming && resume_validators.is_some() {
-            RequestSpec {
-                url: spec.url.clone(),
-                headers: spec.headers.clone(),
-                range: None, // set per-request below
-                validators: resume_validators.clone(),
-                identity_encoding: true,
-                sensitive: false,
-            }
-        } else {
-            spec.clone()
-        };
+        // Request intent (§32): ranged resume with If-Range (§11.3), or full
+        // GET when fresh. The HTTP layer validates the response (status,
+        // range, generation) before any body byte reaches the sink.
+        let conditional_resume = resuming && resume_validators.is_some();
         // Single-stream restarts from zero after a mid-body failure when
         // the body has not been committed (§41 phase 1 exit criterion).
         // When resuming, retries may continue from the durable checkpoint
@@ -839,25 +816,20 @@ impl SingleStreamController {
             if meta.total_size.is_some_and(|t| offset >= t) {
                 break 'download;
             }
-            // Request: ranged when continuing at a nonzero offset
-            // (§17.3 retry only the unfinished portion); full GET when
-            // fresh at offset 0. Credential-provider headers (§29) attach
-            // to every re-issued request after a challenge.
-            let mut this_spec = if resuming || offset > 0 {
-                let mut s = if resume_validators.is_some() {
-                    transfer_spec.clone()
-                } else {
-                    let mut s2 = spec.clone();
-                    s2.validators = Some(validators.clone());
-                    s2
-                };
-                s.range = Some((
-                    offset,
-                    meta.total_size.unwrap_or(u64::MAX).saturating_sub(1),
-                ));
-                s
+            // Ranged when continuing at a nonzero offset (§17.3: retry only
+            // the unfinished portion) or resuming; full GET when fresh.
+            // Credential-provider headers (§29) attach to every re-issued
+            // request after a challenge.
+            let request_was_ranged = resuming || offset > 0;
+            let mut this_spec = if conditional_resume {
+                RequestSpec {
+                    url: spec.url.clone(),
+                    headers: spec.headers.clone(),
+                    identity_encoding: true,
+                    ..RequestSpec::default()
+                }
             } else {
-                transfer_spec.clone()
+                spec.clone()
             };
             if !challenge_headers.is_empty() {
                 for (k, v) in &challenge_headers {
@@ -872,60 +844,53 @@ impl SingleStreamController {
                     }
                 }
             }
-            let mut resp = match self.transport.get(&this_spec, &cancel).await {
-                Ok(r) => r,
-                Err(e) => {
-                    match self.classifier.decide(&e, attempt, None) {
-                        RetryDecision::Retry {
-                            attempt: next,
-                            delay,
-                        } => {
-                            counters.worker(0).expect("w").add_retries(1);
-                            attempt = next;
-                            offset = 0; // restart from zero (no checkpoint yet)
-                            let _ = sink.abort();
-                            sink = FileSink::open(
-                                &request.destination,
-                                &TempFileSpec::default(),
-                                self.config.transfer.preallocate_output,
-                            )
-                            .map_err(|se| se.0)?;
-                            sink.prepare(meta.total_size).map_err(|se| se.0)?;
-                            tokio::time::sleep(delay).await;
-                            continue 'download;
-                        }
-                        RetryDecision::GiveUp => {
-                            let _ = sink.abort();
-                            return self
-                                .terminal_failed(
-                                    &state,
-                                    request,
-                                    counters,
-                                    started.elapsed(),
-                                    e,
-                                    validators,
-                                    warnings,
-                                )
-                                .map(|mut r| {
-                                    r.final_path = None;
-                                    r
-                                });
-                        }
-                    }
-                }
+            let intent = if request_was_ranged {
+                TransferIntent::Range(RangeIntent {
+                    range: (
+                        offset,
+                        meta.total_size.unwrap_or(u64::MAX).saturating_sub(1),
+                    ),
+                    established_total: meta.total_size,
+                    expected_validators: if resume_validators.is_some() {
+                        resume_validators.clone()
+                    } else {
+                        Some(validators.clone())
+                    },
+                    full_response: if conditional_resume {
+                        // Full representation to an If-Range request: the
+                        // resource changed mid-resume (§26).
+                        FullResponsePolicy::ResourceChanged
+                    } else {
+                        // A 200 to a nonzero range is never written as the
+                        // requested range (§11.2).
+                        FullResponsePolicy::InvalidRange
+                    },
+                })
+            } else {
+                TransferIntent::Full
             };
-            // Response validation (§11.2 basics) with Retry-After honoring
-            // for retryable statuses (§17.1-§17.2). 200 and 206 are
-            // accepted here; ranged semantics are validated below (§11.2).
-            if resp.status != 200 && resp.status != 206 {
-                // Credential challenge (§29): consult the provider at most
-                // MAX_AUTH_STAGES times; never loop authentication.
-                if let Some(provider) = &request.credential_provider {
-                    if let Some(challenge) = crate::control::auth::challenge_from_headers(
-                        resp.status,
-                        &spec.url,
-                        &resp.headers,
-                    ) {
+            // Semantic transfer (§32): failures carry classified errors,
+            // server retry timing, and challenge data — no raw response.
+            let response = match self
+                .execution
+                .transfer(
+                    TransferRequest {
+                        spec: this_spec,
+                        intent,
+                    },
+                    &cancel,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(HttpFailure {
+                    error: e,
+                    retry_after,
+                    challenge,
+                }) => {
+                    // Credential challenge (§29): consult the provider at most
+                    // MAX_AUTH_STAGES times; never loop authentication.
+                    if let (Some(ch), Some(provider)) = (&challenge, &request.credential_provider) {
                         if !auth_guard.can_provide() {
                             let _ = sink.abort();
                             return self
@@ -944,7 +909,7 @@ impl SingleStreamController {
                                 });
                         }
                         auth_guard.record();
-                        match provider.request(&challenge) {
+                        match provider.request(ch) {
                             Ok(crate::control::auth::CredentialDecision::Headers(hdrs)) => {
                                 challenge_headers.clear();
                                 for (k, v) in hdrs {
@@ -972,112 +937,73 @@ impl SingleStreamController {
                         let _ = sink.abort();
                         continue 'download; // re-issue with provider headers
                     }
-                }
-                let err = status_error(resp.status);
-                let retry_after = parse_retry_after(resp.header("retry-after"));
-                let _ = sink.abort();
-                match self.classifier.decide(&err, attempt, retry_after) {
-                    RetryDecision::Retry {
-                        attempt: next,
-                        delay,
-                    } => {
-                        counters.worker(0).expect("w").add_retries(1);
-                        attempt = next;
-                        offset = 0;
-                        sink = FileSink::open(
-                            &request.destination,
-                            &TempFileSpec::default(),
-                            self.config.transfer.preallocate_output,
-                        )
-                        .map_err(|se| se.0)?;
-                        sink.prepare(meta.total_size).map_err(|se| se.0)?;
-                        hub.emit(Event::Warning {
-                            detail: format!("status {} retrying from zero ({err})", resp.status),
-                        })
-                        .await;
-                        tokio::time::sleep(delay).await;
-                        continue 'download;
-                    }
-                    RetryDecision::GiveUp => {
-                        return self
-                            .terminal_failed(
-                                &state,
-                                request,
-                                counters,
-                                started.elapsed(),
-                                err,
-                                validators,
-                                warnings,
+                    // Retry classification (§17.1-§17.2) with server-provided
+                    // retry timing; single-stream status/transport failures
+                    // restart from zero (no committed prefix yet, §41).
+                    let _ = sink.abort();
+                    match self.classifier.decide(&e, attempt, retry_after) {
+                        RetryDecision::Retry {
+                            attempt: next,
+                            delay,
+                        } => {
+                            counters.worker(0).expect("w").add_retries(1);
+                            attempt = next;
+                            offset = 0;
+                            sink = FileSink::open(
+                                &request.destination,
+                                &TempFileSpec::default(),
+                                self.config.transfer.preallocate_output,
                             )
-                            .map(|mut r| {
-                                r.final_path = None;
-                                r
-                            });
-                    }
-                }
-            }
-            validators = resp.validators.clone();
-
-            // Ranged response validation (§11.2): for a ranged request the
-            // 206's Content-Range must start exactly at our offset and the
-            // total must match; 200 with If-Range means generation changed
-            // (§26).
-            let request_was_ranged = resuming || offset > 0;
-            if request_was_ranged {
-                if resp.status == 206 {
-                    match resp.content_range {
-                        Some(cr) if cr.start == offset => {}
-                        _ => {
-                            let _ = sink.abort();
-                            return self.terminal_failed(
-                                &state,
-                                request,
-                                counters,
-                                started.elapsed(),
-                                DownloadError::InvalidRangeResponse(format!(
-                                    "Content-Range must start at {offset}"
-                                )),
-                                validators,
-                                warnings,
-                            );
+                            .map_err(|se| se.0)?;
+                            sink.prepare(meta.total_size).map_err(|se| se.0)?;
+                            if let Some(status) = e.http_status() {
+                                hub.emit(Event::Warning {
+                                    detail: format!("status {status} retrying from zero ({e})"),
+                                })
+                                .await;
+                            }
+                            tokio::time::sleep(delay).await;
+                            continue 'download;
+                        }
+                        RetryDecision::GiveUp => {
+                            // Retryable-but-given-up means the retry budget
+                            // exhausted (§17): the structured exhaustion error
+                            // keeps sequential and segmented classification in
+                            // agreement (§32 parity). Non-retryable failures
+                            // surface as themselves.
+                            let err = if self.classifier.retryable(&e) {
+                                DownloadError::RetryExhausted {
+                                    source: Box::new(e),
+                                }
+                            } else {
+                                e
+                            };
+                            return self
+                                .terminal_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    err,
+                                    validators,
+                                    warnings,
+                                )
+                                .map(|mut r| {
+                                    r.final_path = None;
+                                    r
+                                });
                         }
                     }
-                } else if resp.status == 200 && resuming && resume_validators.is_some() {
-                    // Full representation to an If-Range request: the
-                    // resource changed mid-resume (§26).
-                    let _ = sink.abort();
-                    return self.terminal_failed(
-                        &state,
-                        request,
-                        counters,
-                        started.elapsed(),
-                        DownloadError::ResourceChanged(
-                            "server ignored If-Range; resource changed".into(),
-                        ),
-                        validators,
-                        warnings,
-                    );
-                } else if resp.status == 200 {
-                    // Server ignored the Range on a mid-body retry
-                    // (§11.2): a 200 to a nonzero range is never written
-                    // as the requested range.
-                    let _ = sink.abort();
-                    return self.terminal_failed(
-                        &state,
-                        request,
-                        counters,
-                        started.elapsed(),
-                        DownloadError::InvalidRangeResponse(
-                            "server returned 200 for a ranged request".into(),
-                        ),
-                        validators,
-                        warnings,
-                    );
                 }
-            }
-
-            use http_body_util::BodyExt;
-            let mut body = resp.body().expect("body present");
+            };
+            validators = response.validators.clone();
+            // Bounded body delivery (§32): one-chunk demand. The HTTP layer
+            // validated status/range/generation before returning the
+            // response; chunks arrive zero-copy and no further chunk is
+            // fetched until the sink finished the current one (§13.1).
+            // Cancellation and pause win a select against a pending read;
+            // the source stays owned so a pause resumes byte-exact (§9.3).
+            let mut body = response.body;
             let mut written_this_stream: u64 = 0;
             loop {
                 // Chunk read with cancellation checks (§9.2 invariant 8).
@@ -1091,32 +1017,108 @@ impl SingleStreamController {
                     );
                     return self.terminal_cancelled(&state, request, counters, elapsed);
                 }
-                if cancel.is_paused() {
-                    // §9.3: pause converges quickly. Single-stream v1 keeps
-                    // the temp file, settles writes, and persists a
-                    // checkpoint (§9.3 steps 3-5).
-                    let _ = sink.flush(FlushLevel::PageCache);
-                    durable.page_cache_ack(offset);
-                    if meta.total_size.is_some() && offset > 0 {
-                        let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
-                            crate::resume::checkpoint::Checkpoint::new(
-                                identity.clone(),
-                                request.url.clone(),
-                                format!("tmp-{}", identity),
-                            )
-                        });
-                        cp.total_size = meta.total_size;
-                        cp.validators = validators.clone();
-                        cp.final_url = meta.final_url.clone();
-                        cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                        let _ = store.save_atomic(&cp);
-                        sink.set_keep_on_drop(true);
+                match body.next_chunk(&cancel).await {
+                    Ok(BodyEvent::Data(data)) => {
+                        let len = data.len() as u64;
+                        if let Some(max) = request.expected_size {
+                            if offset + len > max {
+                                // Overshoot is a protocol violation (§11.2).
+                                let _ = sink.abort();
+                                return self.terminal_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    DownloadError::Protocol(format!(
+                                        "body exceeds expected size {max}"
+                                    )),
+                                    validators,
+                                    warnings,
+                                );
+                            }
+                        }
+
+                        // Backpressure: single in-flight chunk; write then
+                        // read (§13.1).
+                        sink.write_at(offset, &data).map_err(|se| {
+                            let _ = sink.abort();
+                            se.0
+                        })?;
+                        counters.worker(0).expect("w").add_network(len);
+                        counters.worker(0).expect("w").add_completed(len);
+                        offset += len;
+                        durable.page_cache_ack(offset);
+                        written_this_stream += len;
+
+                        // Checkpoint cadence (§8.1): record progress on the
+                        // configured interval (§15.4 performance mode).
+                        if last_checkpoint.elapsed() >= self.config.checkpoint_flush_interval
+                            && offset > 0
+                        {
+                            last_checkpoint = std::time::Instant::now();
+                            let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
+                                crate::resume::checkpoint::Checkpoint::new(
+                                    identity.clone(),
+                                    request.url.clone(),
+                                    format!("tmp-{}", identity),
+                                )
+                            });
+                            cp.total_size = meta.total_size;
+                            cp.validators = validators.clone();
+                            cp.final_url = meta.final_url.clone();
+                            cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
+                            let _ = store.save_atomic(&cp);
+                            sink.set_keep_on_drop(true);
+                        }
                     }
-                    // Wait while paused, then continue or cancel.
-                    while cancel.is_paused() && !cancel.is_cancelled() {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(BodyEvent::End) => break, // clean EOF
+                    Ok(BodyEvent::Paused) => {
+                        // §9.3: pause converges quickly. Single-stream v1
+                        // keeps the temp file, settles writes, and persists a
+                        // checkpoint (§9.3 steps 3-5). The body source stays
+                        // owned: the next read resumes byte-exact (§32).
+                        let _ = sink.flush(FlushLevel::PageCache);
+                        durable.page_cache_ack(offset);
+                        if meta.total_size.is_some() && offset > 0 {
+                            let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
+                                crate::resume::checkpoint::Checkpoint::new(
+                                    identity.clone(),
+                                    request.url.clone(),
+                                    format!("tmp-{}", identity),
+                                )
+                            });
+                            cp.total_size = meta.total_size;
+                            cp.validators = validators.clone();
+                            cp.final_url = meta.final_url.clone();
+                            cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
+                            let _ = store.save_atomic(&cp);
+                            sink.set_keep_on_drop(true);
+                        }
+                        // Wait while paused, then continue or cancel.
+                        while cancel.is_paused() && !cancel.is_cancelled() {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        if cancel.is_cancelled() {
+                            self.cleanup_cancelled(
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                                &mut sink,
+                                &store,
+                                &identity,
+                            );
+                            return self.terminal_cancelled(
+                                &state,
+                                request,
+                                counters,
+                                started.elapsed(),
+                            );
+                        }
                     }
-                    if cancel.is_cancelled() {
+                    Err(DownloadError::Cancelled) => {
+                        // Cancellation interrupts a pending read (§32): same
+                        // terminal path as an observed cancel.
+                        let elapsed = started.elapsed();
                         self.cleanup_cancelled(
                             CancelMode::from_u8(
                                 cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
@@ -1125,150 +1127,86 @@ impl SingleStreamController {
                             &store,
                             &identity,
                         );
-                        return self.terminal_cancelled(
-                            &state,
-                            request,
-                            counters,
-                            started.elapsed(),
-                        );
+                        return self.terminal_cancelled(&state, request, counters, elapsed);
                     }
-                }
-                let frame =
-                    match tokio::time::timeout(self.config.network.read_idle_timeout, body.frame())
-                        .await
-                    {
-                        Ok(Some(Ok(frame))) => frame,
-                        Ok(Some(Err(e))) => {
-                            let err = classify_body_error(&e);
-                            match self.classifier.decide(&err, attempt, None) {
-                                RetryDecision::Retry {
-                                    attempt: next,
-                                    delay,
-                                } => {
-                                    counters.worker(0).expect("w").add_retries(1);
-                                    counters
-                                        .worker(0)
-                                        .expect("w")
-                                        .add_wasted(written_this_stream);
-                                    attempt = next;
-                                    // Retry from the durable prefix (§17.3):
-                                    // reuse checkpointed offset when a
-                                    // checkpoint exists, else restart from zero.
-                                    let durable_through = durable.admissible_through();
-                                    if durable_through > 0 {
-                                        offset = durable_through;
-                                        // Keep the temp file; reopen without
-                                        // truncate to preserve the prefix.
-                                        let _ = sink.flush(FlushLevel::PageCache);
-                                        // Prevent the old sink's Drop from
-                                        // deleting the temp file we are
-                                        // preserving.
-                                        sink.set_keep_on_drop(true);
-                                        sink = FileSink::open(
-                                            &request.destination,
-                                            &TempFileSpec::default(),
-                                            false,
-                                        )
-                                        .map_err(|se| se.0)?;
-                                    } else {
-                                        offset = 0;
-                                        let _ = sink.abort();
-                                        sink = FileSink::open(
-                                            &request.destination,
-                                            &TempFileSpec::default(),
-                                            self.config.transfer.preallocate_output,
-                                        )
-                                        .map_err(|se| se.0)?;
-                                        sink.prepare(meta.total_size).map_err(|se| se.0)?;
-                                    }
-                                    hub.emit(Event::Warning {
-                                        detail: format!(
-                                            "stream reset; retrying from offset {offset} ({err})"
-                                        ),
-                                    })
-                                    .await;
-                                    tokio::time::sleep(delay).await;
-                                    continue 'download;
-                                }
-                                RetryDecision::GiveUp => {
+                    Err(err) => {
+                        // Body fault or read-idle timeout, already classified
+                        // by the HTTP layer (§17.1): decide retry from the
+                        // durable prefix (§17.3) or give up.
+                        match self.classifier.decide(&err, attempt, None) {
+                            RetryDecision::Retry {
+                                attempt: next,
+                                delay,
+                            } => {
+                                counters.worker(0).expect("w").add_retries(1);
+                                counters
+                                    .worker(0)
+                                    .expect("w")
+                                    .add_wasted(written_this_stream);
+                                attempt = next;
+                                // Retry from the durable prefix (§17.3):
+                                // reuse checkpointed offset when a checkpoint
+                                // exists, else restart from zero.
+                                let durable_through = durable.admissible_through();
+                                if durable_through > 0 {
+                                    offset = durable_through;
+                                    // Keep the temp file; reopen without
+                                    // truncate to preserve the prefix.
+                                    let _ = sink.flush(FlushLevel::PageCache);
+                                    // Prevent the old sink's Drop from
+                                    // deleting the temp file we are
+                                    // preserving.
+                                    sink.set_keep_on_drop(true);
+                                    sink = FileSink::open(
+                                        &request.destination,
+                                        &TempFileSpec::default(),
+                                        false,
+                                    )
+                                    .map_err(|se| se.0)?;
+                                } else {
+                                    offset = 0;
                                     let _ = sink.abort();
-                                    return self.terminal_failed(
-                                        &state,
-                                        request,
-                                        counters,
-                                        started.elapsed(),
-                                        err,
-                                        validators,
-                                        warnings,
-                                    );
+                                    sink = FileSink::open(
+                                        &request.destination,
+                                        &TempFileSpec::default(),
+                                        self.config.transfer.preallocate_output,
+                                    )
+                                    .map_err(|se| se.0)?;
+                                    sink.prepare(meta.total_size).map_err(|se| se.0)?;
                                 }
+                                hub.emit(Event::Warning {
+                                    detail: format!(
+                                        "stream reset; retrying from offset {offset} ({err})"
+                                    ),
+                                })
+                                .await;
+                                tokio::time::sleep(delay).await;
+                                continue 'download;
+                            }
+                            RetryDecision::GiveUp => {
+                                let _ = sink.abort();
+                                // Same exhaustion shaping as the transfer path
+                                // (§32 parity): retryable failures that exhausted
+                                // the budget report RetryExhausted.
+                                let err = if self.classifier.retryable(&err) {
+                                    DownloadError::RetryExhausted {
+                                        source: Box::new(err),
+                                    }
+                                } else {
+                                    err
+                                };
+                                return self.terminal_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    err,
+                                    validators,
+                                    warnings,
+                                );
                             }
                         }
-                        Ok(None) => break, // clean EOF
-                        Err(_) => {
-                            // Read idle timeout.
-                            let _ = sink.abort();
-                            return self.terminal_failed(
-                                &state,
-                                request,
-                                counters,
-                                started.elapsed(),
-                                DownloadError::Connection("read idle timeout".into()),
-                                validators,
-                                warnings,
-                            );
-                        }
-                    };
-                let data = frame
-                    .into_data()
-                    .map_err(|_f| DownloadError::Protocol("unexpected trailer frame".into()))?;
-                let len = data.len() as u64;
-                if let Some(max) = request.expected_size {
-                    if offset + len > max {
-                        // Overshoot is a protocol violation (§11.2).
-                        let _ = sink.abort();
-                        return self.terminal_failed(
-                            &state,
-                            request,
-                            counters,
-                            started.elapsed(),
-                            DownloadError::Protocol(format!("body exceeds expected size {max}")),
-                            validators,
-                            warnings,
-                        );
                     }
-                }
-
-                // Backpressure: single in-flight chunk; write then read
-                // (§13.1).
-                sink.write_at(offset, &data).map_err(|se| {
-                    let _ = sink.abort();
-                    se.0
-                })?;
-                counters.worker(0).expect("w").add_network(len);
-                counters.worker(0).expect("w").add_completed(len);
-                offset += len;
-                durable.page_cache_ack(offset);
-                written_this_stream += len;
-
-                // Checkpoint cadence (§8.1): record progress on the
-                // configured interval (§15.4 performance mode).
-                if last_checkpoint.elapsed() >= self.config.checkpoint_flush_interval && offset > 0
-                {
-                    last_checkpoint = std::time::Instant::now();
-                    let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
-                        crate::resume::checkpoint::Checkpoint::new(
-                            identity.clone(),
-                            request.url.clone(),
-                            format!("tmp-{}", identity),
-                        )
-                    });
-                    cp.total_size = meta.total_size;
-                    cp.validators = validators.clone();
-                    cp.final_url = meta.final_url.clone();
-                    cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                    let _ = store.save_atomic(&cp);
-                    sink.set_keep_on_drop(true);
                 }
             }
 
@@ -1587,45 +1525,6 @@ impl SingleStreamController {
         }
     }
 
-    /// HEAD probe capturing `Retry-After` for honoring (§17.2). Challenge
-    /// detail (§29): the caller receives the challenge alongside the error
-    /// so the provider can be consulted before re-probing.
-    async fn probe_with_retry_after(
-        &self,
-        spec: &RequestSpec,
-        cancel: &CancellationToken,
-    ) -> Result<
-        (
-            ProbeMetadata,
-            Option<Duration>,
-            Option<crate::control::auth::Challenge>,
-        ),
-        (
-            DownloadError,
-            Option<Duration>,
-            Option<crate::control::auth::Challenge>,
-        ),
-    > {
-        let head = self
-            .transport
-            .head(spec, cancel)
-            .await
-            .map_err(|e| (e, None, None))?;
-        let retry_after = parse_retry_after(
-            head.headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
-                .map(|(_, v)| v.as_str()),
-        );
-        let status = head.parts.status.as_u16();
-        let challenge =
-            crate::control::auth::challenge_from_headers(status, spec.url.as_str(), &head.headers);
-        match interpret(status, spec.url.as_str(), &head.headers, None, "HTTP/1.1") {
-            Ok(m) => Ok((m, retry_after, None)),
-            Err(e) => Err((e, retry_after, challenge)),
-        }
-    }
-
     fn failed_result(
         &self,
         _request: DownloadRequest,
@@ -1723,29 +1622,6 @@ fn verify_hashes_path(integrity: &IntegrityPolicy, path: &Path) -> Result<(), Do
         }
     }
     Ok(())
-}
-
-fn status_error(status: u16) -> DownloadError {
-    match status {
-        404 | 410 => DownloadError::NotFound { status },
-        401 => DownloadError::AuthenticationRequired,
-        403 => DownloadError::AuthorizationFailed,
-        429 => DownloadError::RateLimited { status },
-        408 => DownloadError::Protocol("408 request timeout".into()),
-        s if (500..=599).contains(&s) => DownloadError::Server { status: s },
-        s => DownloadError::Protocol(format!("unexpected status {s}")),
-    }
-}
-
-fn classify_body_error(e: &hyper::Error) -> DownloadError {
-    let msg = e.to_string();
-    if msg.contains("incomplete") || msg.contains("connection closed") || msg.contains("reset") {
-        DownloadError::Connection(msg)
-    } else if e.is_timeout() || msg.contains("timed out") {
-        DownloadError::Connection("read timeout".into())
-    } else {
-        DownloadError::Connection(msg)
-    }
 }
 
 /// Sequential hash verification of the completed temp file (§16.2).

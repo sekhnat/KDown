@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kdown_engine::config::EngineConfig;
+use kdown_engine::http::probe::ProbeMetadata;
+use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
+use kdown_engine::http::HttpExecution;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use kdown_engine::resume::{DurabilityMode, FileCheckpointStore};
@@ -19,6 +22,15 @@ use support::test_server::{ScriptedResponse, TestServer};
 fn controller() -> SingleStreamController {
     SingleStreamController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+        EngineConfig::default(),
+    )
+}
+
+/// Scripted orchestration controller (§32): network-neutral resume
+/// orchestration runs through the deterministic adapter — no sockets.
+fn scripted_controller(scripted: &ScriptedHttp) -> SingleStreamController {
+    SingleStreamController::with_execution(
+        HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
 }
@@ -287,24 +299,31 @@ async fn pause_persists_checkpoint_for_restart_resume() {
 
 #[tokio::test]
 async fn corrupt_checkpoint_fails_safely() {
+    // Orchestration-only recovery (§32, §15.1): the corrupt checkpoint is
+    // file state, not wire behavior — the scripted adapter proves the
+    // consumed request sequence for the fail-safe restart.
     let content = Arc::new(vec![5u8; 4096]);
-    let server = TestServer::new()
-        .serve_static("/corrupt.bin", (*content).clone())
-        .start()
-        .await
-        .expect("start");
+    let scripted = ScriptedHttp::new()
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(4096),
+            ..ProbeMetadata::default()
+        }))
+        .expect_transfer(
+            TransferStep::new().ok(TransferOk::new().total(4096).chunk((*content).clone())),
+        );
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("corrupt.bin");
-    let identity = kdown_engine::resume::job_identity(&server.url("/corrupt.bin"), &dest);
+    let identity = kdown_engine::resume::job_identity("https://scripted/corrupt.bin", &dest);
     let _store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
     std::fs::write(dir.path().join(format!("{identity}.kdown")), b"{corrupt").expect("corrupt cp");
     // Temp exists so the corrupt-checkpoint path (not missing-temp) runs.
     std::fs::write(dir.path().join("corrupt.bin.part"), vec![1u8; 1024]).expect("temp");
 
-    let c = controller();
+    let c = scripted_controller(&scripted);
     let result = c
         .run(DownloadRequest::new(
-            server.url("/corrupt.bin"),
+            "https://scripted/corrupt.bin",
             dest.clone(),
         ))
         .await
@@ -313,6 +332,10 @@ async fn corrupt_checkpoint_fails_safely() {
     // fresh download succeeds (§15.1 fail-safe, §38).
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    // Consumed request sequence: one probe, one full transfer.
+    let log = scripted.request_log();
+    assert_eq!(log.len(), 2, "{log:?}");
+    scripted.assert_all_consumed();
 }
 
 #[tokio::test]
@@ -356,25 +379,15 @@ async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
 
 #[tokio::test]
 async fn required_resume_without_checkpoint_fails_before_probing() {
-    // Admission begins before the probe: a required checkpoint that is
-    // missing rejects the job before the Probing transition, so no
-    // probing state change or probe is ever observed (§15.5, §7.2). The
-    // delayed HEAD guarantees any Probing emission in any implementation
-    // variant would still land after the subscription below.
-    let content = Arc::new(vec![3u8; 4096]);
-    let server = TestServer::new()
-        .serve_handler("/req-miss.bin", move |_req| {
-            ScriptedResponse::ok((*content).clone())
-                .delayed_headers(std::time::Duration::from_millis(400))
-        })
-        .start()
-        .await
-        .expect("start");
+    // Orchestration-only admission (§32, §15.5): a required checkpoint
+    // that is missing rejects the job before the Probing transition — the
+    // scripted request log proves no probe call was ever consumed.
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("req-miss.bin");
-    let mut request = DownloadRequest::new(server.url("/req-miss.bin"), dest.clone());
+    let scripted = ScriptedHttp::new(); // any call would mismatch
+    let mut request = DownloadRequest::new("https://scripted/req-miss.bin", dest.clone());
     request.resume = kdown_engine::config::ResumePolicy::Required;
-    let c = controller();
+    let c = scripted_controller(&scripted);
     let (handle, join) = c.start(request);
     let mut events = handle.events();
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), join)
@@ -400,6 +413,8 @@ async fn required_resume_without_checkpoint_fails_before_probing() {
         panic!("unexpected event from pre-probe failure: {event:?}");
     }
     assert_eq!(handle.state(), kdown_engine::job::JobState::Failed);
+    // No HTTP call of any kind reached the seam.
+    assert!(scripted.request_log().is_empty());
 }
 
 #[tokio::test]

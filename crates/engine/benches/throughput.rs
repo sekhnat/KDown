@@ -99,6 +99,10 @@ async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
                         Ok(n) => n,
                     };
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // A HEAD response has no body (RFC 9110 §9.3.2): writing
+                    // one desyncs keep-alive connections and poisons pool
+                    // reuse for the next request.
+                    let is_head = req.starts_with("HEAD");
                     let range = req
                         .lines()
                         .find_map(|l| l.strip_prefix("Range: bytes="))
@@ -121,6 +125,10 @@ async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
                     );
                     if socket.write_all(head.as_bytes()).await.is_err() {
                         return;
+                    }
+                    // HEAD: headers only; keep the keep-alive loop going.
+                    if is_head {
+                        continue;
                     }
                     if socket.write_all(&body).await.is_err() {
                         return;

@@ -1,6 +1,8 @@
 //! HTTP transport: hyper-backed request execution and response streaming
 //! (§7.1, §32).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,56 +15,77 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::config::{EngineConfig, NetworkPolicy, ProxyConfig};
+use crate::control::CancellationToken;
 use crate::error::DownloadError;
 use crate::http::connect::{ConnectError, ConnectionLimits, EngineConnector};
+use crate::http::execution::{
+    challenge, classify_hyper_body_error, range_overrun_error, retry_after, status_to_error,
+    FullResponsePolicy, HttpBody, HttpBodySource, HttpExecutor, HttpFailure, ProbeOutcome,
+    ProbeRequest, ResponseMetadata, TransferIntent, TransferRequest, TransferResponse,
+};
+use crate::http::range::{validate_range_response, ResponseHead};
 use crate::http::redirect::{RedirectAction, RedirectPolicy, RedirectTracker};
 use crate::http::validators::{if_range_value, ContentRange, ResourceValidators};
 
-/// Metadata + streaming body returned before any body byte is accepted
-/// (§32: transport returns enough metadata for job-level validation).
-pub struct RangeResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub content_range: Option<ContentRange>,
-    pub validators: ResourceValidators,
-    pub total_size: Option<u64>,
+/// HTTP-private final response (§32): the raw Hyper response plus the
+/// redirect-resolved final URL and HTTP version. Raw values never leave
+/// the `http` module; adapters map them onto semantic outcomes.
+pub(crate) struct FinalResponse {
+    pub response: hyper::Response<Incoming>,
+    pub final_url: String,
     pub http_version: &'static str,
-    body: Option<Incoming>,
+}
+
+impl FinalResponse {
+    /// Flattened header list from a `HeaderMap`.
+    pub(crate) fn header_list_from(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect()
+    }
+}
+
+/// Metadata + streaming body returned before any body byte is accepted.
+/// HTTP-private production-adapter detail (§32): the semantic seam maps
+/// this onto `TransferResponse`; job code never sees it.
+pub(crate) struct RangeResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) content_range: Option<ContentRange>,
+    pub(crate) validators: ResourceValidators,
+    pub(crate) total_size: Option<u64>,
 }
 
 impl RangeResponse {
-    /// Access the body stream exactly once; caller validates metadata
-    /// first (§32).
-    pub fn body(&mut self) -> Option<Incoming> {
-        self.body.take()
-    }
-
-    /// Test-only constructor: metadata-only response with no body.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        status: u16,
-        headers: Vec<(String, String)>,
-        content_range: Option<ContentRange>,
-        validators: ResourceValidators,
-        total_size: Option<u64>,
-    ) -> Self {
-        Self {
-            status,
-            headers,
-            content_range,
-            validators,
-            total_size,
-            http_version: "HTTP/1.1",
-            body: None,
-        }
-    }
-
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+}
+
+impl ResponseHead for RangeResponse {
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn content_range(&self) -> Option<ContentRange> {
+        self.content_range
+    }
+
+    fn validators(&self) -> &ResourceValidators {
+        &self.validators
+    }
+
+    fn total_size(&self) -> Option<u64> {
+        self.total_size
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.header(name)
     }
 }
 
@@ -76,10 +99,15 @@ impl std::fmt::Debug for RangeResponse {
     }
 }
 
-/// Raw response metadata without body (probe path).
-pub struct HeadResponse {
-    pub parts: Parts,
-    pub headers: Vec<(String, String)>,
+/// Raw response metadata without body (probe path). HTTP-private
+/// production-adapter detail (§32).
+pub(crate) struct HeadResponse {
+    pub(crate) parts: Parts,
+    pub(crate) headers: Vec<(String, String)>,
+    /// Redirect-resolved final URL (§10.1), retained by the execution layer.
+    pub(crate) final_url: String,
+    /// Wire protocol version of the final response.
+    pub(crate) http_version: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,11 +237,12 @@ impl HttpTransport {
             .map_err(|e| DownloadError::InvalidUrl(format!("{url}: {e}")))
     }
 
-    /// HEAD probe (§10.2 step 1).
+    /// HEAD probe (§10.2 step 1). HTTP-private: the semantic seam's
+    /// `probe` owns interpretation.
     ///
     /// # Errors
     /// Structured transport errors.
-    pub async fn head(
+    pub(crate) async fn head(
         &self,
         spec: &RequestSpec,
         cancel: &crate::control::CancellationToken,
@@ -221,22 +250,9 @@ impl HttpTransport {
         self.run_headless(Method::HEAD, spec, cancel).await
     }
 
-    /// GET with headers; returns metadata and the untouched body.
-    ///
-    /// # Errors
-    /// Structured transport errors.
-    pub async fn get(
-        &self,
-        spec: &RequestSpec,
-        cancel: &crate::control::CancellationToken,
-    ) -> Result<RangeResponse, DownloadError> {
-        // The spec's range (if any) drives request framing; the explicit
-        // `range` parameter of get_range takes precedence.
-        self.run_get(spec, spec.range, cancel).await
-    }
-
     /// GET a byte range, conditionally validated (§11.2-§11.3).
-    pub async fn get_range(
+    /// HTTP-private: the semantic seam's `transfer` owns validation.
+    pub(crate) async fn get_range(
         &self,
         spec: &RequestSpec,
         range: (u64, u64),
@@ -251,16 +267,21 @@ impl HttpTransport {
         spec: &RequestSpec,
         cancel: &crate::control::CancellationToken,
     ) -> Result<HeadResponse, DownloadError> {
-        let resp = self
-            .request_following_redirects(method.clone(), spec, None, cancel)
+        let final_resp = self
+            .request_following_redirects(method, spec, None, cancel)
             .await?;
-        let (parts, _body) = resp.into_parts();
+        let (parts, _body) = final_resp.response.into_parts();
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        Ok(HeadResponse { parts, headers })
+        Ok(HeadResponse {
+            parts,
+            headers,
+            final_url: final_resp.final_url,
+            http_version: final_resp.http_version,
+        })
     }
 
     async fn run_get(
@@ -269,10 +290,12 @@ impl HttpTransport {
         range: Option<(u64, u64)>,
         cancel: &crate::control::CancellationToken,
     ) -> Result<RangeResponse, DownloadError> {
-        let resp = self
+        let final_resp = self
             .request_following_redirects(Method::GET, spec, range, cancel)
             .await?;
-        let (parts, body) = resp.into_parts();
+        // Metadata-only: the validating probe never consumes this body
+        // (the semantic transfer path streams its own response body).
+        let (parts, _body) = final_resp.response.into_parts();
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
@@ -309,12 +332,6 @@ impl HttpTransport {
             content_range,
             validators,
             total_size,
-            http_version: if parts.version == hyper::Version::HTTP_2 {
-                "HTTP/2.0"
-            } else {
-                "HTTP/1.1"
-            },
-            body: Some(body),
         })
     }
 
@@ -324,7 +341,7 @@ impl HttpTransport {
         spec: &RequestSpec,
         range: Option<(u64, u64)>,
         cancel: &crate::control::CancellationToken,
-    ) -> Result<hyper::Response<Incoming>, DownloadError> {
+    ) -> Result<FinalResponse, DownloadError> {
         let mut tracker = RedirectTracker::new(self.redirect.clone());
         let mut url = spec.url.clone();
         let mut strip_credentials = false;
@@ -348,7 +365,20 @@ impl HttpTransport {
                 .collect();
             let decision = tracker.decide(status, location.as_deref(), &url, &current_headers);
             match decision.action {
-                RedirectAction::Final => return Ok(resp),
+                RedirectAction::Final => {
+                    // Retain the post-redirect URL and wire version for
+                    // probe metadata (§10.1); raw values stay inside `http`.
+                    let http_version = if resp.version() == hyper::Version::HTTP_2 {
+                        "HTTP/2.0"
+                    } else {
+                        "HTTP/1.1"
+                    };
+                    return Ok(FinalResponse {
+                        response: resp,
+                        final_url: url,
+                        http_version,
+                    });
+                }
                 RedirectAction::Follow { location: next } => {
                     if strip_credentials || decision.strip_credentials {
                         strip_credentials = true;
@@ -433,6 +463,260 @@ impl HttpTransport {
             .map_err(|_| DownloadError::ConnectTimeout)?
             .map_err(|e| classify_transport_error(&e))?;
         Ok(resp)
+    }
+}
+
+/// Hyper frame source for [`HttpBody`] (§32): polls `Incoming` frames
+/// internally, discards no data frames, rejects unexpected non-data frames
+/// per the existing protocol policy, and maps Hyper body errors through
+/// the one shared classifier. Hyper's `Bytes` chunks pass through
+/// zero-copy. A range limit rejects an overrun before returning the
+/// offending chunk (§11.2); EOF and underflow continue into the engine's
+/// exact final size/coverage checks.
+struct HyperBodySource {
+    inner: Incoming,
+    /// Range limiting: `(range_start, range_end, delivered)` when the
+    /// intent is ranged; `None` for full bodies.
+    limit: Option<(u64, u64, u64)>,
+}
+
+impl HyperBodySource {
+    fn new(inner: Incoming, limit: Option<(u64, u64, u64)>) -> Self {
+        Self { inner, limit }
+    }
+}
+
+impl HttpBodySource for HyperBodySource {
+    fn poll_chunk(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<bytes::Bytes>, DownloadError>> {
+        use http_body_util::BodyExt;
+        // `Incoming` is Unpin: safe to project to &mut inside the box. The
+        // frame future is a wrapper struct, no allocation per poll.
+        let this = self.get_mut();
+        match std::pin::pin!(this.inner.frame()).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    if let Some((start, end, delivered)) = &mut this.limit {
+                        let (start, end) = (*start, *end);
+                        let len = data.len() as u64;
+                        let accepted_len = end - start + 1;
+                        if delivered.saturating_add(len) > accepted_len {
+                            // Overrun: reject before returning the chunk
+                            // (§11.2).
+                            return std::task::Poll::Ready(Err(range_overrun_error(start, end)));
+                        }
+                        *delivered += len;
+                    }
+                    std::task::Poll::Ready(Ok(Some(data)))
+                }
+                Err(_trailer) => std::task::Poll::Ready(Err(DownloadError::Protocol(
+                    "unexpected trailer frame".into(),
+                ))),
+            },
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Err(classify_hyper_body_error(&e)))
+            }
+        }
+    }
+}
+
+impl HttpExecutor for HttpTransport {
+    /// Semantic probe (§10): HEAD interpretation plus, when policy requires,
+    /// the validating `bytes=0-0` request — all inside the HTTP layer.
+    fn probe<'a>(
+        &'a self,
+        request: ProbeRequest,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ProbeOutcome, HttpFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            let head = self
+                .head(&request.spec, cancel)
+                .await
+                .map_err(HttpFailure::from_error)?;
+            let status = head.parts.status.as_u16();
+            let retry_after = retry_after(&head.headers);
+            let challenge_data = challenge(status, &request.spec.url, &head.headers);
+            let mut meta = crate::http::probe::interpret(
+                status,
+                &head.final_url,
+                &head.headers,
+                None,
+                head.http_version,
+            )
+            .map_err(|error| HttpFailure {
+                error,
+                retry_after,
+                challenge: challenge_data,
+            })?;
+
+            // Policy-controlled validating range request (§10.2): only when
+            // the size qualifies for segmentation, ranges are advertised,
+            // verification is enabled, and nothing verified it yet.
+            let mut notices: Vec<String> = Vec::new();
+            let size_qualifies = meta
+                .total_size
+                .is_some_and(|s| s >= request.segmentation_threshold);
+            if size_qualifies
+                && meta.accept_ranges
+                && request.verify_range_support
+                && !meta.range_verified
+            {
+                let mut vspec = RequestSpec {
+                    url: head.final_url.clone(),
+                    headers: request.spec.headers.clone(),
+                    identity_encoding: true,
+                    ..RequestSpec::default()
+                };
+                vspec.range = Some((0, 0));
+                match self.get_range(&vspec, (0, 0), cancel).await {
+                    Ok(vresp) => {
+                        let ok = vresp.status == 206
+                            && vresp
+                                .content_range
+                                .is_some_and(|cr| cr.start == 0 && cr.total.is_some());
+                        if ok {
+                            meta.range_verified = true;
+                            if let Some(cr) = vresp.content_range {
+                                meta.content_range_total = cr.total;
+                                if cr.total != meta.total_size {
+                                    // HEAD lied about the size; trust the
+                                    // Content-Range total (§10.2).
+                                    meta.total_size = cr.total;
+                                }
+                            }
+                        } else {
+                            // Advertised-but-broken range support: capability
+                            // failure for segmentation (§10.2); fall back to
+                            // single stream with verified=false.
+                            meta.accept_ranges = false;
+                            meta.range_verified = false;
+                            notices.push(
+                                "server advertises ranges but ranged GET failed; \
+                                 falling back to single stream"
+                                    .into(),
+                            );
+                        }
+                    }
+                    // Ordinary transport failures do not prove ranges unusable:
+                    // retain the structured failure so the job's retry policy
+                    // decides (design decision 5) instead of silently
+                    // downgrading every failure.
+                    Err(error) => return Err(HttpFailure::from_error(error)),
+                }
+            }
+            Ok(ProbeOutcome {
+                metadata: meta,
+                notices,
+            })
+        })
+    }
+
+    /// Semantic transfer (§11.2): status/range/generation validation all
+    /// complete before the body is returned; no raw response crosses.
+    fn transfer<'a>(
+        &'a self,
+        request: TransferRequest,
+        cancel: &'a CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<TransferResponse, HttpFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            let requested_range = request.intent.range();
+            let mut spec = request.spec.clone();
+            spec.range = requested_range;
+            // Conditional request for ranged transfers with expected
+            // validators (§11.3): the strongest validator protects against
+            // generation mixing.
+            if let (TransferIntent::Range(ri), Some(_)) = (&request.intent, requested_range) {
+                spec.validators = ri.expected_validators.clone();
+            }
+
+            let final_resp = self
+                .request_following_redirects(Method::GET, &spec, requested_range, cancel)
+                .await
+                .map_err(HttpFailure::from_error)?;
+            let FinalResponse {
+                response,
+                final_url: _,
+                http_version,
+            } = final_resp;
+            let (parts, incoming) = response.into_parts();
+            let headers = FinalResponse::header_list_from(&parts.headers);
+            let status = parts.status.as_u16();
+            let meta = ResponseMetadata::from_head(status, headers.clone(), http_version);
+
+            // Status mapping (§17.1) with retry timing and challenge data,
+            // before any body byte is available.
+            if status != 200 && status != 206 {
+                return Err(HttpFailure {
+                    error: status_to_error(status),
+                    retry_after: retry_after(&headers),
+                    challenge: challenge(status, &request.spec.url, &headers),
+                });
+            }
+
+            // Intent validation before body delivery (§32).
+            let (start, end, total_size, validators) = match &request.intent {
+                TransferIntent::Full => {
+                    // A 206 to a full request is accepted as-is (existing
+                    // behavior); the body covers the representation from 0.
+                    let total = meta.total_size;
+                    (
+                        0u64,
+                        total.map_or(u64::MAX, |t| t.saturating_sub(1)),
+                        total,
+                        meta.validators.clone(),
+                    )
+                }
+                TransferIntent::Range(ri) => {
+                    // Full response to a ranged request: classified from the
+                    // intent's conditional policy (§26 vs §11.2) before body
+                    // delivery.
+                    if status == 200 && ri.full_response == FullResponsePolicy::ResourceChanged {
+                        return Err(HttpFailure::from_error(DownloadError::ResourceChanged(
+                            "server ignored If-Range; resource changed".into(),
+                        )));
+                    }
+                    let validated = validate_range_response(
+                        ri.range,
+                        &meta,
+                        ri.established_total,
+                        ri.expected_validators.as_ref(),
+                    )
+                    .map_err(|rej| {
+                        // Generation changes report resource change; the
+                        // remaining rejections report invalid range response.
+                        HttpFailure::from_error(rej.into_error())
+                    })?;
+                    (
+                        validated.start,
+                        validated.end,
+                        validated.total_size,
+                        meta.validators.clone(),
+                    )
+                }
+            };
+
+            // Range-limited bounded body (§32): the limit rejects an overrun
+            // before returning the offending chunk.
+            let limit = match (&request.intent, requested_range) {
+                (TransferIntent::Range(_), Some((s, e))) => Some((s, e, 0u64)),
+                _ => None,
+            };
+            let body = HttpBody::new(
+                HyperBodySource::new(incoming, limit),
+                self.network.read_idle_timeout,
+            );
+            Ok(TransferResponse {
+                start,
+                end,
+                total_size,
+                validators,
+                body,
+            })
+        })
     }
 }
 

@@ -1,16 +1,20 @@
 //! Integration tests for range request building and response validation
-//! (§11.2, task 5.4): the validation gate rejects lying/broken range
-//! server behaviors before any body byte is accepted, and well-behaved
-//! 206 responses validate through with correct offsets.
+//! (§11.2, task 5.4) through the semantic execution seam: the production
+//! Hyper adapter's parsing is the subject, exercised via `HttpExecutor` —
+//! the validation gate rejects lying/broken range server behaviors before
+//! any body byte is accepted, and well-behaved 206 responses validate
+//! through with correct offsets.
 
 #[path = "support/mod.rs"]
 mod support;
 
 use kdown_engine::config::NetworkPolicy;
 use kdown_engine::control::CancellationToken;
-use kdown_engine::http::range::{validate_range_response, RejectionKind};
 use kdown_engine::http::transport::{HttpTransport, RequestSpec};
-use kdown_engine::http::validators::ResourceValidators;
+use kdown_engine::http::{
+    FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, TransferIntent, TransferRequest,
+};
+use kdown_engine::DownloadError;
 use support::fixtures::deterministic_bytes;
 use support::test_server::{RangeMode, TestServer};
 
@@ -26,38 +30,64 @@ fn spec(url: &str) -> RequestSpec {
     }
 }
 
-/// Fetch a range and hand the metadata to the validation gate (no body
-/// read before validation — §32).
-async fn fetch_and_validate(
-    t: &HttpTransport,
-    spec: &RequestSpec,
+fn range_intent(
     range: (u64, u64),
     established_total: Option<u64>,
-) -> Result<kdown_engine::http::range::ValidatedRange, RejectionKind> {
-    let cancel = CancellationToken::new();
-    let resp = t
-        .get_range(spec, range, &cancel)
-        .await
-        .expect("transport ok");
-    validate_range_response(range, &resp, established_total, None).map_err(|e| e.kind)
+    expected_validators: Option<kdown_engine::http::validators::ResourceValidators>,
+) -> TransferIntent {
+    TransferIntent::Range(RangeIntent {
+        range,
+        established_total,
+        expected_validators,
+        full_response: FullResponsePolicy::InvalidRange,
+    })
+}
+
+/// Ranged transfer through the semantic seam; validation happens inside
+/// the HTTP layer before the response (and its body) exists (§32).
+async fn transfer_range(
+    t: &HttpExecution,
+    url: &str,
+    range: (u64, u64),
+    established_total: Option<u64>,
+    expected_validators: Option<kdown_engine::http::validators::ResourceValidators>,
+) -> Result<kdown_engine::http::TransferResponse, HttpFailure> {
+    t.transfer(
+        TransferRequest {
+            spec: spec(url),
+            intent: range_intent(range, established_total, expected_validators),
+        },
+        &CancellationToken::new(),
+    )
+    .await
 }
 
 #[tokio::test]
 async fn correct_range_server_validates() {
     let content = deterministic_bytes(8192, 101);
     let server = TestServer::new()
-        .serve_static("/ok", content)
+        .serve_static("/ok", content.clone())
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/ok"));
-    let v = fetch_and_validate(&t, &s, (100, 199), Some(8192))
+    let t = HttpExecution::from_adapter(transport());
+    let mut resp = transfer_range(&t, &server.url("/ok"), (100, 199), Some(8192), None)
         .await
         .expect("correct range validates");
-    assert_eq!(v.start, 100);
-    assert_eq!(v.end, 199);
-    assert_eq!(v.total_size, Some(8192));
+    assert_eq!(resp.start, 100);
+    assert_eq!(resp.end, 199);
+    assert_eq!(resp.total_size, Some(8192));
+    let mut got = Vec::new();
+    while let Some(d) = resp
+        .body
+        .next_chunk(&CancellationToken::new())
+        .await
+        .unwrap()
+        .data()
+    {
+        got.extend_from_slice(d);
+    }
+    assert_eq!(&got[..], &content[100..200], "byte-exact slice");
 }
 
 #[tokio::test]
@@ -69,30 +99,34 @@ async fn lying_200_server_rejected() {
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/liar"));
-    let err = fetch_and_validate(&t, &s, (100, 199), Some(4096))
+    let t = HttpExecution::from_adapter(transport());
+    let err = transfer_range(&t, &server.url("/liar"), (100, 199), Some(4096), None)
         .await
         .expect_err("200-on-range must reject");
-    assert_eq!(err, RejectionKind::FullResponseToNonzeroRange);
+    assert!(
+        matches!(err.error, DownloadError::InvalidRangeResponse(ref m) if m.contains("full response to nonzero range")),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
 async fn malformed_content_range_rejected() {
     // §36.2 MalformedContentRange: 206 with wrong start/end and a bogus
-    // total — the parse fails, so the gate rejects as StartMismatch.
+    // total — the parse fails, so the gate rejects as start mismatch.
     let content = deterministic_bytes(4096, 103);
     let server = TestServer::new()
         .serve_ranges("/malformed", content, RangeMode::MalformedContentRange)
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/malformed"));
-    let err = fetch_and_validate(&t, &s, (0, 99), None)
+    let t = HttpExecution::from_adapter(transport());
+    let err = transfer_range(&t, &server.url("/malformed"), (0, 99), None, None)
         .await
         .expect_err("malformed Content-Range must reject");
-    assert_eq!(err, RejectionKind::StartMismatch);
+    assert!(
+        matches!(err.error, DownloadError::InvalidRangeResponse(ref m) if m.contains("start mismatch")),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -104,69 +138,74 @@ async fn no_range_server_200_rejected_for_nonzero_range() {
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/noranges"));
-    let err = fetch_and_validate(&t, &s, (500, 999), Some(2048))
+    let t = HttpExecution::from_adapter(transport());
+    let err = transfer_range(&t, &server.url("/noranges"), (500, 999), Some(2048), None)
         .await
         .expect_err("200 to nonzero range rejected");
-    assert_eq!(err, RejectionKind::FullResponseToNonzeroRange);
+    assert!(matches!(
+        err.error,
+        DownloadError::InvalidRangeResponse(ref m) if m.contains("full response to nonzero range")
+    ));
 }
 
 #[tokio::test]
 async fn range_request_carries_identity_encoding() {
-    // §11.4: segmented requests send Accept-Encoding: identity.
+    // §11.4: ranged requests send Accept-Encoding: identity.
     let server = TestServer::new()
-        .serve_handler("/enc", |req| {
-            let ae = req.header("accept-encoding").unwrap_or("").to_string();
-            let body = if ae.eq_ignore_ascii_case("identity") {
-                b"identity-ok".to_vec()
-            } else {
-                b"wrong".to_vec()
-            };
-            let ae_hdr = ae.clone();
-            support::test_server::ScriptedResponse::ok(body)
-                .with_header("x-observed-accept-encoding", &ae_hdr)
+        .serve_handler("/enc", |_req| {
+            support::test_server::ScriptedResponse::ok(b"identity-ok".to_vec())
         })
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/enc"));
-    let resp = t
-        .get_range(&s, (0, 7), &CancellationToken::new())
+    let t = HttpExecution::from_adapter(transport());
+    let _ = transfer_range(&t, &server.url("/enc"), (0, 7), None, None)
         .await
         .expect("get");
+    let reqs = server.requests().await;
+    let last = reqs.last().expect("request recorded");
     assert_eq!(
-        resp.header("x-observed-accept-encoding"),
+        last.header("accept-encoding"),
         Some("identity"),
-        "range requests must carry Accept-Encoding: identity (§11.4)"
+        "ranged requests must carry Accept-Encoding: identity (§11.4)"
     );
 }
 
 #[tokio::test]
 async fn well_behaved_range_end_to_end() {
-    // Full loop: request a range from a correct server, validate, then
-    // read the body and assert it matches the requested slice exactly.
+    // Full loop: request a range from a correct server and read the body,
+    // asserting it matches the requested slice exactly.
     let content = deterministic_bytes(64 * 1024, 105);
     let server = TestServer::new()
         .serve_static("/slice", content.clone())
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/slice"));
+    let t = HttpExecution::from_adapter(transport());
     let range = (17_345u64, 18_943u64);
-    let cancel = CancellationToken::new();
-    let mut resp = t.get_range(&s, range, &cancel).await.expect("get");
-    let v = validate_range_response(range, &resp, Some(content.len() as u64), None)
-        .expect("valid slice");
-    assert_eq!(v.start, range.0);
-    use http_body_util::BodyExt;
-    let body = resp.body().expect("body");
-    let bytes = body.collect().await.expect("collect").to_bytes();
+    let mut resp = transfer_range(
+        &t,
+        &server.url("/slice"),
+        range,
+        Some(content.len() as u64),
+        None,
+    )
+    .await
+    .expect("valid slice");
+    assert_eq!(resp.start, range.0);
+    let mut bytes = Vec::new();
+    while let Some(d) = resp
+        .body
+        .next_chunk(&CancellationToken::new())
+        .await
+        .expect("chunk")
+        .data()
+    {
+        bytes.extend_from_slice(d);
+    }
     assert_eq!(
         bytes.len() as u64,
-        v.end - v.start + 1,
+        resp.end - resp.start + 1,
         "body length matches validated slice"
     );
     assert_eq!(
@@ -197,24 +236,24 @@ async fn established_total_conflict_rejected() {
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/mutated"));
+    let t = HttpExecution::from_adapter(transport());
     // Established total from the probe was 4096, but the segment response
-    // claims 3000: TotalConflict.
-    let cancel = CancellationToken::new();
-    let resp = t.get_range(&s, (0, 99), &cancel).await.expect("get");
-    let err = validate_range_response((0, 99), &resp, Some(4096), None).unwrap_err();
-    assert_eq!(err.kind, RejectionKind::TotalConflict);
-    assert!(!matches!(err.kind, RejectionKind::StartMismatch));
+    // claims 3000: total conflict.
+    let err = transfer_range(&t, &server.url("/mutated"), (0, 99), Some(4096), None)
+        .await
+        .expect_err("total conflict");
+    assert!(
+        matches!(err.error, DownloadError::InvalidRangeResponse(ref m) if m.contains("total conflict")),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
 async fn validators_passed_to_gate_detect_generation_change() {
     // The response carries a different ETag than the job's established
-    // validators: the gate rejects with GenerationChanged.
+    // validators: the gate rejects with a resource-change error (§26).
     let server = TestServer::new()
-        .serve_handler("/gen", |req| {
-            let _ = req;
+        .serve_handler("/gen", |_req| {
             support::test_server::ScriptedResponse::new(206)
                 .with_body(vec![1u8; 100])
                 .with_header("etag", "\"generation-2\"")
@@ -224,17 +263,14 @@ async fn validators_passed_to_gate_detect_generation_change() {
         .start()
         .await
         .expect("start");
-    let t = transport();
-    let s = spec(&server.url("/gen"));
-    let cancel = CancellationToken::new();
-    let resp = t.get_range(&s, (0, 99), &cancel).await.expect("get");
-    let expected = ResourceValidators::from_headers(Some("\"generation-1\""), None, Some(1000));
-    let err = kdown_engine::http::range::validate_range_response(
-        (0, 99),
-        &resp,
+    let t = HttpExecution::from_adapter(transport());
+    let expected = kdown_engine::http::validators::ResourceValidators::from_headers(
+        Some("\"generation-1\""),
+        None,
         Some(1000),
-        Some(&expected),
-    )
-    .unwrap_err();
-    assert_eq!(err.kind, RejectionKind::GenerationChanged);
+    );
+    let err = transfer_range(&t, &server.url("/gen"), (0, 99), Some(1000), Some(expected))
+        .await
+        .expect_err("generation change");
+    assert!(matches!(err.error, DownloadError::ResourceChanged(_)));
 }

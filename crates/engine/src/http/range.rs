@@ -6,8 +6,7 @@
 //! total. A 200 response to a nonzero range request is never treated as
 //! the requested range (§11.2: abort segmented mode for the job).
 
-use crate::http::transport::RangeResponse;
-use crate::http::validators::ResourceValidators;
+use crate::http::validators::{ContentRange, ResourceValidators};
 
 /// A validated range response: the engine may read the body and write it
 /// at `validated.start`.
@@ -90,6 +89,20 @@ pub fn range_request_is_nonzero(start: u64) -> bool {
     start > 0
 }
 
+/// HTTP-private view of a response head used for range validation (§11.2).
+///
+/// Implemented by the production adapter's raw response and by the
+/// HTTP-private metadata carrier (`crate::http::execution::ResponseMetadata`),
+/// so one validation table serves both without exposing raw response types
+/// to job code. Implementation detail of the HTTP module.
+pub trait ResponseHead {
+    fn status(&self) -> u16;
+    fn content_range(&self) -> Option<ContentRange>;
+    fn validators(&self) -> &ResourceValidators;
+    fn total_size(&self) -> Option<u64>;
+    fn header(&self, name: &str) -> Option<&str>;
+}
+
 /// Validate a range response against its request (§11.2).
 ///
 /// `request_range` is `(S, E)` inclusive; `established_total` is the size
@@ -99,16 +112,16 @@ pub fn range_request_is_nonzero(start: u64) -> bool {
 /// Returns the validated slice, or the structured rejection reason. The
 /// caller MUST NOT read body bytes before this passes (§32: metadata
 /// validated before body).
-pub fn validate_range_response(
+pub fn validate_range_response<T: ResponseHead + ?Sized>(
     request_range: (u64, u64),
-    response: &RangeResponse,
+    response: &T,
     established_total: Option<u64>,
     expected_validators: Option<&ResourceValidators>,
 ) -> Result<ValidatedRange, RangeRejection> {
     let (s, e) = request_range;
     // 200 to a nonzero range request: full representation — never usable
     // as the requested slice (§11.2).
-    if response.status == 200 {
+    if response.status() == 200 {
         if range_request_is_nonzero(s) {
             return Err(RangeRejection {
                 kind: RejectionKind::FullResponseToNonzeroRange,
@@ -120,16 +133,19 @@ pub fn validate_range_response(
         return Ok(ValidatedRange {
             start: 0,
             end: e,
-            total_size: response.total_size.or(established_total),
+            total_size: response.total_size().or(established_total),
         });
     }
-    if response.status != 206 {
+    if response.status() != 206 {
         return Err(RangeRejection {
             kind: RejectionKind::UnexpectedStatus,
-            detail: format!("status {} for range request bytes={s}-{e}", response.status),
+            detail: format!(
+                "status {} for range request bytes={s}-{e}",
+                response.status()
+            ),
         });
     }
-    let Some(cr) = response.content_range else {
+    let Some(cr) = response.content_range() else {
         return Err(RangeRejection {
             kind: RejectionKind::StartMismatch,
             detail: "206 response missing Content-Range".into(),
@@ -159,7 +175,7 @@ pub fn validate_range_response(
     // Generation identity (§26): validators present in the response must
     // not contradict the established ones.
     if let Some(expected) = expected_validators {
-        if expected.same_generation(&response.validators).is_err() {
+        if expected.same_generation(response.validators()).is_err() {
             return Err(RangeRejection {
                 kind: RejectionKind::GenerationChanged,
                 detail: "response validators differ from job generation".into(),
@@ -186,11 +202,15 @@ pub fn body_overrun(offset_in_range: u64, incoming_len: u64, accepted_len: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::transport::RangeResponse;
+    use crate::http::execution::ResponseMetadata;
     use crate::http::validators::{ContentRange, ResourceValidators};
 
-    fn resp(status: u16, content_range: Option<ContentRange>, total: Option<u64>) -> RangeResponse {
-        RangeResponse::for_test(
+    fn resp(
+        status: u16,
+        content_range: Option<ContentRange>,
+        total: Option<u64>,
+    ) -> ResponseMetadata {
+        ResponseMetadata::for_test(
             status,
             vec![],
             content_range,

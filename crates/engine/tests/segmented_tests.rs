@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
+use kdown_engine::http::probe::ProbeMetadata;
+use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
+use kdown_engine::http::HttpExecution;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
@@ -39,6 +42,12 @@ fn controller(cfg: EngineConfig) -> SingleStreamController {
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     )
+}
+
+/// Scripted orchestration controller (§32): network-neutral cases run
+/// through the deterministic adapter — no sockets, no delays.
+fn scripted_controller(scripted: &ScriptedHttp, cfg: EngineConfig) -> SingleStreamController {
+    SingleStreamController::with_execution(HttpExecution::from_adapter(scripted.clone()), cfg)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -73,25 +82,37 @@ async fn segmented_download_byte_exact() {
 
 #[tokio::test]
 async fn small_resource_uses_single_stream() {
-    // Below the threshold: no parallel range requests (§10.3).
+    // Orchestration-only eligibility (§10.3, §32): below the threshold the
+    // probe metadata's single eligibility decision selects sequential —
+    // no per-segment requests.
     let content = deterministic_bytes(64 * 1024, 2002);
-    let server = TestServer::new()
-        .serve_static("/small.bin", content.clone())
-        .start()
-        .await
-        .expect("start");
-    let dir = tempfile::tempdir().expect("tmp");
-    let dest = dir.path().join("small.bin");
-    let c = controller(cfg(16 * 1024 * 1024));
+    let scripted = ScriptedHttp::new()
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(content.len() as u64),
+            ..ProbeMetadata::default()
+        }))
+        .expect_transfer(
+            TransferStep::new().ok(TransferOk::new()
+                .total(content.len() as u64)
+                .chunk(content.clone())),
+        );
+    let c = scripted_controller(&scripted, cfg(16 * 1024 * 1024));
     let result = c
-        .run(DownloadRequest::new(server.url("/small.bin"), dest.clone()))
+        .run(DownloadRequest::new(
+            "https://scripted/small.bin",
+            tempfile::tempdir().expect("tmp").path().join("small.bin"),
+        ))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    // HEAD + at most one range-validation GET; no per-segment requests.
-    let count = server.request_count("/small.bin").await;
-    assert!(count <= 2, "small resource must not segment: {count}");
+    // HEAD probe + one sequential transfer; no per-segment requests.
+    assert!(
+        scripted.request_log().len() <= 2,
+        "small resource must not segment: {:?}",
+        scripted.request_log()
+    );
+    scripted.assert_all_consumed();
 }
 
 #[tokio::test]
@@ -189,63 +210,69 @@ async fn randomized_failures_segmented_still_exact() {
     assert!(!dir.path().join("flaky-seg.bin.part").exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinated_503_backoff_completes() {
-    // First two range responses are 503; the coordinated gate still lets
-    // the job complete with correct output (§17.4).
-    let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 2005));
-    let hits = Arc::new(AtomicU32::new(0));
-    let server = {
-        let content = content.clone();
-        let hits = hits.clone();
-        TestServer::new().serve_handler("/gate", move |req| {
-            let total = content.len() as u64;
-            if req.method == "HEAD" {
-                return ScriptedResponse::ok((*content).clone())
-                    .with_header("accept-ranges", "bytes");
-            }
-            let n = hits.fetch_add(1, Ordering::SeqCst);
-            if let Some((s, e)) = req.range {
-                if n < 2 {
-                    return ScriptedResponse::new(503)
-                        .with_header("retry-after", "0")
-                        .with_header("accept-ranges", "bytes");
-                }
-                let body = content[s as usize..=(e as usize).min(total as usize - 1)].to_vec();
-                ScriptedResponse::new(206)
-                    .with_body(body)
-                    .with_header("content-range", &format!("bytes {s}-{e}/{total}"))
-                    .with_header("accept-ranges", "bytes")
-            } else {
-                ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
-            }
-        })
-    }
-    .start()
-    .await
-    .expect("start");
+    // Orchestration-only 503 coordination (§17.4, §32): every segment's
+    // first attempt is rate limited server-side, the coordinated origin
+    // gate delays the retries, and the job completes byte-exact. One
+    // unordered range-keyed phase keeps arrival order irrelevant.
+    let content = deterministic_bytes(4000, 2005);
+    let seg = |start: u64| {
+        TransferStep::new()
+            .range((start, start + 999))
+            .ok(TransferOk::new()
+                .range(start, start + 999)
+                .total(4000)
+                .chunk(content[start as usize..(start + 1000) as usize].to_vec()))
+    };
+    let server_error = || kdown_engine::http::HttpFailure {
+        error: kdown_engine::DownloadError::Server { status: 503 },
+        retry_after: Some(Duration::from_millis(1)),
+        challenge: None,
+    };
+    let scripted = ScriptedHttp::new()
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(4000),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }))
+        .expect_unordered_ranges(
+            "503-then-ok",
+            vec![
+                TransferStep::new().range((0, 999)).fail(server_error()),
+                TransferStep::new().range((1000, 1999)).fail(server_error()),
+                TransferStep::new().range((2000, 2999)).fail(server_error()),
+                TransferStep::new().range((3000, 3999)).fail(server_error()),
+                seg(0),
+                seg(1000),
+                seg(2000),
+                seg(3000),
+            ],
+        );
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("gate.bin");
-    let mut c_cfg = cfg(1024 * 1024);
-    c_cfg.transfer.max_segment_size = 512 * 1024;
-    let c = controller(c_cfg);
+    let mut c_cfg = cfg(1024);
+    c_cfg.transfer.max_segment_size = 1000;
+    c_cfg.transfer.min_segment_size = 1;
+    let c = scripted_controller(&scripted, c_cfg);
     let result = c
-        .run(DownloadRequest::new(server.url("/gate"), dest.clone()))
+        .run(DownloadRequest::new("https://scripted/gate", dest.clone()))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    assert!(hits.load(Ordering::Relaxed) >= 2);
-    // §17.4: coordinated delay — the gate must add delay beyond an
-    // immediate retry (Retry-After: 0 honors the backoff gate instantly,
-    // so verify coordination structurally: total requests stay bounded
-    // rather than every worker hammering independently).
-    let total_requests = server.request_count("/gate").await;
-    // HEAD + validation GET + segments + the two 503s + modest retries.
-    assert!(
-        total_requests < 20,
-        "coordinated backoff must prevent a thundering herd: {total_requests}"
+    // §17.4: coordinated delay — bounded requests rather than every
+    // worker hammering independently: exactly one 503 + one success per
+    // segment.
+    assert_eq!(
+        scripted.request_log().len(),
+        9,
+        "coordinated backoff must prevent a thundering herd: {:?}",
+        scripted.request_log()
     );
+    scripted.assert_all_consumed();
 }
 
 #[tokio::test]

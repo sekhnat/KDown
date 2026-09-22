@@ -72,24 +72,10 @@ pub(crate) fn interpret(
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     };
-    match status {
-        200 | 206 => {}
-        404 | 410 => return Err(DownloadError::NotFound { status }),
-        401 => return Err(DownloadError::AuthenticationRequired),
-        407 => {
-            return Err(DownloadError::Proxy(
-                "proxy authentication required (407)".into(),
-            ))
-        }
-        403 => return Err(DownloadError::AuthorizationFailed),
-        408 => return Err(DownloadError::Protocol("408 request timeout".into())),
-        429 => return Err(DownloadError::RateLimited { status }),
-        s if (500..=599).contains(&s) => return Err(DownloadError::Server { status: s }),
-        s => {
-            return Err(DownloadError::Protocol(format!(
-                "unexpected probe status {s}"
-            )))
-        }
+    // Centralized status table (§17.1): identical classification for probe
+    // and transfer in both modes; 200/206 pass through as success.
+    if status != 200 && status != 206 {
+        return Err(crate::http::execution::status_to_error(status));
     }
     let content_length = header("content-length")
         .and_then(|v| v.parse().ok())

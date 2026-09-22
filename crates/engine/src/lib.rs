@@ -49,6 +49,53 @@
 //! # }
 //! ```
 //!
+//! ## HTTP execution seam
+//!
+//! Job orchestration never touches concrete HTTP client, response-body, or
+//! framing types. Both sequential and segmented transfers issue semantic
+//! [`kdown_engine::http::HttpExecutor::probe`] and
+//! [`kdown_engine::http::HttpExecutor::transfer`] operations through a
+//! cloneable [`kdown_engine::http::HttpExecution`] handle; statuses,
+//! `Retry-After` timing, authentication challenges, range validation,
+//! generation conflicts, body overruns, and read-idle timeouts are all
+//! classified inside the HTTP layer before any body chunk is delivered.
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//! use std::sync::Arc;
+//! use kdown_engine::config::EngineConfig;
+//! use kdown_engine::http::probe::ProbeMetadata;
+//! use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
+//! use kdown_engine::http::{HttpExecution, HttpBodySource as _};
+//! use kdown_engine::job::controller::{DownloadRequest, SingleStreamController};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Compatible production construction (unchanged):
+//! let config = EngineConfig::default();
+//! let transport = kdown_engine::HttpTransport::from_config(&config)?;
+//! let controller = SingleStreamController::new(transport, config);
+//!
+//! // Scripted injection (tests and alternate adapters): the same
+//! // controller code runs against a deterministic adapter with no socket.
+//! let scripted = ScriptedHttp::new()
+//!     .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+//!         status: 200,
+//!         total_size: Some(5),
+//!         ..ProbeMetadata::default()
+//!     }))
+//!     .expect_transfer(
+//!         TransferStep::new()
+//!             .ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
+//!     );
+//! let scripted_controller = SingleStreamController::with_execution(
+//!     HttpExecution::from_adapter(scripted),
+//!     EngineConfig::default(),
+//! );
+//! let _ = (controller, scripted_controller);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Configuration reference
 //!
 //! [`EngineConfig`] validates concurrency bounds, timeout values, segment

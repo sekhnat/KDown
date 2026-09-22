@@ -51,24 +51,24 @@ Design decisions D1–D15 and spec phases (§41) drive this order: workspace →
 
 ## 6. Performance engineering (Phase 4 exit: saturate target link without excessive CPU/memory)
 
-- [ ] 6.1 Implement connection pooling config (engine-global + per-origin limits, idle expiry, safe broken-connection retry §27) over hyper-util client; verify per-origin limit test with two concurrent segmented jobs
-- [ ] 6.2 Tune HTTP/2 behavior: single-connection multiplexing default with additional-connections policy hook (D5); verify H2 segmented test multiplexes and byte-exact
-- [ ] 6.3 Reduce hot-path overhead: lock-free counters on chunk path, scheduler lock only at lease boundaries, event batching, no per-byte callbacks (§13.3, §23); verify bench harness shows no hot global lock and memory stays O(workers×buffers) with file size growth
-- [ ] 6.4 Build `criterion` benchmark harness with local fixture-server scenarios (localhost H1/H2, throttled, varying workers, prealloc on/off, tmpfs) recording throughput/CPU/wall/RSS/retransferred bytes (§37); verify harness runs and records a baseline
-- [ ] 6.5 Phase 4 exit: benchmark on loopback demonstrates near-link saturation at 1 Gbit/s-class throughput with single-digit-percent CPU per §22 targets; record results and set CI regression thresholds (§37.4)
+- [x] 6.1 Implement connection pooling config (engine-global + per-origin limits, idle expiry, safe broken-connection retry §27) over hyper-util client; verify per-origin limit test with two concurrent segmented jobs
+- [x] 6.2 Tune HTTP/2 behavior: single-connection multiplexing default with additional-connections policy hook (D5); verify H2 segmented test multiplexes and byte-exact
+- [x] 6.3 Reduce hot-path overhead: lock-free counters on chunk path, scheduler lock only at lease boundaries, event batching, no per-byte callbacks (§13.3, §23); verify bench harness shows no hot global lock and memory stays O(workers×buffers) with file size growth
+- [x] 6.4 Build `criterion` benchmark harness with local fixture-server scenarios (localhost H1/H2, throttled, varying workers, prealloc on/off, tmpfs) recording throughput/CPU/wall/RSS/retransferred bytes (§37); verify harness runs and records a baseline
+- [x] 6.5 Phase 4 exit: benchmark on loopback demonstrates near-link saturation at 1 Gbit/s-class throughput with single-digit-percent CPU per §22 targets; record results and set CI regression thresholds (§37.4)
 
 ## 7. Hardening (Phase 5)
 
-- [ ] 7.1 Implement proxy support (HTTP/CONNECT, optional SOCKS hook, caller selection, credential redaction) and credential provider callback with challenge handling and no auth-retry loops (§28, §29); verify integration tests through a local CONNECT proxy and credential-provider unit tests
-- [ ] 7.2 Implement structured log levels + correlation fields (engine/job/worker/lease/origin/attempt/category) and end-to-end redaction audit; verify a test asserting no secret values appear anywhere in logs at default levels
-- [ ] 7.3 Implement security tests: TLS-failure/no-downgrade (mock TLS), redirect credential stripping, path-sanitization utility for Content-Disposition (§21.3), resource-exhaustion bounds (header size, redirect loops, oversized metadata §21.4), SSRF restriction hooks (§21.5); verify each via integration tests
-- [ ] 7.4 Set up `cargo-fuzz` targets for URL, Content-Range, ETag, Content-Disposition, checkpoint parsers (§36.5); verify short fuzz runs complete without panics and malformed inputs fail safely
-- [ ] 7.5 Implement engine metrics export (§19.5 counters/gauges: jobs by outcome, bytes, retries by category, status counts, range violations, integrity failures, latencies); verify metrics assertions in integration tests
-- [ ] 7.6 Platform matrix: run full test suite incl. positional-write, rename-over-existing, and preallocation tests on Linux, macOS, Windows CI; verify green matrix
-- [ ] 7.7 Phase 5 exit: acceptance review against §42 v1 criteria (correctness, reliability, performance, API quality, security) with all suites green; run `cargo test` full, `cargo clippy -- -D warnings`, fuzz smoke, bench baseline
+- [x] 7.1 Implement proxy support (HTTP/CONNECT, optional SOCKS hook, caller selection, credential redaction) and credential provider callback with challenge handling and no auth-retry loops (§28, §29); verify integration tests through a local CONNECT proxy and credential-provider unit tests
+- [x] 7.2 Implement structured log levels + correlation fields (engine/job/worker/lease/origin/attempt/category) and end-to-end redaction audit; verify a test asserting no secret values appear anywhere in logs at default levels
+- [x] 7.3 Implement security tests: TLS-failure/no-downgrade (mock TLS), redirect credential stripping, path-sanitization utility for Content-Disposition (§21.3), resource-exhaustion bounds (header size, redirect loops, oversized metadata §21.4), SSRF restriction hooks (§21.5); verify each via integration tests
+- [x] 7.4 Set up `cargo-fuzz` targets for URL, Content-Range, ETag, Content-Disposition, checkpoint parsers (§36.5); verify short fuzz runs complete without panics and malformed inputs fail safely
+- [x] 7.5 Implement engine metrics export (§19.5 counters/gauges: jobs by outcome, bytes, retries by category, status counts, range violations, integrity failures, latencies); verify metrics assertions in integration tests
+- [x] 7.6 Platform matrix: run full test suite incl. positional-write, rename-over-existing, and preallocation tests on Linux, macOS, Windows CI; verify green matrix
+- [x] 7.7 Phase 5 exit: acceptance review against §42 v1 criteria (correctness, reliability, performance, API quality, security) with all suites green; run `cargo test` full, `cargo clippy -- -D warnings`, fuzz smoke, bench baseline
 
 ## 8. Documentation and delivery
 
-- [ ] 8.1 Write crate docs: public API examples (start/pause/resume/cancel/observe), engine/job config reference, durability mode explanation, event/callback concurrency guarantees (§30), and redaction behavior; verify `cargo doc` builds without warnings
-- [ ] 8.2 Add README quickstart (embedding the engine), CHANGELOG entry for 0.1.0, and example program downloading a URL with progress display; verify example runs against the local fixture server
-- [ ] 8.3 Final verification: full `cargo test`, clippy clean, docs clean, bench baseline committed; confirm §42 acceptance checklist items each have a passing test or documented benchmark
+- [x] 8.1 Write crate docs: public API examples (start/pause/resume/cancel/observe), engine/job config reference, durability mode explanation, event/callback concurrency guarantees (§30), and redaction behavior; verify `cargo doc` builds without warnings
+- [x] 8.2 Add README quickstart (embedding the engine), CHANGELOG entry for 0.1.0, and example program downloading a URL with progress display; verify example runs against the local fixture server
+- [x] 8.3 Final verification: full `cargo test`, clippy clean, docs clean, bench baseline committed; confirm §42 acceptance checklist items each have a passing test or documented benchmark
