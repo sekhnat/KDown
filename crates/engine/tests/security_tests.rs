@@ -21,11 +21,11 @@ use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamC
 use kdown_engine::{config::AddressFilter, io::sanitize_filename};
 
 mod support;
-use support::test_server::{TestServer, ScriptedResponse};
+use support::test_server::{ScriptedResponse, TestServer};
 
 mod tls_support {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use tokio_rustls::rustls;
 
@@ -41,28 +41,23 @@ mod tls_support {
             // must reject it (§21.1). The returned CA is still this cert's
             // own — trusting it makes the cert chain valid but the NAME
             // wrong, isolating hostname validation.
-            let wrong = rcgen::generate_simple_self_signed(vec!["other.example".into()])
-                .expect("cert");
+            let wrong =
+                rcgen::generate_simple_self_signed(vec!["other.example".into()]).expect("cert");
             let pem = wrong.cert.pem().into_bytes();
             (
                 rustls::pki_types::CertificateDer::from(wrong.cert),
                 rustls::pki_types::PrivateKeyDer::Pkcs8(
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(
-                        wrong.signing_key.serialize_der(),
-                    ),
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(wrong.signing_key.serialize_der()),
                 ),
                 pem,
             )
         } else {
-            let cert =
-                rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
             let pem = cert.cert.pem().into_bytes();
             (
                 rustls::pki_types::CertificateDer::from(cert.cert),
                 rustls::pki_types::PrivateKeyDer::Pkcs8(
-                    rustls::pki_types::PrivatePkcs8KeyDer::from(
-                        cert.signing_key.serialize_der(),
-                    ),
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
                 ),
                 pem,
             )
@@ -73,17 +68,24 @@ mod tls_support {
             .expect("cert pair");
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let tls = Arc::new(cfg);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let conns = Arc::new(AtomicUsize::new(0));
         let c2 = conns.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((socket, _)) = listener.accept().await else { return };
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
                 let tls = tls.clone();
                 c2.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await else { return };
+                    let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
+                    else {
+                        return;
+                    };
                     let _ = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
                     )
@@ -95,7 +97,9 @@ mod tls_support {
                                 Ok::<_, std::convert::Infallible>(
                                     hyper::Response::builder()
                                         .header("content-length", content.len())
-                                        .body(http_body_util::Full::new(hyper::body::Bytes::from(content)))
+                                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                                            content,
+                                        )))
                                         .expect("resp"),
                                 )
                             }
@@ -178,10 +182,7 @@ async fn hostname_validation_enforced_with_custom_ca() {
     );
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
-    assert_eq!(
-        result.error.expect("err").category(),
-        ErrorCategory::Tls
-    );
+    assert_eq!(result.error.expect("err").category(), ErrorCategory::Tls);
 }
 
 /// No silent HTTPS→HTTP downgrade: a redirect from HTTPS to HTTP is
@@ -221,7 +222,10 @@ fn https_downgrade_denied_by_default() {
         "https://secure.example/f.bin",
         &[],
     );
-    assert!(matches!(d2.action, kdown_engine::http::RedirectAction::Follow { .. }));
+    assert!(matches!(
+        d2.action,
+        kdown_engine::http::RedirectAction::Follow { .. }
+    ));
 }
 
 /// Redirect credential stripping (§21.2): the redirected request carries
@@ -248,11 +252,11 @@ async fn redirect_to_other_host_strips_credentials() {
     let cfg = EngineConfig::default();
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
-    let mut req = DownloadRequest::new(
-        server.url("/start"),
-        dir.path().join("out.bin"),
-    );
-    req.headers.push(("Authorization".to_string(), "Bearer same-origin-cred".into()));
+    let mut req = DownloadRequest::new(server.url("/start"), dir.path().join("out.bin"));
+    req.headers.push((
+        "Authorization".to_string(),
+        "Bearer same-origin-cred".into(),
+    ));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
 }
@@ -302,11 +306,15 @@ fn hostile_metadata_parses_without_panics() {
 /// (§21.4) — the job fails with a structured error, not OOM.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn endless_headers_bounded() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let head = {
@@ -328,17 +336,17 @@ async fn endless_headers_bounded() {
     cfg.network.response_header_timeout = std::time::Duration::from_secs(5);
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
-    let req = DownloadRequest::new(
-        format!("http://{addr}/f.bin"),
-        dir.path().join("out.bin"),
-    );
+    let req = DownloadRequest::new(format!("http://{addr}/f.bin"), dir.path().join("out.bin"));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
     // The bound triggered: structured failure (timeout or protocol), never
     // an unbounded memory event (§21.4).
     let cat = result.error.expect("err").category();
     assert!(
-        matches!(cat, ErrorCategory::ConnectTimeout | ErrorCategory::Connection | ErrorCategory::Protocol),
+        matches!(
+            cat,
+            ErrorCategory::ConnectTimeout | ErrorCategory::Connection | ErrorCategory::Protocol
+        ),
         "bounded failure expected, got {cat:?}"
     );
 }
@@ -349,7 +357,10 @@ async fn endless_headers_bounded() {
 async fn ssrf_hook_blocks_disallowed_targets() {
     struct BlockAll;
     impl AddressFilter for BlockAll {
-        fn check(&self, target: &ConnectionTarget) -> Result<(), kdown_engine::error::DownloadError> {
+        fn check(
+            &self,
+            target: &ConnectionTarget,
+        ) -> Result<(), kdown_engine::error::DownloadError> {
             Err(kdown_engine::error::DownloadError::Proxy(format!(
                 "address filter rejected {target:?} (SSRF policy)"
             )))
@@ -370,10 +381,7 @@ async fn ssrf_hook_blocks_disallowed_targets() {
     let req = DownloadRequest::new(server.url("/f.bin"), dir.path().join("out.bin"));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
-    assert_eq!(
-        result.error.expect("err").category(),
-        ErrorCategory::Proxy
-    );
+    assert_eq!(result.error.expect("err").category(), ErrorCategory::Proxy);
     assert_eq!(result.bytes_downloaded_from_network, 0);
 }
 
@@ -383,7 +391,10 @@ async fn ssrf_hook_blocks_disallowed_targets() {
 async fn ssrf_hook_allows_permitted_targets() {
     struct AllowLoopbackOnly;
     impl AddressFilter for AllowLoopbackOnly {
-        fn check(&self, target: &ConnectionTarget) -> Result<(), kdown_engine::error::DownloadError> {
+        fn check(
+            &self,
+            target: &ConnectionTarget,
+        ) -> Result<(), kdown_engine::error::DownloadError> {
             let allowed = match target {
                 ConnectionTarget::Resolved { ip, .. } => ip.is_loopback(),
                 ConnectionTarget::Unresolved { host, .. } => {

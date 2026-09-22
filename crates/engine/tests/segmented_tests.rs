@@ -13,6 +13,7 @@ use std::time::Duration;
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{RangeMode, ScriptedResponse, TestServer};
 
@@ -34,7 +35,10 @@ fn cfg(threshold: u64) -> EngineConfig {
 }
 
 fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(HttpTransport::new(cfg.network.clone()).expect("transport"), cfg)
+    SingleStreamController::new(
+        HttpTransport::new(cfg.network.clone()).expect("transport"),
+        cfg,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -61,7 +65,10 @@ async fn segmented_download_byte_exact() {
     assert!(!dir.path().join("seg.bin.part").exists(), "no temp residue");
     // Multiple range requests prove segmented mode ran.
     let count = server.request_count("/seg.bin").await;
-    assert!(count > 1, "segmented mode issues multiple requests: {count}");
+    assert!(
+        count > 1,
+        "segmented mode issues multiple requests: {count}"
+    );
 }
 
 #[tokio::test]
@@ -351,4 +358,61 @@ async fn oversized_body_overrun_detected() {
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn segmented_resume_reuses_all_completed_ranges() {
+    // Admission-boundary evidence for segmented mode: disjoint admitted
+    // ranges are all reused, only the remaining ranges are fetched, and
+    // the output is byte-identical (§15.5, §12.1).
+    let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 2010));
+    let server = TestServer::new()
+        .serve_static("/seg-resume.bin", (*content).clone())
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("seg-resume.bin");
+    let temp = dir.path().join("seg-resume.bin.part");
+    // Partial local state: [0, 64 KiB) and [1 MiB, 1 MiB + 64 KiB).
+    let prefix_len = 64 * 1024;
+    let second_start = 1024 * 1024;
+    let mut temp_bytes = content[..prefix_len].to_vec();
+    temp_bytes.resize(second_start + prefix_len, 0);
+    temp_bytes[second_start..second_start + prefix_len]
+        .copy_from_slice(&content[second_start..second_start + prefix_len]);
+    std::fs::write(&temp, &temp_bytes).expect("temp");
+    let identity = kdown_engine::resume::job_identity(&server.url("/seg-resume.bin"), &dest);
+    let store = kdown_engine::resume::FileCheckpointStore::new(
+        dir.path(),
+        kdown_engine::resume::DurabilityMode::Performance,
+    )
+    .expect("store");
+    let mut cp =
+        kdown_engine::resume::Checkpoint::new(&identity, server.url("/seg-resume.bin"), "tmp");
+    cp.total_size = Some(content.len() as u64);
+    cp.completed_ranges = vec![
+        (0, prefix_len as u64 - 1),
+        (
+            second_start as u64,
+            second_start as u64 + prefix_len as u64 - 1,
+        ),
+    ];
+    store.save_atomic(&cp).expect("save");
+
+    let c = controller(cfg(1024 * 1024));
+    let result = c
+        .run(DownloadRequest::new(
+            server.url("/seg-resume.bin"),
+            dest.clone(),
+        ))
+        .await
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    // Both disjoint ranges counted once as reused.
+    assert_eq!(result.bytes_reused_from_checkpoint, 2 * prefix_len as u64);
+    // No residue after commit (§14.6 step 5).
+    assert!(store.load(&identity).expect("load").is_none());
+    assert!(!temp.exists());
 }

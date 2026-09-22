@@ -20,9 +20,7 @@ impl ResourceValidators {
         last_modified: Option<&str>,
         content_length: Option<u64>,
     ) -> Self {
-        let (etag, weak) = etag
-            .map(parse_etag)
-            .unwrap_or((None, false));
+        let (etag, weak) = etag.map(parse_etag).unwrap_or((None, false));
         Self {
             etag,
             etag_is_weak: weak,
@@ -98,9 +96,7 @@ pub fn if_range_value(v: &ResourceValidators) -> Option<IfRangeHeader> {
     }
     v.last_modified
         .as_ref()
-        .map(|lm| IfRangeHeader {
-            value: lm.clone(),
-        })
+        .map(|lm| IfRangeHeader { value: lm.clone() })
 }
 
 /// Parse `Content-Range: bytes S-E/TOTAL` (§11.2).
@@ -138,7 +134,10 @@ pub fn parse_content_range(v: &str) -> Result<ContentRange, ContentRangeParseErr
         .map_err(|_| ContentRangeParseError(v.to_string()))?;
     let total = match total_part.trim() {
         "*" => None,
-        t => Some(t.parse().map_err(|_| ContentRangeParseError(v.to_string()))?),
+        t => Some(
+            t.parse()
+                .map_err(|_| ContentRangeParseError(v.to_string()))?,
+        ),
     };
     if end < start {
         return Err(ContentRangeParseError(v.to_string()));
@@ -152,7 +151,11 @@ mod tests {
 
     #[test]
     fn capture_strong_etag() {
-        let v = ResourceValidators::from_headers(Some("\"abc123\""), Some("Mon, 22 Sep 2026 00:00:00 GMT"), Some(100));
+        let v = ResourceValidators::from_headers(
+            Some("\"abc123\""),
+            Some("Mon, 22 Sep 2026 00:00:00 GMT"),
+            Some(100),
+        );
         assert_eq!(v.etag.as_deref(), Some("\"abc123\""));
         assert!(!v.etag_is_weak);
         assert!(v.resume_capable());
@@ -179,15 +182,17 @@ mod tests {
 
     #[test]
     fn if_range_prefers_strong_etag() {
-        let v = ResourceValidators::from_headers(
-            Some("\"e1\""),
-            Some("date"),
-            None,
+        let v = ResourceValidators::from_headers(Some("\"e1\""), Some("date"), None);
+        assert_eq!(
+            if_range_value(&v).map(|h| h.value),
+            Some("\"e1\"".to_string())
         );
-        assert_eq!(if_range_value(&v).map(|h| h.value), Some("\"e1\"".to_string()));
         // Weak ETag falls through to Last-Modified.
         let v = ResourceValidators::from_headers(Some("W/\"e\""), Some("date"), None);
-        assert_eq!(if_range_value(&v).map(|h| h.value), Some("date".to_string()));
+        assert_eq!(
+            if_range_value(&v).map(|h| h.value),
+            Some("date".to_string())
+        );
     }
 
     #[test]
@@ -204,7 +209,14 @@ mod tests {
     #[test]
     fn content_range_parses() {
         let cr = parse_content_range("bytes 100-199/1234").expect("parse");
-        assert_eq!(cr, ContentRange { start: 100, end: 199, total: Some(1234) });
+        assert_eq!(
+            cr,
+            ContentRange {
+                start: 100,
+                end: 199,
+                total: Some(1234)
+            }
+        );
         let star = parse_content_range("bytes 0-0/*").expect("parse star");
         assert_eq!(star.total, None);
         assert!(parse_content_range("bogus 1-2/3").is_err());

@@ -23,7 +23,6 @@ fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigurationError
     }
 }
 
-
 /// Overwrite behavior at final commit (§14.6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -299,7 +298,11 @@ pub trait AddressFilter: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionTarget {
     /// Host resolved to a concrete address before connecting.
-    Resolved { host: String, ip: std::net::IpAddr, port: u16 },
+    Resolved {
+        host: String,
+        ip: std::net::IpAddr,
+        port: u16,
+    },
     /// Host not yet resolved (redirect-target pre-check).
     Unresolved { host: String, port: u16 },
 }
@@ -336,7 +339,10 @@ impl std::fmt::Debug for EngineConfig {
         f.debug_struct("EngineConfig")
             .field("max_active_jobs", &self.max_active_jobs)
             .field("max_connections_total", &self.max_connections_total)
-            .field("max_connections_per_origin", &self.max_connections_per_origin)
+            .field(
+                "max_connections_per_origin",
+                &self.max_connections_per_origin,
+            )
             .field("read_buffer_size", &self.read_buffer_size)
             .field("buffer_pool_max_bytes", &self.buffer_pool_max_bytes)
             .field("checkpoint_flush_interval", &self.checkpoint_flush_interval)
@@ -346,7 +352,10 @@ impl std::fmt::Debug for EngineConfig {
             .field("h2_policy", &self.h2_policy)
             .field("proxy", &self.proxy)
             .field("tls", &self.tls)
-            .field("address_filter", &self.address_filter.as_ref().map(|_| "<filter>"))
+            .field(
+                "address_filter",
+                &self.address_filter.as_ref().map(|_| "<filter>"),
+            )
             .field("transfer", &self.transfer)
             .field("retry", &self.retry)
             .field("network", &self.network)
@@ -395,9 +404,7 @@ fn validate_transfer(t: &TransferPolicy) -> Result<(), ConfigurationError> {
             "must be >= min_segment_size",
         ));
     }
-    if t.initial_segment_size < t.min_segment_size
-        || t.initial_segment_size > t.max_segment_size
-    {
+    if t.initial_segment_size < t.min_segment_size || t.initial_segment_size > t.max_segment_size {
         return Err(invalid(
             "transfer.initial_segment_size",
             "must be within [min_segment_size, max_segment_size]",
@@ -408,7 +415,10 @@ fn validate_transfer(t: &TransferPolicy) -> Result<(), ConfigurationError> {
 
 fn validate_retry(r: &RetryPolicy) -> Result<(), ConfigurationError> {
     if r.max_attempts_per_segment == 0 {
-        return Err(invalid("retry.max_attempts_per_segment", "must be at least 1"));
+        return Err(invalid(
+            "retry.max_attempts_per_segment",
+            "must be at least 1",
+        ));
     }
     if r.base_delay.is_zero() {
         return Err(invalid("retry.base_delay", "must be greater than zero"));
@@ -436,9 +446,16 @@ fn validate_network(n: &NetworkPolicy) -> Result<(), ConfigurationError> {
     Ok(())
 }
 
-fn validate_pool(p: &PoolConfig, max_total: u32, max_per_origin: u32) -> Result<(), ConfigurationError> {
+fn validate_pool(
+    p: &PoolConfig,
+    max_total: u32,
+    max_per_origin: u32,
+) -> Result<(), ConfigurationError> {
     if p.max_total == 0 || p.max_per_origin == 0 {
-        return Err(invalid("pool.max_total/max_per_origin", "must be at least 1"));
+        return Err(invalid(
+            "pool.max_total/max_per_origin",
+            "must be at least 1",
+        ));
     }
     if p.max_per_origin > p.max_total {
         return Err(invalid("pool.max_per_origin", "must be <= pool.max_total"));
@@ -466,10 +483,7 @@ impl EngineConfig {
             return Err(invalid("max_active_jobs", "must be at least 1"));
         }
         if self.max_connections_total == 0 || self.max_connections_per_origin == 0 {
-            return Err(invalid(
-                "max_connections_*",
-                "must be at least 1",
-            ));
+            return Err(invalid("max_connections_*", "must be at least 1"));
         }
         if self.max_connections_per_origin > self.max_connections_total {
             return Err(invalid(
@@ -487,12 +501,19 @@ impl EngineConfig {
             ));
         }
         if self.checkpoint_flush_interval.is_zero() || self.metrics_interval.is_zero() {
-            return Err(invalid("checkpoint_flush_interval/metrics_interval", "must be greater than zero"));
+            return Err(invalid(
+                "checkpoint_flush_interval/metrics_interval",
+                "must be greater than zero",
+            ));
         }
         validate_transfer(&self.transfer)?;
         validate_retry(&self.retry)?;
         validate_network(&self.network)?;
-        validate_pool(&self.pool, self.max_connections_total, self.max_connections_per_origin)?;
+        validate_pool(
+            &self.pool,
+            self.max_connections_total,
+            self.max_connections_per_origin,
+        )?;
         if let ProxyConfig::Http { url } | ProxyConfig::Socks5 { url } = &self.proxy {
             let ok = url.parse::<hyper::Uri>().is_ok()
                 && hyper::Uri::try_from(url.as_str())
@@ -500,7 +521,10 @@ impl EngineConfig {
                     .and_then(|u| u.authority().map(|a| a.port_u16().unwrap_or(0)))
                     .is_some_and(|p| p > 0);
             if !ok {
-                return Err(invalid("proxy.url", "must parse as a URI with host and port"));
+                return Err(invalid(
+                    "proxy.url",
+                    "must parse as a URI with host and port",
+                ));
             }
         }
         match &self.h2_policy {
@@ -555,7 +579,9 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         EngineConfig::default().validate().expect("defaults valid");
-        IntegrityPolicy::default().validate().expect("empty integrity valid");
+        IntegrityPolicy::default()
+            .validate()
+            .expect("empty integrity valid");
     }
 
     #[test]
@@ -580,7 +606,10 @@ mod tests {
     fn zero_max_workers_rejected() {
         let mut c = EngineConfig::default();
         c.transfer.max_workers = 0;
-        assert_eq!(c.validate().expect_err("must reject").field, "transfer.max_workers");
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer.max_workers"
+        );
     }
 
     #[test]

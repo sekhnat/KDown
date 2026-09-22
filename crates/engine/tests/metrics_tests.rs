@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm};
+use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::metrics::EngineMetrics;
-use kdown_engine::http::transport::HttpTransport;
 
 mod support;
 use support::test_server::{ScriptedResponse, TestServer};
@@ -26,7 +26,10 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
     let controller = SingleStreamController::with_metrics(transport, cfg, metrics.clone());
 
     let ok = controller
-        .run(DownloadRequest::new(server.url("/ok.bin"), dir.path().join("ok.bin")))
+        .run(DownloadRequest::new(
+            server.url("/ok.bin"),
+            dir.path().join("ok.bin"),
+        ))
         .await
         .expect("ok result");
     assert_eq!(ok.status, ResultStatus::Completed);
@@ -40,10 +43,7 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
         .expect("missing result");
     assert_eq!(missing.status, ResultStatus::Failed);
 
-    let mut bad_hash = DownloadRequest::new(
-        server.url("/ok.bin"),
-        dir.path().join("bad-hash.bin"),
-    );
+    let mut bad_hash = DownloadRequest::new(server.url("/ok.bin"), dir.path().join("bad-hash.bin"));
     bad_hash.integrity.expected_hashes = vec![ExpectedHash {
         algorithm: HashAlgorithm::Sha256,
         hex: "00".repeat(32),
@@ -60,7 +60,10 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
     assert_eq!(snapshot.status_counts.get("404"), Some(&1));
     assert_eq!(snapshot.integrity_failures, 1);
     assert!(snapshot.latency_count >= 3);
-    assert!(snapshot.retry_categories.keys().any(|k| k.contains("NotFound")));
+    assert!(snapshot
+        .retry_categories
+        .keys()
+        .any(|k| k.contains("NotFound")));
 
     // Snapshot is serializable for host telemetry/export adapters.
     let json = serde_json::to_string(&snapshot).expect("metrics JSON");

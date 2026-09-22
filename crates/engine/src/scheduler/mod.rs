@@ -2,13 +2,13 @@
 
 use crate::resume::checkpoint::ByteRange;
 
+pub mod core;
 pub mod interval_set;
 pub mod lease;
-pub mod core;
 
+pub use core::{SchedulerPolicy, SegmentScheduler};
 pub use interval_set::IntervalSet;
 pub use lease::{LeaseId, SegmentLease};
-pub use core::{SchedulerPolicy, SegmentScheduler};
 
 /// Default oversubscription factor (§12.2): 2-4 so faster workers can
 /// consume additional work instead of waiting on one slow long-lived
@@ -58,7 +58,10 @@ pub fn tile_ranges(total_size: u64, chunk: u64) -> Vec<ByteRange> {
     let mut out = Vec::new();
     let mut start = 0u64;
     while start < total_size {
-        let end = start.saturating_add(chunk).saturating_sub(1).min(total_size - 1);
+        let end = start
+            .saturating_add(chunk)
+            .saturating_sub(1)
+            .min(total_size - 1);
         out.push((start, end));
         start = end + 1;
     }
@@ -75,7 +78,7 @@ mod planning_tests {
         // [1, 64] MiB: unclamped.
         let (seg, _) = plan_segments(64 * 1024 * 1024, 4, 1024 * 1024, 64 * 1024 * 1024);
         assert_eq!(seg, 5_592_406); // ceil(67108864 / 12)
-        // Tiny file: min segment clamps up.
+                                    // Tiny file: min segment clamps up.
         let (seg, ranges) = plan_segments(100, 8, 1024, 4096);
         assert_eq!(seg, 1024);
         assert_eq!(ranges, vec![(0, 99)]);
@@ -112,11 +115,7 @@ mod planning_tests {
     #[test]
     fn boundary_sizes_tile_cleanly() {
         // Segment boundary sizes from §36.6.
-        for total in [
-            8 * 1024 * 1024 - 1,
-            8 * 1024 * 1024,
-            8 * 1024 * 1024 + 1,
-        ] {
+        for total in [8 * 1024 * 1024 - 1, 8 * 1024 * 1024, 8 * 1024 * 1024 + 1] {
             let (seg, ranges) = plan_segments(total, 4, 1024 * 1024, 64 * 1024 * 1024);
             assert!((1024 * 1024..=64 * 1024 * 1024).contains(&seg));
             let covered: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();

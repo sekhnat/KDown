@@ -202,7 +202,10 @@ mod tests {
     #[test]
     fn redacted_headers_display() {
         let headers = vec![
-            ("Authorization".to_string(), "Bearer secret-token".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
             ("cookie".to_string(), "session=abc".to_string()),
             ("set-cookie".to_string(), "sid=xyz".to_string()),
             ("proxy-authorization".to_string(), "Basic xyz".to_string()),

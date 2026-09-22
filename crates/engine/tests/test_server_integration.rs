@@ -25,13 +25,18 @@ async fn raw_get(
     } else {
         format!("{host}:80")
     };
-    let mut stream = tokio::net::TcpStream::connect(&addr).await.expect("connect");
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect");
     let mut req = format!("GET /{path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n");
     for (k, v) in extra_headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.expect("write request");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request");
     let mut buf = Vec::new();
     let mut read_buf = [0u8; 16384];
     // Read until content-length is satisfied or connection closes.
@@ -108,11 +113,14 @@ async fn correct_range_returns_206_with_content_range() {
         .start()
         .await
         .expect("start");
-    let (status, headers, body) =
-        raw_get(&server.url("/r"), &[("range", "bytes=10-19")]).await;
+    let (status, headers, body) = raw_get(&server.url("/r"), &[("range", "bytes=10-19")]).await;
     assert_eq!(status, 206);
     assert_eq!(
-        headers.iter().find(|(k, _)| k == "content-range").unwrap().1,
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-range")
+            .unwrap()
+            .1,
         "bytes 10-19/101"
     );
     assert_eq!(body, (10u8..=19u8).collect::<Vec<u8>>());
@@ -139,7 +147,9 @@ async fn no_ranges_mode_never_advertises() {
         .await
         .expect("start");
     // HEAD-like probe: headers only.
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port_of(&server))).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port_of(&server)))
+        .await
+        .unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream
         .write_all(b"HEAD /plain HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
@@ -175,7 +185,9 @@ async fn malformed_content_range_is_served() {
 async fn truncated_body_then_connection_close() {
     let body = vec![9u8; 1000];
     let server = TestServer::new()
-        .serve_handler("/cut", move |_req| ScriptedResponse::ok(body.clone()).reset_after(200))
+        .serve_handler("/cut", move |_req| {
+            ScriptedResponse::ok(body.clone()).reset_after(200)
+        })
         .start()
         .await
         .expect("start");
@@ -197,7 +209,10 @@ async fn delayed_chunks_arrive_slowly() {
     let start = std::time::Instant::now();
     let (_, _, got) = raw_get(&server.url("/slow"), &[]).await;
     assert_eq!(got, vec![3u8; 200_000]);
-    assert!(start.elapsed() >= Duration::from_millis(250), "chunks must be delayed");
+    assert!(
+        start.elapsed() >= Duration::from_millis(250),
+        "chunks must be delayed"
+    );
 }
 
 #[tokio::test]

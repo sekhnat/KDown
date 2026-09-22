@@ -61,8 +61,7 @@ impl BufferPool {
     #[must_use]
     pub fn new(buffer_size: usize, max_total_bytes: u64) -> Self {
         let buffer_size = buffer_size.max(1);
-        let max_buffers =
-            (max_total_bytes as usize / buffer_size).max(1);
+        let max_buffers = (max_total_bytes as usize / buffer_size).max(1);
         Self {
             buffer_size,
             max_buffers,
@@ -183,18 +182,12 @@ impl PooledBuffer {
     /// Frozen view of the buffer contents (zero-copy hand-off to transport).
     #[must_use]
     pub fn freeze(&mut self) -> Bytes {
-        self.buf
-            .as_mut()
-            .expect("buffer alive")
-            .split()
-            .freeze()
+        self.buf.as_mut().expect("buffer alive").split().freeze()
     }
 
     /// Mutable access for filling from the network.
     pub fn fill_mut(&mut self) -> &mut BytesMut {
-        self.buf
-            .as_mut()
-            .expect("exhausted sentinel has no buffer")
+        self.buf.as_mut().expect("exhausted sentinel has no buffer")
     }
 
     #[must_use]

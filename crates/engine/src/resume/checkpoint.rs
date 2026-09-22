@@ -86,8 +86,7 @@ impl Checkpoint {
     /// # Errors
     /// Serialization failure (should not happen for this plain model).
     pub fn to_json(&self) -> Result<String, CheckpointError> {
-        serde_json::to_string(self)
-            .map_err(|e| CheckpointError::Corrupt(e.to_string()))
+        serde_json::to_string(self).map_err(|e| CheckpointError::Corrupt(e.to_string()))
     }
 
     /// Parse and validate from JSON (§15.5 step 1).
@@ -98,8 +97,8 @@ impl Checkpoint {
     pub fn from_json(json: &str) -> Result<Self, CheckpointError> {
         // Unknown-field tolerant: serde default behavior ignores extras
         // with serde_json::from_str unless deny_unknown_fields is set.
-        let cp: Checkpoint = serde_json::from_str(json)
-            .map_err(|e| CheckpointError::Corrupt(e.to_string()))?;
+        let cp: Checkpoint =
+            serde_json::from_str(json).map_err(|e| CheckpointError::Corrupt(e.to_string()))?;
         cp.validate()?;
         Ok(cp)
     }
@@ -172,10 +171,7 @@ impl Checkpoint {
     /// Bytes covered by completed ranges (unique, §19.1).
     #[must_use]
     pub fn completed_bytes(&self) -> u64 {
-        self.completed_ranges
-            .iter()
-            .map(|(s, e)| e - s + 1)
-            .sum()
+        self.completed_ranges.iter().map(|(s, e)| e - s + 1).sum()
     }
 }
 
@@ -246,10 +242,7 @@ mod tests {
         cp.format_version = CHECKPOINT_FORMAT_VERSION + 1;
         let json = cp.to_json().expect("serialize");
         let err = Checkpoint::from_json(&json).expect_err("newer version must reject");
-        assert!(matches!(
-            err,
-            CheckpointError::UnsupportedVersion { .. }
-        ));
+        assert!(matches!(err, CheckpointError::UnsupportedVersion { .. }));
     }
 
     #[test]
@@ -274,10 +267,7 @@ mod tests {
         cp.record_completed(0, 99);
         cp.record_completed(100, 199); // adjacent -> merge
         cp.record_completed(490, 599); // overlap -> merge
-        assert_eq!(
-            cp.completed_ranges,
-            vec![(0, 199), (400, 599)]
-        );
+        assert_eq!(cp.completed_ranges, vec![(0, 199), (400, 599)]);
         assert_eq!(cp.completed_bytes(), 400);
     }
 }

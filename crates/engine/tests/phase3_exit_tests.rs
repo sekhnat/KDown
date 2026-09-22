@@ -39,7 +39,10 @@ fn cfg(threshold: u64, max_segment: u64) -> EngineConfig {
 }
 
 fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(HttpTransport::new(cfg.network.clone()).expect("transport"), cfg)
+    SingleStreamController::new(
+        HttpTransport::new(cfg.network.clone()).expect("transport"),
+        cfg,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -58,11 +61,8 @@ fn property_sequences_pause_and_resume_cover_exactly() {
         state
     };
     for total in [1u64, 63, 1023, 4096, 100_003] {
-        let mut s = SegmentScheduler::initialize(
-            total,
-            &[],
-            SchedulerPolicy::new(1, (total / 3).max(1)),
-        );
+        let mut s =
+            SegmentScheduler::initialize(total, &[], SchedulerPolicy::new(1, (total / 3).max(1)));
         for _step in 0..400 {
             let roll = next() % 6;
             // Invariants continuously (§12.1).
@@ -217,7 +217,11 @@ async fn boundary_sizes_randomized_failures_exact() {
             .expect("start");
         let dir = tempfile::tempdir().expect("tmp");
         let dest = dir.path().join("b.bin");
-        let threshold = if size >= 2 * SEGMENT { SEGMENT / 2 } else { u64::MAX };
+        let threshold = if size >= 2 * SEGMENT {
+            SEGMENT / 2
+        } else {
+            u64::MAX
+        };
         let max_segment = SEGMENT / 4;
         let c = controller(cfg(threshold, max_segment));
         let result = tokio::time::timeout(
@@ -227,7 +231,11 @@ async fn boundary_sizes_randomized_failures_exact() {
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "size {size}: {result:?}");
+        assert_eq!(
+            result.status,
+            ResultStatus::Completed,
+            "size {size}: {result:?}"
+        );
         if size == 0 {
             // Empty file: destination may exist as an empty file or not.
             continue;
@@ -243,14 +251,9 @@ async fn boundary_sizes_randomized_failures_exact() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn boundary_sizes_with_resets_exact() {
     // Same boundary sizes under randomized connection resets.
-    for (idx, size) in [
-        1u64,
-        CHUNK + 1,
-        SEGMENT + 1,
-        3 * SEGMENT + 1,
-    ]
-    .into_iter()
-    .enumerate()
+    for (idx, size) in [1u64, CHUNK + 1, SEGMENT + 1, 3 * SEGMENT + 1]
+        .into_iter()
+        .enumerate()
     {
         let content = Arc::new(deterministic_bytes(size, 50_000 + idx as u64));
         let (server, hits) = flaky_segmented("/r.bin", content.clone()).await;
@@ -282,8 +285,7 @@ async fn oversized_4gib_sparse_download_exact() {
     // download writes a real (sparse) temp file and must complete with the
     // exact size. Sampling verifies byte positions match the fill.
     const FOUR_GIB_PLUS: u64 = 4 * 1024 * 1024 * 1024 + 1024 * 1024; // 4 GiB + 1 MiB
-    let fill: support::test_server::SparseFill =
-        Arc::new(|off: u64| ((off >> 3) ^ off) as u8);
+    let fill: support::test_server::SparseFill = Arc::new(|off: u64| ((off >> 3) ^ off) as u8);
     let server = TestServer::new()
         .serve_handler("/huge", move |req| {
             let len = FOUR_GIB_PLUS;
@@ -298,10 +300,8 @@ async fn oversized_4gib_sparse_download_exact() {
                 // Sparse: materialize only this slice's bytes.
                 let start = s;
                 let f = fill.clone();
-                let mut r = ScriptedResponse::new(206).with_header(
-                    "content-range",
-                    &format!("bytes {s}-{end}/{len}"),
-                );
+                let mut r = ScriptedResponse::new(206)
+                    .with_header("content-range", &format!("bytes {s}-{end}/{len}"));
                 r.sparse_len = Some(span);
                 r.sparse_fill = Some(Arc::new(move |off: u64| f(start + off)));
                 r.with_header("accept-ranges", "bytes")

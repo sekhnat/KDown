@@ -100,9 +100,7 @@ impl TokenBucket {
     pub async fn acquire_async(&self, bytes: u64) {
         match self.acquire(bytes) {
             Acquisition { wait: None } => {}
-            Acquisition {
-                wait: Some(d),
-            } => tokio::time::sleep(d).await,
+            Acquisition { wait: Some(d) } => tokio::time::sleep(d).await,
         }
     }
 }
@@ -269,6 +267,9 @@ mod tests {
         let start = Instant::now();
         b.acquire_async(10_000).await; // full second's worth
         let elapsed = start.elapsed();
-        assert!(elapsed >= std::time::Duration::from_millis(900), "{elapsed:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "{elapsed:?}"
+        );
     }
 }

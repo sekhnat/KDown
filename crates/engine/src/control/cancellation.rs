@@ -119,10 +119,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             t2.pause();
         });
-        let reason = tokio::time::timeout(std::time::Duration::from_secs(2), t.cancelled_or_paused())
-            .await
-            .expect("resolves")
-            ;
+        let reason =
+            tokio::time::timeout(std::time::Duration::from_secs(2), t.cancelled_or_paused())
+                .await
+                .expect("resolves");
         assert_eq!(reason, CancellationReason::Paused);
     }
 }

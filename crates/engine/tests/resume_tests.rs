@@ -12,7 +12,7 @@ use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
-use kdown_engine::resume::{DurabilityMode, FileCheckpointStore, ResumeSupport};
+use kdown_engine::resume::{DurabilityMode, FileCheckpointStore};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -58,7 +58,10 @@ fn flaky(path: &'static str, content: Arc<Vec<u8>>, failures: u32) -> TestServer
 #[tokio::test]
 async fn interrupted_download_resumes_byte_identical() {
     let content = Arc::new(deterministic_bytes(1024 * 1024, 7001));
-    let server = flaky("/res.bin", content.clone(), 1).start().await.expect("start");
+    let server = flaky("/res.bin", content.clone(), 1)
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("res.bin");
     let c = controller_fast();
@@ -74,7 +77,10 @@ async fn interrupted_download_resumes_byte_identical() {
     // Checkpoint deleted on success (§14.6 step 5).
     let identity = kdown_engine::resume::job_identity(&server.url("/res.bin"), &dest);
     let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
-    assert!(store.load(&identity).expect("load").is_none(), "committed download leaves no checkpoint");
+    assert!(
+        store.load(&identity).expect("load").is_none(),
+        "committed download leaves no checkpoint"
+    );
     assert!(!dir.path().join("res.bin.part").exists());
 }
 
@@ -106,7 +112,10 @@ async fn checkpoint_written_during_transfer_and_valid() {
     let cp = store.load(&identity).expect("load");
     if let Some(cp) = cp {
         assert_eq!(cp.total_size, Some(400_000));
-        assert_eq!(cp.completed_ranges, vec![(0, cp.completed_bytes().saturating_sub(1))]);
+        assert_eq!(
+            cp.completed_ranges,
+            vec![(0, cp.completed_bytes().saturating_sub(1))]
+        );
         assert!(cp.completed_bytes() > 0, "progress was recorded");
     }
     handle.cancel();
@@ -294,7 +303,10 @@ async fn corrupt_checkpoint_fails_safely() {
 
     let c = controller();
     let result = c
-        .run(DownloadRequest::new(server.url("/corrupt.bin"), dest.clone()))
+        .run(DownloadRequest::new(
+            server.url("/corrupt.bin"),
+            dest.clone(),
+        ))
         .await
         .expect("terminal");
     // Conservative recovery: corrupt checkpoint -> restart from zero,
@@ -303,9 +315,177 @@ async fn corrupt_checkpoint_fails_safely() {
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
-#[test]
-fn remaining_ranges_for_single_stream_resume() {
-    // Single-stream checkpoints record a [0, n) prefix.
-    let remaining = ResumeSupport::remaining_ranges(1000, &[(0, 499)]);
-    assert_eq!(remaining, vec![(500, 999)]);
+#[tokio::test]
+async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
+    // Admission-boundary evidence for sequential mode: a valid checkpoint
+    // plus temp file continue at the completed prefix, count exactly that
+    // prefix as reused, and finish byte-identically (§15.5).
+    let content = Arc::new(deterministic_bytes(64 * 1024, 78));
+    let server = TestServer::new()
+        .serve_static("/prefix.bin", (*content).clone())
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("prefix.bin");
+    let prefix_len = 16 * 1024;
+    let temp = dir.path().join("prefix.bin.part");
+    std::fs::write(&temp, &content[..prefix_len]).expect("temp");
+    let identity = kdown_engine::resume::job_identity(&server.url("/prefix.bin"), &dest);
+    let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
+    let mut cp = kdown_engine::resume::Checkpoint::new(&identity, server.url("/prefix.bin"), "tmp");
+    cp.total_size = Some(content.len() as u64);
+    cp.completed_ranges = vec![(0, prefix_len as u64 - 1)];
+    store.save_atomic(&cp).expect("save");
+
+    let c = controller();
+    let result = c
+        .run(DownloadRequest::new(
+            server.url("/prefix.bin"),
+            dest.clone(),
+        ))
+        .await
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    assert_eq!(result.bytes_reused_from_checkpoint, prefix_len as u64);
+    // Committed download leaves no resumable state (§14.6 step 5).
+    assert!(store.load(&identity).expect("load").is_none());
+    assert!(!temp.exists());
+}
+
+#[tokio::test]
+async fn required_resume_without_checkpoint_fails_before_probing() {
+    // Admission begins before the probe: a required checkpoint that is
+    // missing rejects the job before the Probing transition, so no
+    // probing state change or probe is ever observed (§15.5, §7.2). The
+    // delayed HEAD guarantees any Probing emission in any implementation
+    // variant would still land after the subscription below.
+    let content = Arc::new(vec![3u8; 4096]);
+    let server = TestServer::new()
+        .serve_handler("/req-miss.bin", move |_req| {
+            ScriptedResponse::ok((*content).clone())
+                .delayed_headers(std::time::Duration::from_millis(400))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("req-miss.bin");
+    let mut request = DownloadRequest::new(server.url("/req-miss.bin"), dest.clone());
+    request.resume = kdown_engine::config::ResumePolicy::Required;
+    let c = controller();
+    let (handle, join) = c.start(request);
+    let mut events = handle.events();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("prompt")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Failed);
+    assert!(
+        matches!(
+            result.error,
+            Some(kdown_engine::DownloadError::Checkpoint(_))
+        ),
+        "structured checkpoint error expected, got {:?}",
+        result.error
+    );
+    // The stream must stay empty: the job never probed and never emitted.
+    if let Some(event) = tokio::time::timeout(std::time::Duration::from_millis(50), events.next())
+        .await
+        .ok()
+        .flatten()
+    {
+        panic!("unexpected event from pre-probe failure: {event:?}");
+    }
+    assert_eq!(handle.state(), kdown_engine::job::JobState::Failed);
+}
+
+#[tokio::test]
+async fn stale_generation_emits_resource_changed_before_failure() {
+    // Event-ordering evidence (§26): the resource-change notice is
+    // published while the job is still operational, before it
+    // terminates Failed. The delayed HEAD guarantees the subscription
+    // below precedes every probe-time event in any implementation
+    // variant.
+    let content = Arc::new(vec![7u8; 4096]);
+    let server = TestServer::new()
+        .serve_handler("/gen-order.bin", move |req| {
+            let mut r = ScriptedResponse::ok((*content).clone());
+            r.headers.push(("etag".into(), "\"gen-now\"".into()));
+            r.headers.push(("accept-ranges".into(), "bytes".into()));
+            if req.method == "HEAD" {
+                return r.delayed_headers(std::time::Duration::from_millis(300));
+            }
+            r
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("gen-order.bin");
+    let temp = dir.path().join("gen-order.bin.part");
+    std::fs::write(&temp, vec![9u8; 2048]).expect("temp");
+    let identity = kdown_engine::resume::job_identity(&server.url("/gen-order.bin"), &dest);
+    let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
+    let mut cp =
+        kdown_engine::resume::Checkpoint::new(&identity, server.url("/gen-order.bin"), "tmp");
+    cp.total_size = Some(4096);
+    cp.validators = kdown_engine::http::validators::ResourceValidators {
+        etag: Some("\"gen-stale\"".into()),
+        etag_is_weak: false,
+        last_modified: None,
+        total_size: Some(4096),
+    };
+    cp.completed_ranges = vec![(0, 2047)];
+    store.save_atomic(&cp).expect("save stale checkpoint");
+
+    let c = controller();
+    let (handle, join) = c.start(DownloadRequest::new(
+        server.url("/gen-order.bin"),
+        dest.clone(),
+    ));
+    let mut events = handle.events();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("prompt")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Failed);
+    assert!(
+        matches!(
+            result.error,
+            Some(kdown_engine::DownloadError::ResourceChanged(_))
+        ),
+        "structured ResourceChanged expected, got {:?}",
+        result.error
+    );
+    // Old partial data preserved (Fail policy, §26).
+    assert!(temp.exists());
+    // The ResourceChanged notice must precede the terminal failure.
+    let mut saw_probe_completed = false;
+    let mut resource_changed: Option<usize> = None;
+    let mut index = 0;
+    while let Some(event) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), events.next())
+            .await
+            .ok()
+            .flatten()
+    {
+        match event {
+            kdown_engine::Event::ProbeCompleted { .. } => saw_probe_completed = true,
+            kdown_engine::Event::ResourceChanged { .. } => {
+                resource_changed = Some(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    assert!(saw_probe_completed, "probe completed before the decision");
+    assert!(
+        resource_changed.is_some(),
+        "ResourceChanged must be published for a stale checkpoint"
+    );
+    assert_eq!(handle.state(), kdown_engine::job::JobState::Failed);
 }

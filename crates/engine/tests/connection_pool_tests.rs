@@ -70,8 +70,14 @@ async fn per_origin_limit_holds_with_two_jobs() {
     }
     let ra = ja.await.expect("job a").expect("result a");
     let rb = jb.await.expect("job b").expect("result b");
-    assert_eq!(ra.status, kdown_engine::job::controller::ResultStatus::Completed);
-    assert_eq!(rb.status, kdown_engine::job::controller::ResultStatus::Completed);
+    assert_eq!(
+        ra.status,
+        kdown_engine::job::controller::ResultStatus::Completed
+    );
+    assert_eq!(
+        rb.status,
+        kdown_engine::job::controller::ResultStatus::Completed
+    );
 
     // The observed concurrency never exceeded the per-origin cap (§27.2).
     assert!(
@@ -81,14 +87,18 @@ async fn per_origin_limit_holds_with_two_jobs() {
     );
 
     let expect = fixtures::sha256_hex(&content);
-    assert_eq!(fixtures::file_sha256(dest_a.as_path()), fixtures::sha256_hex(&content));
-    assert_eq!(fixtures::file_sha256(dest_b.as_path()), fixtures::sha256_hex(&content));
+    assert_eq!(
+        fixtures::file_sha256(dest_a.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+    assert_eq!(
+        fixtures::file_sha256(dest_b.as_path()),
+        fixtures::sha256_hex(&content)
+    );
     drop(expect);
 }
 
-fn ha_done(
-    _h: &kdown_engine::job::controller::DownloadHandle,
-) -> bool {
+fn ha_done(_h: &kdown_engine::job::controller::DownloadHandle) -> bool {
     // Polling helper: we simply let the join handles complete; sampling
     // runs during the transfer.
     false
@@ -120,8 +130,14 @@ async fn other_origin_unaffected_by_first_origin_limit() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let req = DownloadRequest::new(format!("{base}one.bin"), dir.path().join("one.bin"));
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, kdown_engine::job::controller::ResultStatus::Completed);
-    assert_eq!(fixtures::file_sha256(dir.path().join("one.bin").as_path()), fixtures::sha256_hex(&content));
+    assert_eq!(
+        result.status,
+        kdown_engine::job::controller::ResultStatus::Completed
+    );
+    assert_eq!(
+        fixtures::file_sha256(dir.path().join("one.bin").as_path()),
+        fixtures::sha256_hex(&content)
+    );
 }
 
 /// A pooled keep-alive connection closed by the server before a request is
@@ -155,6 +171,9 @@ async fn stale_pooled_connection_retried_safely() {
             kdown_engine::job::controller::ResultStatus::Completed,
             "iteration {i}"
         );
-        assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(&content));
+        assert_eq!(
+            fixtures::file_sha256(dest.as_path()),
+            fixtures::sha256_hex(&content)
+        );
     }
 }

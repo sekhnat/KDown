@@ -7,8 +7,8 @@
 //! targets, credential redaction, and the credential provider callback
 //! with bounded challenge stages (no auth-retry loops).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ProxyConfig};
 use kdown_engine::http::transport::HttpTransport;
@@ -22,7 +22,15 @@ const CONTENT: &[u8] = b"proxy tunnel payload 0123456789";
 /// A minimal HTTP CONNECT proxy: on `CONNECT host:port`, opens a tunnel
 /// after optionally checking `Proxy-Authorization`; then relays bytes.
 async fn start_proxy(require_auth: bool, stats: Arc<ProxyStats>) -> std::net::SocketAddr {
-    start_connect_proxy_inner(if require_auth { Some("user:secret") } else { None }, stats).await
+    start_connect_proxy_inner(
+        if require_auth {
+            Some("user:secret")
+        } else {
+            None
+        },
+        stats,
+    )
+    .await
 }
 
 async fn start_connect_proxy_inner(
@@ -151,12 +159,6 @@ fn check_basic(header: &str, expected_userpass: &str) -> bool {
     header.trim() == format!("Basic {encoded}")
 }
 
-
-
-
-
-
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn https_through_connect_proxy_with_credentials() {
     let stats = Arc::new(ProxyStats::default());
@@ -183,8 +185,15 @@ async fn https_through_connect_proxy_with_credentials() {
     );
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(CONTENT));
-    assert_eq!(stats.connects.load(Ordering::SeqCst), 1, "one CONNECT tunnel");
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(CONTENT)
+    );
+    assert_eq!(
+        stats.connects.load(Ordering::SeqCst),
+        1,
+        "one CONNECT tunnel"
+    );
     // TLS validation still applied end-to-end (the origin is self-signed;
     // the download succeeded only because the CA bundle trusted it).
 }
@@ -203,13 +212,13 @@ async fn plain_http_through_proxy_uses_absolute_form() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
-    let req = DownloadRequest::new(
-        format!("http://{origin_addr}/f.bin"),
-        dest.clone(),
-    );
+    let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(CONTENT));
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(CONTENT)
+    );
     // HEAD probe + GET = 2 requests (documented pipeline §9.1).
     assert_eq!(stats.plain_requests.load(Ordering::SeqCst), 2);
 }
@@ -231,10 +240,7 @@ async fn proxy_auth_failure_fails_structured() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
-    let req = DownloadRequest::new(
-        format!("http://{origin_addr}/f.bin"),
-        dest.clone(),
-    );
+    let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
     let err = result.error.expect("structured error");
@@ -251,7 +257,7 @@ async fn proxy_auth_failure_fails_structured() {
 /// (§29).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credential_provider_satisfies_challenge_once() {
-    use kdown_engine::control::auth::{CredentialDecision, provider_fn, Challenge};
+    use kdown_engine::control::auth::{provider_fn, Challenge, CredentialDecision};
     let calls = Arc::new(AtomicUsize::new(0));
     let provider_calls = calls.clone();
     let provider = provider_fn(move |ch: &Challenge| {
@@ -275,7 +281,10 @@ async fn credential_provider_satisfies_challenge_once() {
     req.credential_provider = Some(Arc::from(provider));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(fixtures::file_sha256(dir.path().join("out.bin").as_path()), fixtures::sha256_hex(CONTENT));
+    assert_eq!(
+        fixtures::file_sha256(dir.path().join("out.bin").as_path()),
+        fixtures::sha256_hex(CONTENT)
+    );
     // Exactly one provider consultation: the credential worked (§29).
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -284,11 +293,13 @@ async fn credential_provider_satisfies_challenge_once() {
 /// twice (MAX_AUTH_STAGES), then the job fails with the structured error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_credentials_fail_without_loop() {
-    use kdown_engine::control::auth::{CredentialDecision, provider_fn};
-    let provider = provider_fn(|_ch| Ok(CredentialDecision::Headers(vec![(
-        "Authorization".to_string(),
-        "Bearer wrong-token".to_string(),
-    )])));
+    use kdown_engine::control::auth::{provider_fn, CredentialDecision};
+    let provider = provider_fn(|_ch| {
+        Ok(CredentialDecision::Headers(vec![(
+            "Authorization".to_string(),
+            "Bearer wrong-token".to_string(),
+        )]))
+    });
     let origin_addr = start_plain_origin_auth().await;
     let dir = tempfile::tempdir().expect("tmpdir");
 
@@ -314,8 +325,7 @@ async fn bad_credentials_fail_without_loop() {
 
 async fn start_tls_origin() -> (std::net::SocketAddr, Vec<u8>) {
     use tokio_rustls::rustls;
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("cert");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let ca_pem = cert.cert.pem().into_bytes();
     let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -327,14 +337,21 @@ async fn start_tls_origin() -> (std::net::SocketAddr, Vec<u8>) {
         .expect("cert pair");
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls = Arc::new(cfg);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             let tls = tls.clone();
             tokio::spawn(async move {
-                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await else { return };
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
+                else {
+                    return;
+                };
                 let served = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )
@@ -358,11 +375,15 @@ async fn start_tls_origin() -> (std::net::SocketAddr, Vec<u8>) {
 }
 
 async fn start_plain_origin() -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .timer(hyper_util::rt::TokioTimer::new())
@@ -372,7 +393,9 @@ async fn start_plain_origin() -> std::net::SocketAddr {
                             Ok::<_, std::convert::Infallible>(
                                 hyper::Response::builder()
                                     .header("content-length", CONTENT.len())
-                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(CONTENT)))
+                                    .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                                        CONTENT,
+                                    )))
                                     .expect("resp"),
                             )
                         }),
@@ -386,39 +409,45 @@ async fn start_plain_origin() -> std::net::SocketAddr {
 
 /// Origin that demands `Authorization: Bearer good-token` (401 first).
 async fn start_plain_origin_auth() -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { return };
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .timer(hyper_util::rt::TokioTimer::new())
                     .serve_connection(
                         hyper_util::rt::TokioIo::new(socket),
-                        hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
-                            let auth_ok = req
-                                .headers()
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .is_some_and(|v| v == "Bearer good-token");
-                            if auth_ok {
-                                Ok::<_, std::convert::Infallible>(
-                                    hyper::Response::builder()
-                                        .header("content-length", CONTENT.len())
-                                        .body(http_body_util::Full::new(hyper::body::Bytes::from(CONTENT)))
-                                        .expect("resp"),
-                                )
-                            } else {
-                                Ok(
-                                    hyper::Response::builder()
+                        hyper::service::service_fn(
+                            |req: hyper::Request<hyper::body::Incoming>| async move {
+                                let auth_ok = req
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| v == "Bearer good-token");
+                                if auth_ok {
+                                    Ok::<_, std::convert::Infallible>(
+                                        hyper::Response::builder()
+                                            .header("content-length", CONTENT.len())
+                                            .body(http_body_util::Full::new(
+                                                hyper::body::Bytes::from(CONTENT),
+                                            ))
+                                            .expect("resp"),
+                                    )
+                                } else {
+                                    Ok(hyper::Response::builder()
                                         .status(401)
                                         .header("www-authenticate", "Bearer realm=\"kdown\"")
                                         .body(http_body_util::Full::new(hyper::body::Bytes::new()))
-                                        .expect("resp"),
-                                )
-                            }
-                        }),
+                                        .expect("resp"))
+                                }
+                            },
+                        ),
                     )
                     .await;
             });

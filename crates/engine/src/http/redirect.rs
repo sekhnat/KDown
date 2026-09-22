@@ -38,7 +38,9 @@ pub struct RedirectDecision {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RedirectAction {
-    Follow { location: String },
+    Follow {
+        location: String,
+    },
     /// Not a redirect response; treat as final.
     Final,
     /// Redirect chain is invalid; the engine must fail.
@@ -135,9 +137,9 @@ impl RedirectTracker {
         // Cross-origin credential stripping (§21.2).
         let strip = !self.policy.forward_cross_origin_credentials
             && origin_of(current_url) != origin_of(loc)
-            && current_headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("cookie"));
+            && current_headers.iter().any(|(k, _)| {
+                k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("cookie")
+            });
 
         RedirectDecision {
             action: RedirectAction::Follow {
@@ -177,8 +179,15 @@ mod tests {
     fn follows_bounded_chain() {
         let mut t = RedirectTracker::new(RedirectPolicy::default());
         for hop in 0..10u32 {
-            let d = follow_chain(&mut t, "http://a.example/x", &format!("http://b.example/h{hop}"));
-            assert!(matches!(d.action, RedirectAction::Follow { .. }), "hop {hop}");
+            let d = follow_chain(
+                &mut t,
+                "http://a.example/x",
+                &format!("http://b.example/h{hop}"),
+            );
+            assert!(
+                matches!(d.action, RedirectAction::Follow { .. }),
+                "hop {hop}"
+            );
         }
         let d = follow_chain(&mut t, "http://b.example/x", "http://c.example/z");
         assert!(
@@ -194,7 +203,10 @@ mod tests {
         assert!(matches!(d1.action, RedirectAction::Follow { .. }));
         let d2 = follow_chain(&mut t, "http://a/y", "http://a/y");
         assert!(
-            matches!(d2.action, RedirectAction::Reject(DownloadError::Redirect(_))),
+            matches!(
+                d2.action,
+                RedirectAction::Reject(DownloadError::Redirect(_))
+            ),
             "repeated location must be detected as a loop"
         );
     }

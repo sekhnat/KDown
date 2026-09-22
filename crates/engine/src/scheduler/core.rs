@@ -125,7 +125,12 @@ impl SegmentScheduler {
     /// Report durable progress for a lease (§31): advance `next_offset` to
     /// `durable_through_offset` (bytes `[start, offset)` are written).
     /// Rejects stale generations; never moves the offset backward.
-    pub fn report_progress(&mut self, lease_id: LeaseId, generation: u64, durable_through_offset: u64) -> bool {
+    pub fn report_progress(
+        &mut self,
+        lease_id: LeaseId,
+        generation: u64,
+        durable_through_offset: u64,
+    ) -> bool {
         let Some(lease) = self.active.get_mut(&lease_id) else {
             return false;
         };
@@ -223,7 +228,12 @@ impl SegmentScheduler {
     /// worker (§12.3). Only bytes at/after the lease's live `next_offset`
     /// may move — bytes read or queued for write are excluded. Returns the
     /// new lease covering the tail. Stale generations are rejected.
-    pub fn split_tail(&mut self, lease_id: LeaseId, generation: u64, min_tail: u64) -> Option<SegmentLease> {
+    pub fn split_tail(
+        &mut self,
+        lease_id: LeaseId,
+        generation: u64,
+        min_tail: u64,
+    ) -> Option<SegmentLease> {
         let min_tail = min_tail.max(1);
         let lease = *self.active.get(&lease_id)?;
         if lease.generation != generation {
@@ -377,7 +387,10 @@ mod tests {
         assert_eq!(active[0].next_offset, 8_192);
         // Checkpoint after absorb claims exactly the absorbed bytes.
         let ranges = s.completed_ranges();
-        assert!(ranges.is_empty(), "absorbed progress is in-flight, not complete");
+        assert!(
+            ranges.is_empty(),
+            "absorbed progress is in-flight, not complete"
+        );
         // Fail after absorb: prefix completes, tail requeues (§17.3).
         assert!(s.fail(lease.id, lease.generation));
         assert_eq!(s.completed_ranges(), vec![(lease.start, 8_191)]);
@@ -421,7 +434,11 @@ mod tests {
         assert_eq!(s.pending_bytes(), 0);
         assert_eq!(s.active_bytes(), 10_000);
         assert!(!s.is_complete());
-        assert_eq!(s.active_leases().len(), 1, "whole domain fits one max segment");
+        assert_eq!(
+            s.active_leases().len(),
+            1,
+            "whole domain fits one max segment"
+        );
     }
 
     #[test]
@@ -431,7 +448,10 @@ mod tests {
         let stale_gen = lease.generation.wrapping_add(1);
         assert!(!s.complete(lease.id, stale_gen), "stale complete rejected");
         assert!(!s.fail(lease.id, stale_gen), "stale fail rejected");
-        assert!(!s.report_progress(lease.id, stale_gen, 50), "stale progress rejected");
+        assert!(
+            !s.report_progress(lease.id, stale_gen, 50),
+            "stale progress rejected"
+        );
         // Current generation still works.
         assert!(s.report_progress(lease.id, lease.generation, 50));
         assert!(s.complete(lease.id, lease.generation));
@@ -473,7 +493,10 @@ mod tests {
         let mut s = sched(100);
         let l = s.acquire().expect("lease");
         assert!(s.complete(l.id, l.generation));
-        assert!(!s.complete(l.id, l.generation), "second complete must be rejected");
+        assert!(
+            !s.complete(l.id, l.generation),
+            "second complete must be rejected"
+        );
         assert_eq!(s.completed_ranges(), vec![(l.start, l.end)]);
     }
 
@@ -505,7 +528,10 @@ mod tests {
         // Worker consumed 2,000 bytes.
         assert!(s.report_progress(l.id, l.generation, 2_000));
         let tail = s.split_tail(l.id, l.generation, 100).expect("split");
-        assert!(tail.start >= 2_000, "split must exclude consumed bytes (§12.3)");
+        assert!(
+            tail.start >= 2_000,
+            "split must exclude consumed bytes (§12.3)"
+        );
         assert_eq!(tail.next_offset, tail.start, "split lease starts fresh");
         let orig = s
             .active_leases()
@@ -521,9 +547,15 @@ mod tests {
     fn split_refuses_small_tail_and_stale() {
         let mut s = sched(200);
         let l = s.acquire().expect("lease");
-        assert!(s.split_tail(l.id, l.generation, 10_000).is_none(), "tail too small");
+        assert!(
+            s.split_tail(l.id, l.generation, 10_000).is_none(),
+            "tail too small"
+        );
         let stale = l.generation.wrapping_add(1);
-        assert!(s.split_tail(l.id, stale, 1).is_none(), "stale split rejected");
+        assert!(
+            s.split_tail(l.id, stale, 1).is_none(),
+            "stale split rejected"
+        );
     }
 
     #[test]
@@ -532,7 +564,10 @@ mod tests {
         let l = s.acquire().expect("lease");
         assert!(s.report_progress(l.id, l.generation, 100));
         let _ = s.bump_generation();
-        assert!(s.active_leases().is_empty(), "generation change invalidates leases");
+        assert!(
+            s.active_leases().is_empty(),
+            "generation change invalidates leases"
+        );
         // Old lease's callback now stale.
         assert!(!s.complete(l.id, l.generation));
         // Acknowledged prefix [0,99] completed; remainder [100,999] pending.
@@ -579,11 +614,19 @@ mod tests {
         assert!(s.report_progress(l.id, l.generation, 500));
         // Older report must not move the offset back.
         assert!(s.report_progress(l.id, l.generation, 200));
-        let after = s.active_leases().into_iter().find(|x| x.id == l.id).expect("lease");
+        let after = s
+            .active_leases()
+            .into_iter()
+            .find(|x| x.id == l.id)
+            .expect("lease");
         assert_eq!(after.next_offset, 500, "monotonic progress");
         // Beyond-end report clamps to end+1.
         assert!(s.report_progress(l.id, l.generation, 10_000));
-        let after = s.active_leases().into_iter().find(|x| x.id == l.id).expect("lease");
+        let after = s
+            .active_leases()
+            .into_iter()
+            .find(|x| x.id == l.id)
+            .expect("lease");
         assert_eq!(after.next_offset, l.end + 1);
         assert_eq!(after.remaining(), 0);
     }

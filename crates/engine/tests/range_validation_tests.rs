@@ -35,9 +35,11 @@ async fn fetch_and_validate(
     established_total: Option<u64>,
 ) -> Result<kdown_engine::http::range::ValidatedRange, RejectionKind> {
     let cancel = CancellationToken::new();
-    let resp = t.get_range(spec, range, &cancel).await.expect("transport ok");
-    validate_range_response(range, &resp, established_total, None)
-        .map_err(|e| e.kind)
+    let resp = t
+        .get_range(spec, range, &cancel)
+        .await
+        .expect("transport ok");
+    validate_range_response(range, &resp, established_total, None).map_err(|e| e.kind)
 }
 
 #[tokio::test]
@@ -162,7 +164,11 @@ async fn well_behaved_range_end_to_end() {
     use http_body_util::BodyExt;
     let body = resp.body().expect("body");
     let bytes = body.collect().await.expect("collect").to_bytes();
-    assert_eq!(bytes.len() as u64, v.end - v.start + 1, "body length matches validated slice");
+    assert_eq!(
+        bytes.len() as u64,
+        v.end - v.start + 1,
+        "body length matches validated slice"
+    );
     assert_eq!(
         &bytes[..],
         &content[range.0 as usize..=(range.1 as usize)],
@@ -223,7 +229,12 @@ async fn validators_passed_to_gate_detect_generation_change() {
     let cancel = CancellationToken::new();
     let resp = t.get_range(&s, (0, 99), &cancel).await.expect("get");
     let expected = ResourceValidators::from_headers(Some("\"generation-1\""), None, Some(1000));
-    let err = kdown_engine::http::range::validate_range_response((0, 99), &resp, Some(1000), Some(&expected))
-        .unwrap_err();
+    let err = kdown_engine::http::range::validate_range_response(
+        (0, 99),
+        &resp,
+        Some(1000),
+        Some(&expected),
+    )
+    .unwrap_err();
     assert_eq!(err.kind, RejectionKind::GenerationChanged);
 }

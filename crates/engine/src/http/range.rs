@@ -203,7 +203,11 @@ mod tests {
     fn valid_206_accepted() {
         let r = resp(
             206,
-            Some(ContentRange { start: 100, end: 199, total: Some(1000) }),
+            Some(ContentRange {
+                start: 100,
+                end: 199,
+                total: Some(1000),
+            }),
             Some(1000),
         );
         let v = validate_range_response((100, 199), &r, Some(1000), None).expect("valid");
@@ -216,7 +220,11 @@ mod tests {
     fn start_mismatch_rejected() {
         let r = resp(
             206,
-            Some(ContentRange { start: 101, end: 199, total: Some(1000) }),
+            Some(ContentRange {
+                start: 101,
+                end: 199,
+                total: Some(1000),
+            }),
             Some(1000),
         );
         let err = validate_range_response((100, 199), &r, Some(1000), None).unwrap_err();
@@ -234,7 +242,11 @@ mod tests {
     fn end_overshoot_rejected() {
         let r = resp(
             206,
-            Some(ContentRange { start: 100, end: 250, total: Some(1000) }),
+            Some(ContentRange {
+                start: 100,
+                end: 250,
+                total: Some(1000),
+            }),
             Some(1000),
         );
         let err = validate_range_response((100, 199), &r, Some(1000), None).unwrap_err();
@@ -245,7 +257,11 @@ mod tests {
     fn total_conflict_rejected() {
         let r = resp(
             206,
-            Some(ContentRange { start: 100, end: 199, total: Some(999) }),
+            Some(ContentRange {
+                start: 100,
+                end: 199,
+                total: Some(999),
+            }),
             Some(999),
         );
         let err = validate_range_response((100, 199), &r, Some(1000), None).unwrap_err();
@@ -271,7 +287,11 @@ mod tests {
     fn generation_change_rejected() {
         let mut r = resp(
             206,
-            Some(ContentRange { start: 0, end: 99, total: Some(1000) }),
+            Some(ContentRange {
+                start: 0,
+                end: 99,
+                total: Some(1000),
+            }),
             Some(1000),
         );
         r.validators = ResourceValidators::from_headers(Some("\"v2\""), None, Some(1000));
@@ -281,7 +301,11 @@ mod tests {
         // Same generation passes.
         let mut r_ok = resp(
             206,
-            Some(ContentRange { start: 0, end: 99, total: Some(1000) }),
+            Some(ContentRange {
+                start: 0,
+                end: 99,
+                total: Some(1000),
+            }),
             Some(1000),
         );
         r_ok.validators = expected.clone();
@@ -311,12 +335,18 @@ mod tests {
             detail: "x".into(),
         }
         .into_error();
-        assert!(matches!(err, crate::error::DownloadError::InvalidRangeResponse(_)));
+        assert!(matches!(
+            err,
+            crate::error::DownloadError::InvalidRangeResponse(_)
+        ));
         let err = RangeRejection {
             kind: RejectionKind::GenerationChanged,
             detail: "x".into(),
         }
         .into_error();
-        assert!(matches!(err, crate::error::DownloadError::ResourceChanged(_)));
+        assert!(matches!(
+            err,
+            crate::error::DownloadError::ResourceChanged(_)
+        ));
     }
 }

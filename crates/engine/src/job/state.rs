@@ -30,7 +30,10 @@ pub enum JobState {
 impl JobState {
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, JobState::Completed | JobState::Cancelled | JobState::Failed)
+        matches!(
+            self,
+            JobState::Completed | JobState::Cancelled | JobState::Failed
+        )
     }
 
     #[must_use]
@@ -153,9 +156,8 @@ impl StateMachine {
     }
 
     pub fn cancel(&self) -> Result<(), InvalidTransition> {
-        self.transition(JobState::Cancelling).or_else(|_| {
-            self.transition(JobState::Cancelled)
-        })
+        self.transition(JobState::Cancelling)
+            .or_else(|_| self.transition(JobState::Cancelled))
     }
 }
 
@@ -190,9 +192,13 @@ mod tests {
     #[test]
     fn terminal_states_latch() {
         let sm = StateMachine::new();
-        sm.transition(JobState::Cancelling).expect("cancel from created");
+        sm.transition(JobState::Cancelling)
+            .expect("cancel from created");
         sm.transition(JobState::Cancelled).expect("terminal");
-        assert!(sm.transition(JobState::Running).is_err(), "no exit from terminal");
+        assert!(
+            sm.transition(JobState::Running).is_err(),
+            "no exit from terminal"
+        );
         assert!(sm.transition(JobState::Cancelled).is_err());
     }
 
@@ -229,7 +235,10 @@ mod tests {
         sm.transition(JobState::Running).unwrap();
         sm.transition(JobState::Pausing).unwrap();
         sm.transition(JobState::Paused).unwrap();
-        assert!(sm.transition(JobState::Running).is_err(), "Paused -> Running direct is rejected; must go through Resuming");
+        assert!(
+            sm.transition(JobState::Running).is_err(),
+            "Paused -> Running direct is rejected; must go through Resuming"
+        );
     }
 
     #[test]
@@ -247,7 +256,13 @@ mod tests {
 
     #[test]
     fn cancel_from_operational_states() {
-        for start in [JobState::Probing, JobState::Preparing, JobState::Running, JobState::Paused, JobState::Verifying] {
+        for start in [
+            JobState::Probing,
+            JobState::Preparing,
+            JobState::Running,
+            JobState::Paused,
+            JobState::Verifying,
+        ] {
             let sm = StateMachine::new();
             // Reach the start state through the graph where possible.
             match start {

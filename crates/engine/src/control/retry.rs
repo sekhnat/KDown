@@ -39,10 +39,7 @@ impl RetryClassifier {
         use ErrorCategory as C;
         let status = err.http_status();
         match err.category() {
-            C::Dns
-            | C::ConnectTimeout
-            | C::Connection
-            | C::RetryExhausted => true,
+            C::Dns | C::ConnectTimeout | C::Connection | C::RetryExhausted => true,
             C::Server => self.policy.retry_5xx,
             C::RateLimited => self.policy.retry_429,
             C::Protocol => match status {
@@ -79,8 +76,12 @@ impl RetryClassifier {
     #[must_use]
     pub fn backoff_delay(&self, attempt: u32) -> Duration {
         let base = self.policy.base_delay.as_secs_f64();
-        let cap = (base * self.policy.multiplier.powi(i32::try_from(attempt).unwrap_or(i32::MAX)))
-            .min(self.policy.max_delay.as_secs_f64());
+        let cap = (base
+            * self
+                .policy
+                .multiplier
+                .powi(i32::try_from(attempt).unwrap_or(i32::MAX)))
+        .min(self.policy.max_delay.as_secs_f64());
         let jittered = rand::rng().random_range(0.0..=cap);
         Duration::from_secs_f64(jittered.max(0.0))
     }
@@ -187,8 +188,7 @@ mod tests {
         for attempt in 0..10u32 {
             let d = c.backoff_delay(attempt);
             // Full jitter: delay in [0, cap]; cap = min(max, base*2^n).
-            let cap = (0.1 * 2f64.powi(attempt.min(8) as i32))
-                .min(30.0);
+            let cap = (0.1 * 2f64.powi(attempt.min(8) as i32)).min(30.0);
             assert!(d.as_secs_f64() >= 0.0);
             assert!(
                 d.as_secs_f64() <= cap * 1.01 + 0.01,
@@ -210,10 +210,10 @@ mod tests {
     fn attempts_exhaustion_gives_up() {
         let c = classifier();
         let err = DownloadError::Connection("reset".into());
-        assert!(matches!(
-            c.decide(&err, 3, None),
-            RetryDecision::GiveUp,
-        ), "attempt 3 of max 3 must give up");
+        assert!(
+            matches!(c.decide(&err, 3, None), RetryDecision::GiveUp,),
+            "attempt 3 of max 3 must give up"
+        );
         assert!(matches!(
             c.decide(&err, 2, None),
             RetryDecision::Retry { attempt: 3, .. }
@@ -250,7 +250,10 @@ mod tests {
             parse_retry_after(Some("120")),
             Some(Duration::from_secs(120))
         );
-        assert_eq!(parse_retry_after(Some("Mon, 22 Sep 2026 00:00:00 GMT")), None);
+        assert_eq!(
+            parse_retry_after(Some("Mon, 22 Sep 2026 00:00:00 GMT")),
+            None
+        );
         assert_eq!(parse_retry_after(None), None);
         assert_eq!(parse_retry_after(Some("bogus")), None);
     }

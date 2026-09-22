@@ -12,7 +12,7 @@ use kdown_engine::config::EngineConfig;
 use kdown_engine::job::controller::{DownloadRequest, SingleStreamController};
 
 mod support;
-use support::test_server::{TestServer, ScriptedResponse};
+use support::test_server::{ScriptedResponse, TestServer};
 
 /// A tracing layer that records every event's full formatted output
 /// (including fields) at the default level filter (§35.1: no TRACE).
@@ -41,7 +41,8 @@ impl tracing::field::Visit for CapturingVisitor {
         if field.name() == "message" {
             self.msg = format!("{value:?}");
         } else {
-            self.fields.push((field.name().to_string(), format!("{value:?}")));
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
         }
     }
 
@@ -49,7 +50,8 @@ impl tracing::field::Visit for CapturingVisitor {
         if field.name() == "message" {
             self.msg = value.to_string();
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
         }
     }
 }
@@ -65,10 +67,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
             fields: vec![],
         };
         event.record(&mut v);
-        self.records
-            .lock()
-            .expect("records")
-            .push(v.render());
+        self.records.lock().expect("records").push(v.render());
     }
 }
 
@@ -102,13 +101,17 @@ fn records_since(captured: &Arc<Mutex<Vec<String>>>, before: usize) -> Vec<Strin
 async fn run_with_capture(
     _server_url: String,
     request: DownloadRequest,
-) -> (usize, Vec<String>, kdown_engine::job::controller::DownloadResult) {
+) -> (
+    usize,
+    Vec<String>,
+    kdown_engine::job::controller::DownloadResult,
+) {
     let captured = capture_sink();
     let before = captured.lock().expect("records").len();
 
     let cfg = EngineConfig::default();
-    let transport = kdown_engine::http::transport::HttpTransport::new(cfg.network.clone())
-        .expect("transport");
+    let transport =
+        kdown_engine::http::transport::HttpTransport::new(cfg.network.clone()).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let result = controller.run(request).await.expect("run");
     let records = records_since(&captured, before);
@@ -121,7 +124,10 @@ fn test_request(url: String, dest: std::path::PathBuf) -> DownloadRequest {
         "Authorization".to_string(),
         "Bearer super-secret-bearer-token".to_string(),
     ));
-    r.headers.push(("Cookie".to_string(), "session=TOP-SECRET-COOKIE".to_string()));
+    r.headers.push((
+        "Cookie".to_string(),
+        "session=TOP-SECRET-COOKIE".to_string(),
+    ));
     r.authorization = Some("Bearer another-secret-value".to_string());
     r
 }
@@ -152,10 +158,7 @@ async fn credentials_never_appear_in_logs() {
         "the failing job must have produced log records"
     );
     for r in &records {
-        assert!(
-            !r.contains("TOP-SECRET-COOKIE"),
-            "cookie value leaked: {r}"
-        );
+        assert!(!r.contains("TOP-SECRET-COOKIE"), "cookie value leaked: {r}");
         assert!(
             !r.contains("secret-bearer-token"),
             "bearer value leaked: {r}"
@@ -185,14 +188,8 @@ async fn successful_job_logs_correlated_without_secrets() {
         kdown_engine::job::controller::ResultStatus::Completed
     );
     for r in &records {
-        assert!(
-            !r.contains("super-secret-bearer-token"),
-            "bearer leak: {r}"
-        );
-        assert!(
-            !r.contains("TOP-SECRET-COOKIE"),
-            "cookie leak: {r}"
-        );
+        assert!(!r.contains("super-secret-bearer-token"), "bearer leak: {r}");
+        assert!(!r.contains("TOP-SECRET-COOKIE"), "cookie leak: {r}");
         assert!(
             !r.contains("another-secret-value"),
             "authorization leak: {r}"

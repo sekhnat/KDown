@@ -5,8 +5,8 @@
 //! that the additional-connections hook (`H2ConnectionPolicy::Additional`)
 //! permits more connections to the same origin under the §24 conditions.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy};
 use kdown_engine::http::transport::HttpTransport;
@@ -18,11 +18,13 @@ use support::fixtures;
 /// An HTTPS test server speaking HTTP/2 (and HTTP/1.1 via ALPN) with a
 /// self-signed certificate; returns the CA PEM so the transport can trust
 /// it via `TlsConfig::custom_ca_bundle` (§21.1 custom CA scenario).
-async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Vec<u8>, Arc<AtomicUsize>) {
+async fn start_h2_tls_server(
+    content: Arc<Vec<u8>>,
+) -> (std::net::SocketAddr, Vec<u8>, Arc<AtomicUsize>) {
     use tokio_rustls::rustls;
 
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("self-signed cert");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
     let ca_pem = cert.cert.pem().into_bytes();
     let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -51,9 +53,7 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
             let content = content.clone();
             accept_loop.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
-                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls)
-                    .accept(socket)
-                    .await
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
                 else {
                     return;
                 };
@@ -63,8 +63,9 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
                     hyper_util::rt::TokioExecutor::new(),
                 )
                 .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream),
-                        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    hyper_util::rt::TokioIo::new(tls_stream),
+                    hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
                             let content = content.clone();
                             async move {
                                 let range = req
@@ -95,8 +96,9 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
                                     .map(Ok::<_, std::convert::Infallible>)
                                     .expect("response body")
                             }
-                        }),
-                    )
+                        },
+                    ),
+                )
                 .await;
                 if let Err(e) = served {
                     eprintln!("h2 test server conn error: {e}");
@@ -126,7 +128,8 @@ fn h2_cfg(ca_path: &std::path::Path) -> EngineConfig {
 /// connections and the file completes byte-correct (§11.1 H2 scenario).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn h2_segmented_download_is_byte_exact() {
-    let content: Arc<Vec<u8>> = Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
     let (addr, ca_pem, _conns) = start_h2_tls_server(content.clone()).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let ca_path = dir.path().join("ca.pem");
@@ -137,23 +140,27 @@ async fn h2_segmented_download_is_byte_exact() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
-    let req = DownloadRequest::new(format!("https://localhost:{}/file.bin", addr.port()), dest.clone());
+    let req = DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    );
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(&content));
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
     // H2 was actually negotiated: the result records the HTTP version of
     // the probe response.
-    assert_eq!(
-        result.validators.total_size,
-        Some(content.len() as u64)
-    );
+    assert_eq!(result.validators.total_size, Some(content.len() as u64));
 }
 
 /// The additional-connections hook opens more than one connection to the
 /// same origin while per-origin limits still hold (§24, §27.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn h2_additional_connections_policy_hook() {
-    let content: Arc<Vec<u8>> = Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
     let (addr, ca_pem, conns) = start_h2_tls_server(content.clone()).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let ca_path = dir.path().join("ca.pem");
@@ -166,10 +173,22 @@ async fn h2_additional_connections_policy_hook() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
-    let req = DownloadRequest::new(format!("https://localhost:{}/file.bin", addr.port()), dest.clone());
+    let req = DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    );
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}\nca_len={}", result.error, ca_pem.len());
-    assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(&content));
+    assert_eq!(
+        result.status,
+        ResultStatus::Completed,
+        "{:?}\nca_len={}",
+        result.error,
+        ca_pem.len()
+    );
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
     // Multiple connections were established to the origin (hook active);
     // each carried its own TLS handshake.
     assert!(
@@ -182,7 +201,8 @@ async fn h2_additional_connections_policy_hook() {
 /// stream (D5, §24 "one connection first").
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn h2_single_connection_default_multiplexes() {
-    let content: Arc<Vec<u8>> = Arc::new((0..6_u64 * 1024 * 1024).map(|i| (i % 251) as u8).collect());
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..6_u64 * 1024 * 1024).map(|i| (i % 251) as u8).collect());
     let (addr, ca_pem, conns) = start_h2_tls_server(content.clone()).await;
     let dir = tempfile::tempdir().expect("tmpdir");
     let ca_path = dir.path().join("ca.pem");
@@ -192,10 +212,16 @@ async fn h2_single_connection_default_multiplexes() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
-    let req = DownloadRequest::new(format!("https://localhost:{}/file.bin", addr.port()), dest.clone());
+    let req = DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    );
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(fixtures::file_sha256(dest.as_path()), fixtures::sha256_hex(&content));
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
     // Segmented mode used several range requests; with the single-connection
     // default the server must have accepted exactly ONE TLS connection
     // carrying all streams.

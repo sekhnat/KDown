@@ -15,7 +15,11 @@ use support::test_server::TestServer;
 
 /// Server that kills the connection at a deterministic pseudo-random
 /// offset for the first N requests, then serves the full body.
-fn flaky_server(path: &'static str, content: Vec<u8>, failures: u32) -> support::test_server::TestServer {
+fn flaky_server(
+    path: &'static str,
+    content: Vec<u8>,
+    failures: u32,
+) -> support::test_server::TestServer {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     let hits = Arc::new(AtomicU32::new(0));
@@ -62,7 +66,6 @@ fn flaky_server_fixed_cut(
     content: Vec<u8>,
     cut: usize,
 ) -> support::test_server::TestServer {
-    
     use std::sync::Arc;
     let content = Arc::new(content);
     TestServer::new().serve_handler(path, move |req| {
@@ -149,7 +152,10 @@ async fn exhausted_retries_fail_structured() {
     let c = controller();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        c.run(DownloadRequest::new(server.url("/always"), dir.path().join("x"))),
+        c.run(DownloadRequest::new(
+            server.url("/always"),
+            dir.path().join("x"),
+        )),
     )
     .await
     .expect("no hang")

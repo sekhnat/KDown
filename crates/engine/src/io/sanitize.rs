@@ -20,9 +20,8 @@ pub const MAX_FILENAME_LEN: usize = 255;
 
 /// Reserved Windows device names, case-insensitive (§21.3).
 const RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
-    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
-    "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Sanitize a server-supplied filename into a safe single-component name.
@@ -150,8 +149,17 @@ mod tests {
         assert_eq!(sanitize_filename(""), "download");
         // Hostile fuzz-ish inputs must not panic (§21.4).
         for evil in [
-            "\0", "../../", "C:\\..\\..\\", "\u{0}\u{0}", "....", "a//..//b",
-            "\\\\", "COM0", "con.", "..a..", "é\u{0}.txt",
+            "\0",
+            "../../",
+            "C:\\..\\..\\",
+            "\u{0}\u{0}",
+            "....",
+            "a//..//b",
+            "\\\\",
+            "COM0",
+            "con.",
+            "..a..",
+            "é\u{0}.txt",
         ] {
             let _ = sanitize_filename(evil); // must not panic
         }

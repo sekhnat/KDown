@@ -161,8 +161,14 @@ mod tests {
     fn challenge_extracted_from_headers() {
         let headers = vec![
             ("content-type".to_string(), "text/html".to_string()),
-            ("WWW-Authenticate".to_string(), "Bearer realm=\"x\"".to_string()),
-            ("Www-Authenticate".to_string(), "Basic realm=\"y\"".to_string()),
+            (
+                "WWW-Authenticate".to_string(),
+                "Bearer realm=\"x\"".to_string(),
+            ),
+            (
+                "Www-Authenticate".to_string(),
+                "Basic realm=\"y\"".to_string(),
+            ),
         ];
         let ch = challenge_from_headers(401, "https://x.example", &headers).expect("challenge");
         assert_eq!(ch.status, 401);

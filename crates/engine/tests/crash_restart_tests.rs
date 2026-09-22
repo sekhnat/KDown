@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
+use kdown_engine::io::sink::Sink as _;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::resume::checkpoint_store::CheckpointStore as _;
 use kdown_engine::resume::{job_identity, DurabilityMode, FileCheckpointStore};
-use kdown_engine::io::sink::Sink as _;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -47,8 +47,7 @@ fn crashy(path: &'static str, content: Arc<Vec<u8>>, kill_count: u32) -> TestSer
     TestServer::new().serve_handler(path, move |req| {
         let n = hits.fetch_add(1, Ordering::SeqCst);
         if req.method == "HEAD" {
-            return ScriptedResponse::ok((*content).clone())
-                .with_header("accept-ranges", "bytes");
+            return ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes");
         }
         let total = (*content).len() as u64;
         let range_response = |start: u64| {
@@ -81,7 +80,10 @@ fn crashy(path: &'static str, content: Arc<Vec<u8>>, kill_count: u32) -> TestSer
 #[tokio::test]
 async fn kill_during_segment_write_then_resume() {
     let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 41_000));
-    let server = crashy("/crash.bin", content.clone(), 2).start().await.expect("start");
+    let server = crashy("/crash.bin", content.clone(), 2)
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("crash.bin");
     let expected_crash = content.clone();
@@ -111,10 +113,7 @@ async fn interrupt_during_pause_simulates_process_kill() {
                 let body = (*content)[s as usize..].to_vec();
                 ScriptedResponse::new(206)
                     .with_body(body)
-                    .with_header(
-                        "content-range",
-                        &format!("bytes {s}-{}/{total}", total - 1),
-                    )
+                    .with_header("content-range", &format!("bytes {s}-{}/{total}", total - 1))
             } else {
                 ScriptedResponse::ok((*content).clone())
             };
@@ -132,10 +131,7 @@ async fn interrupt_during_pause_simulates_process_kill() {
     // of SIGKILL during Running.
     {
         let c = controller();
-        let (handle, join) = c.start(DownloadRequest::new(
-            server.url("/kill.bin"),
-            dest.clone(),
-        ));
+        let (handle, join) = c.start(DownloadRequest::new(server.url("/kill.bin"), dest.clone()));
         tokio::time::sleep(Duration::from_millis(400)).await;
         handle.pause();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -167,9 +163,7 @@ async fn interrupt_during_pause_simulates_process_kill() {
         }
         eprintln!("cp bytes: {:?}", store.load(&identity));
     }
-    let result = result
-    .expect("no hang")
-    .expect("terminal");
+    let result = result.expect("no hang").expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert!(
         result.bytes_reused_from_checkpoint > 0,

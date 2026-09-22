@@ -12,8 +12,12 @@ pub struct Redactor {
 }
 
 /// Query/header names that are always redacted (§35.3).
-pub const SENSITIVE_HEADER_NAMES: &[&str] =
-    &["authorization", "cookie", "set-cookie", "proxy-authorization"];
+pub const SENSITIVE_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+];
 
 impl Redactor {
     #[must_use]
@@ -65,10 +69,11 @@ impl Redactor {
         let parts: Vec<String> = query
             .split('&')
             .map(|kv| match kv.split_once('=') {
-                Some((k, _)) if self
-                    .sensitive_query_params
-                    .iter()
-                    .any(|p| k.eq_ignore_ascii_case(p)) =>
+                Some((k, _))
+                    if self
+                        .sensitive_query_params
+                        .iter()
+                        .any(|p| k.eq_ignore_ascii_case(p)) =>
                 {
                     format!("{k}=REDACTED")
                 }
@@ -117,8 +122,13 @@ mod tests {
     #[test]
     fn header_names_include_sensitive_set() {
         for name in SENSITIVE_HEADER_NAMES {
-            assert!(["authorization", "cookie", "set-cookie", "proxy-authorization"]
-                .contains(name));
+            assert!([
+                "authorization",
+                "cookie",
+                "set-cookie",
+                "proxy-authorization"
+            ]
+            .contains(name));
         }
     }
 }

@@ -11,16 +11,14 @@
 //! Baselines land in `benches/results/baseline.md` (§37.4 thresholds are
 //! enforced from this record in CI).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use kdown_engine::config::{
-    EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsConfig,
-};
+use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsConfig};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{
     DownloadRequest, DownloadResult, ResultStatus, SingleStreamController,
@@ -112,10 +110,7 @@ async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
                             (
                                 "206 Partial Content",
                                 content[s..=end].to_vec(),
-                                format!(
-                                    "content-range: bytes {s}-{end}/{}\r\n",
-                                    content.len()
-                                ),
+                                format!("content-range: bytes {s}-{end}/{}\r\n", content.len()),
                             )
                         }
                         None => ("200 OK", (*content).clone(), String::new()),
@@ -147,8 +142,8 @@ fn parse_range(v: &str) -> Option<(u64, u64)> {
 async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Vec<u8>) {
     use tokio_rustls::rustls;
 
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("self-signed cert");
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
     let ca_pem = cert.cert.pem().into_bytes();
     let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -173,9 +168,7 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
             let tls = tls_config.clone();
             let content = content.clone();
             tokio::spawn(async move {
-                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls)
-                    .accept(socket)
-                    .await
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
                 else {
                     return;
                 };
@@ -199,10 +192,7 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
                                         (
                                             206,
                                             content[s as usize..=(end as usize)].to_vec(),
-                                            Some(format!(
-                                                "bytes {s}-{end}/{}",
-                                                content.len()
-                                            )),
+                                            Some(format!("bytes {s}-{end}/{}", content.len())),
                                         )
                                     }
                                     None => (200, (*content).clone(), None),
@@ -320,8 +310,13 @@ async fn measure_download(
 fn fmt_record(name: &str, r: &ResourceRecord) -> String {
     format!(
         "| {name} | {} | {:.2} | {:.2} | {:.1}% | {} KiB | {} | {:?} |",
-        r.bytes, r.throughput_mib_s, r.wall.as_secs_f64(), r.cpu_percent, r.peak_rss_kib,
-        r.retransferred_bytes, r.connections
+        r.bytes,
+        r.throughput_mib_s,
+        r.wall.as_secs_f64(),
+        r.cpu_percent,
+        r.peak_rss_kib,
+        r.retransferred_bytes,
+        r.connections
     )
 }
 
@@ -352,16 +347,21 @@ fn bench_h1_throughput(c: &mut Criterion) {
         cfg.network.read_idle_timeout = Duration::from_secs(30);
         let cfg_for_bench = cfg.clone();
         group.bench_function(format!("workers_{workers}"), |b| {
-            b.iter(|| rt.block_on(async {
-                let dir = tempfile::tempdir().expect("tmpdir");
-                let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
-                let r = controller
-                    .run(DownloadRequest::new(black_box(url.clone()), dir.path().join("out.bin")))
-                    .await
-                    .expect("download");
-                black_box(assert_completed(&r));
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    let dir = tempfile::tempdir().expect("tmpdir");
+                    let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
+                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let r = controller
+                        .run(DownloadRequest::new(
+                            black_box(url.clone()),
+                            dir.path().join("out.bin"),
+                        ))
+                        .await
+                        .expect("download");
+                    black_box(assert_completed(&r));
+                })
+            });
         });
     }
     group.finish();
@@ -396,16 +396,21 @@ fn bench_h2_throughput(c: &mut Criterion) {
         cfg.network.read_idle_timeout = Duration::from_secs(30);
         let cfg_for_bench = cfg.clone();
         group.bench_function(format!("workers_{workers}"), |b| {
-            b.iter(|| rt.block_on(async {
-                let out = tempfile::tempdir().expect("tmpdir");
-                let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
-                let r = controller
-                    .run(DownloadRequest::new(black_box(url.clone()), out.path().join("out.bin")))
-                    .await
-                    .expect("download");
-                black_box(assert_completed(&r));
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    let out = tempfile::tempdir().expect("tmpdir");
+                    let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
+                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let r = controller
+                        .run(DownloadRequest::new(
+                            black_box(url.clone()),
+                            out.path().join("out.bin"),
+                        ))
+                        .await
+                        .expect("download");
+                    black_box(assert_completed(&r));
+                })
+            });
         });
     }
     group.finish();
@@ -432,16 +437,21 @@ fn bench_prealloc(c: &mut Criterion) {
         cfg.network.read_idle_timeout = Duration::from_secs(30);
         let cfg_for_bench = cfg.clone();
         group.bench_function(format!("prealloc_{prealloc}"), |b| {
-            b.iter(|| rt.block_on(async {
-                let out = tempfile::tempdir().expect("tmpdir");
-                let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
-                let r = controller
-                    .run(DownloadRequest::new(black_box(url.clone()), out.path().join("out.bin")))
-                    .await
-                    .expect("download");
-                black_box(assert_completed(&r));
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    let out = tempfile::tempdir().expect("tmpdir");
+                    let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
+                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let r = controller
+                        .run(DownloadRequest::new(
+                            black_box(url.clone()),
+                            out.path().join("out.bin"),
+                        ))
+                        .await
+                        .expect("download");
+                    black_box(assert_completed(&r));
+                })
+            });
         });
     }
     group.finish();
@@ -468,15 +478,18 @@ fn _scenario_docs(_p: ProxyConfig, _t: TlsConfig) {}
 
 #[allow(unused)]
 fn _fmt_record_alive() -> String {
-    fmt_record("x", &ResourceRecord {
-        wall: Duration::ZERO,
-        bytes: 0,
-        throughput_mib_s: 0.0,
-        cpu_percent: 0.0,
-        peak_rss_kib: 0,
-        retransferred_bytes: 0,
-        connections: None,
-    })
+    fmt_record(
+        "x",
+        &ResourceRecord {
+            wall: Duration::ZERO,
+            bytes: 0,
+            throughput_mib_s: 0.0,
+            cpu_percent: 0.0,
+            peak_rss_kib: 0,
+            retransferred_bytes: 0,
+            connections: None,
+        },
+    )
 }
 
 #[allow(unused)]

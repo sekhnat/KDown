@@ -5,9 +5,9 @@
 //! release sequences.
 
 use kdown_engine::resume::checkpoint::ByteRange;
+use kdown_engine::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 use kdown_engine::scheduler::interval_set::IntervalSet;
 use kdown_engine::scheduler::lease::SegmentLease;
-use kdown_engine::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 
 use proptest::prelude::*;
 

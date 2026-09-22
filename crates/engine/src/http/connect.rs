@@ -68,7 +68,12 @@ impl LimitedConn {
         alpn_h2_requested: bool,
         permits: LimitPermits,
     ) -> Self {
-        Self::new(ConnIo::Tls(Box::new(tls)), proxied, alpn_h2_requested, permits)
+        Self::new(
+            ConnIo::Tls(Box::new(tls)),
+            proxied,
+            alpn_h2_requested,
+            permits,
+        )
     }
 }
 
@@ -89,9 +94,7 @@ impl tokio::io::AsyncRead for LimitedConn {
                 // and integrity is caller-verified §16). This is teardown
                 // tolerance, not a certificate/trust bypass (§21.1).
                 match Pin::new(s).poll_read(cx, buf) {
-                    Poll::Ready(Err(e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
+                    Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         Poll::Ready(Ok(()))
                     }
                     other => other,
@@ -230,7 +233,9 @@ impl TlsSettings {
         } else {
             vec![b"http/1.1".to_vec()]
         };
-        Ok(Self { config: Arc::new(config) })
+        Ok(Self {
+            config: Arc::new(config),
+        })
     }
 }
 
@@ -267,9 +272,7 @@ impl ConnectionLimits {
         let origin = {
             let mut map = self.origins.lock().expect("origin map");
             map.entry(origin_key.to_string())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(self.per_origin as usize))
-                })
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_origin as usize)))
                 .clone()
         };
         let permit = origin
@@ -406,7 +409,9 @@ impl EngineConnector {
             .host()
             .ok_or_else(|| ConnectError(DownloadError::InvalidUrl("missing host".into())))?
             .to_string();
-        let port = dst.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let port = dst
+            .port_u16()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let proxy_addr = match &self.proxy {
             ProxyConfig::Http { url } | ProxyConfig::Socks5 { url } => Some(url.clone()),
             ProxyConfig::None => None,
@@ -451,8 +456,10 @@ impl EngineConnector {
                 let proxy_uri: hyper::Uri = proxy_addr
                     .and_then(|u| u.parse().ok())
                     .ok_or_else(|| ConnectError(DownloadError::Proxy("bad proxy url".into())))?;
-                let mut tunnel =
-                    hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_uri, RawTcpConnector);
+                let mut tunnel = hyper_util::client::legacy::connect::proxy::Tunnel::new(
+                    proxy_uri,
+                    RawTcpConnector,
+                );
                 if let Some(auth) = &self.proxy_auth {
                     tunnel = tunnel.with_auth(auth.clone());
                 }
@@ -484,9 +491,10 @@ impl EngineConnector {
                     proxy_uri,
                     RawTcpConnector,
                 );
-                let conn = s.call(dst.clone()).await.map_err(|e| {
-                    ConnectError(DownloadError::Proxy(format!("socks5: {e}")))
-                })?;
+                let conn = s
+                    .call(dst.clone())
+                    .await
+                    .map_err(|e| ConnectError(DownloadError::Proxy(format!("socks5: {e}"))))?;
                 let raw = conn.into_inner();
                 if scheme == "https" {
                     let tls = self.tls_handshake(raw, &host).await?;
@@ -524,13 +532,11 @@ impl EngineConnector {
         port: u16,
         check_resolved: bool,
     ) -> Result<tokio::net::TcpStream, ConnectError> {
-        let resolved = tokio::time::timeout(
-            self.connect_timeout,
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .map_err(|_| ConnectError(DownloadError::ConnectTimeout))?
-        .map_err(|e| ConnectError(DownloadError::Dns(e.to_string())))?;
+        let resolved =
+            tokio::time::timeout(self.connect_timeout, tokio::net::lookup_host((host, port)))
+                .await
+                .map_err(|_| ConnectError(DownloadError::ConnectTimeout))?
+                .map_err(|e| ConnectError(DownloadError::Dns(e.to_string())))?;
         let addrs: Vec<std::net::SocketAddr> = resolved.collect();
         if addrs.is_empty() {
             return Err(ConnectError(DownloadError::Dns("no addresses".into())));
@@ -573,7 +579,9 @@ impl EngineConnector {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| ConnectError(DownloadError::Connection("no dialable address".into()))))
+        Err(last_err.unwrap_or_else(|| {
+            ConnectError(DownloadError::Connection("no dialable address".into()))
+        }))
     }
 
     async fn tls_handshake(
@@ -588,13 +596,10 @@ impl EngineConnector {
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| ConnectError(DownloadError::Tls(format!("server name: {e}"))))?;
         let connector = tokio_rustls::TlsConnector::from(settings.config.clone());
-        let tls = tokio::time::timeout(
-            self.connect_timeout,
-            connector.connect(server_name, tcp),
-        )
-        .await
-        .map_err(|_| ConnectError(DownloadError::Tls("handshake timeout".into())))?
-        .map_err(|e| ConnectError(DownloadError::Tls(e.to_string())))?;
+        let tls = tokio::time::timeout(self.connect_timeout, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| ConnectError(DownloadError::Tls("handshake timeout".into())))?
+            .map_err(|e| ConnectError(DownloadError::Tls(e.to_string())))?;
         Ok(tls)
     }
 }
@@ -672,12 +677,24 @@ fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
         out.push(TABLE[(n >> 18) as usize & 63] as char);
         out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }

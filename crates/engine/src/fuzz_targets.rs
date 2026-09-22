@@ -13,7 +13,9 @@ use crate::resume::checkpoint::Checkpoint;
 
 /// Fuzz target: URL handling (§36.5).
 pub fn fuzz_url(data: &[u8]) {
-    let Ok(s) = std::str::from_utf8(data) else { return };
+    let Ok(s) = std::str::from_utf8(data) else {
+        return;
+    };
     let _ = s.parse::<hyper::Uri>();
     let red = Redactor::new().with_sensitive_query_params(&["token", "sig"]);
     let _ = red.redact_url(s);
@@ -21,23 +23,25 @@ pub fn fuzz_url(data: &[u8]) {
 
 /// Fuzz target: Content-Range parsing (§36.5).
 pub fn fuzz_content_range(data: &[u8]) {
-    let Ok(s) = std::str::from_utf8(data) else { return };
+    let Ok(s) = std::str::from_utf8(data) else {
+        return;
+    };
     let _ = parse_content_range(s);
 }
 
 /// Fuzz target: ETag capture/comparison (§36.5).
 pub fn fuzz_etag(data: &[u8]) {
-    let Ok(s) = std::str::from_utf8(data) else { return };
-    let _ = crate::http::validators::ResourceValidators::from_headers(
-        Some(s),
-        Some(s),
-        Some(1024),
-    );
+    let Ok(s) = std::str::from_utf8(data) else {
+        return;
+    };
+    let _ = crate::http::validators::ResourceValidators::from_headers(Some(s), Some(s), Some(1024));
 }
 
 /// Fuzz target: Content-Disposition parsing + filename sanitization (§36.5).
 pub fn fuzz_content_disposition(data: &[u8]) {
-    let Ok(s) = std::str::from_utf8(data) else { return };
+    let Ok(s) = std::str::from_utf8(data) else {
+        return;
+    };
     if let Some(name) = filename_from_disposition(Some(s)) {
         let safe = sanitize_filename(&name);
         assert!(!safe.contains('\0'));
@@ -50,7 +54,9 @@ pub fn fuzz_content_disposition(data: &[u8]) {
 
 /// Fuzz target: checkpoint files (§36.5).
 pub fn fuzz_checkpoint(data: &[u8]) {
-    let Ok(s) = std::str::from_utf8(data) else { return };
+    let Ok(s) = std::str::from_utf8(data) else {
+        return;
+    };
     let _ = Checkpoint::from_json(s);
     if let Ok(mut cp) = serde_json::from_str::<Checkpoint>(s) {
         cp.completed_ranges = vec![(u64::MAX, 0), (0, u64::MAX)];

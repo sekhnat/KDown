@@ -34,11 +34,7 @@ impl IntervalSet {
         if end < start {
             return; // empty/invalid range contributes nothing
         }
-        let lower = self
-            .map
-            .range(..=start)
-            .next_back()
-            .map(|(k, v)| (*k, *v));
+        let lower = self.map.range(..=start).next_back().map(|(k, v)| (*k, *v));
         let mut lo = start;
         let mut hi = end;
         // Absorb the predecessor when it overlaps or touches.

@@ -50,11 +50,20 @@ mod tests {
             next_offset: 100,
         };
         assert_eq!(l.remaining(), 100);
-        let advanced = SegmentLease { next_offset: 150, ..l };
+        let advanced = SegmentLease {
+            next_offset: 150,
+            ..l
+        };
         assert_eq!(advanced.remaining(), 50);
-        let done = SegmentLease { next_offset: 200, ..l };
+        let done = SegmentLease {
+            next_offset: 200,
+            ..l
+        };
         assert_eq!(done.remaining(), 0);
-        let past = SegmentLease { next_offset: 250, ..l };
+        let past = SegmentLease {
+            next_offset: 250,
+            ..l
+        };
         assert_eq!(past.remaining(), 0, "no negative remaining");
     }
 }

@@ -30,7 +30,10 @@ fn segmented_cfg() -> EngineConfig {
 }
 
 fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(HttpTransport::new(cfg.network.clone()).expect("transport"), cfg)
+    SingleStreamController::new(
+        HttpTransport::new(cfg.network.clone()).expect("transport"),
+        cfg,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

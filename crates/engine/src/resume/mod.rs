@@ -8,4 +8,4 @@ pub mod flow;
 
 pub use checkpoint::{ByteRange, Checkpoint, CheckpointError, CHECKPOINT_FORMAT_VERSION};
 pub use checkpoint_store::{CheckpointStore, DurabilityMode, FileCheckpointStore};
-pub use flow::{job_identity, GenerationChangePolicy, ResumeSupport};
+pub use flow::{job_identity, GenerationChangePolicy};

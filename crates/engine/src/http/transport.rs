@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{ACCEPT_ENCODING, AUTHORIZATION, COOKIE, IF_RANGE, RANGE, USER_AGENT};
@@ -157,9 +156,7 @@ impl HttpTransport {
             redirect: RedirectPolicy {
                 max_redirects: cfg.network.max_redirects,
                 deny_downgrade: cfg.network.deny_https_downgrade,
-                forward_cross_origin_credentials: cfg
-                    .network
-                    .forward_credentials_cross_origin,
+                forward_cross_origin_credentials: cfg.network.forward_credentials_cross_origin,
             },
             network: cfg.network.clone(),
             user_agent: "kdown-engine/0.1".to_string(),
@@ -254,7 +251,9 @@ impl HttpTransport {
         spec: &RequestSpec,
         cancel: &crate::control::CancellationToken,
     ) -> Result<HeadResponse, DownloadError> {
-        let resp = self.request_following_redirects(method.clone(), spec, None, cancel).await?;
+        let resp = self
+            .request_following_redirects(method.clone(), spec, None, cancel)
+            .await?;
         let (parts, _body) = resp.into_parts();
         let headers: Vec<(String, String)> = parts
             .headers
@@ -333,7 +332,9 @@ impl HttpTransport {
             if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
-            let resp = self.single_request(&method, &url, spec, range, strip_credentials).await?;
+            let resp = self
+                .single_request(&method, &url, spec, range, strip_credentials)
+                .await?;
             let status = resp.status().as_u16();
             let location = resp
                 .headers()
@@ -345,8 +346,7 @@ impl HttpTransport {
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            let decision =
-                tracker.decide(status, location.as_deref(), &url, &current_headers);
+            let decision = tracker.decide(status, location.as_deref(), &url, &current_headers);
             match decision.action {
                 RedirectAction::Final => return Ok(resp),
                 RedirectAction::Follow { location: next } => {
@@ -369,7 +369,10 @@ impl HttpTransport {
         strip_credentials: bool,
     ) -> Result<hyper::Response<Incoming>, DownloadError> {
         let uri = self.uri(url)?;
-        let scheme_ok = matches!(uri.scheme().map(|s| s.as_str()), Some("http") | Some("https"));
+        let scheme_ok = matches!(
+            uri.scheme().map(|s| s.as_str()),
+            Some("http") | Some("https")
+        );
         if !scheme_ok {
             return Err(DownloadError::UnsupportedScheme(
                 uri.scheme_str().unwrap_or("").to_string(),
@@ -396,16 +399,15 @@ impl HttpTransport {
             }
             for (k, v) in &spec.headers {
                 let lower = k.to_ascii_lowercase();
-                if strip_credentials
-                    && (lower == "authorization" || lower == "cookie")
-                {
+                if strip_credentials && (lower == "authorization" || lower == "cookie") {
                     continue; // stripped by redirect policy (§21.2)
                 }
                 hm.insert(
                     hyper::header::HeaderName::from_bytes(k.as_bytes())
                         .map_err(|e| DownloadError::InvalidUrl(format!("bad header {k}: {e}")))?,
-                    v.parse()
-                        .map_err(|e| DownloadError::InvalidUrl(format!("bad header value {k}: {e}")))?,
+                    v.parse().map_err(|e| {
+                        DownloadError::InvalidUrl(format!("bad header value {k}: {e}"))
+                    })?,
                 );
             }
         }
@@ -426,13 +428,10 @@ impl HttpTransport {
             &self.clients[0]
         };
         let fut = client.request(req);
-        let resp = tokio::time::timeout(
-            self.network.response_header_timeout,
-            fut,
-        )
-        .await
-        .map_err(|_| DownloadError::ConnectTimeout)?
-        .map_err(|e| classify_transport_error(&e))?;
+        let resp = tokio::time::timeout(self.network.response_header_timeout, fut)
+            .await
+            .map_err(|_| DownloadError::ConnectTimeout)?
+            .map_err(|e| classify_transport_error(&e))?;
         Ok(resp)
     }
 }
@@ -442,8 +441,8 @@ pub(crate) fn resolve_redirect(current: &str, location: &str) -> Result<String, 
     if location.contains("://") {
         return Ok(location.to_string());
     }
-    let base = hyper::Uri::try_from(current)
-        .map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
+    let base =
+        hyper::Uri::try_from(current).map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
     if let Some(path_and_query) = base.path_and_query() {
         let pq = path_and_query.as_str();
         if let Some(rest) = pq.strip_prefix('/') {

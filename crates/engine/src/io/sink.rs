@@ -227,10 +227,10 @@ impl FileSink {
     pub fn commit(mut self) -> Result<PathBuf, SinkError> {
         self.file = None;
         self.finalized = true; // consumed below; drop must not clean up
-        // POSIX rename replaces atomically. Windows cannot rename over an
-        // existing file while it is open; the platform fallback removes
-        // the old destination immediately before rename. The CI matrix
-        // exercises this path (§42 platform coverage).
+                               // POSIX rename replaces atomically. Windows cannot rename over an
+                               // existing file while it is open; the platform fallback removes
+                               // the old destination immediately before rename. The CI matrix
+                               // exercises this path (§42 platform coverage).
         #[cfg(windows)]
         if self.destination.exists() {
             std::fs::remove_file(&self.destination)
@@ -281,7 +281,8 @@ impl Sink for FileSink {
         };
         if matches!(level, FlushLevel::FsyncFile | FlushLevel::FsyncDir) {
             file.flush()?;
-            file.sync_all().map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+            file.sync_all()
+                .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
         } else {
             file.flush()?;
         }
@@ -362,8 +363,7 @@ mod tests {
     fn write_read_commit_roundtrip() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink =
-                FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
             sink.write_at(0, b"hello").expect("write");
             sink.write_at(5, b" world").expect("write at 5");
             assert_eq!(sink.size().expect("size"), 11);
@@ -392,8 +392,7 @@ mod tests {
     fn drop_without_commit_cleans_temp() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink =
-                FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
             sink.write_at(0, b"partial").expect("write");
             // Dropped without finalize/commit/abort.
         }
@@ -421,9 +420,8 @@ mod tests {
         std::fs::create_dir(&orphan_dir).expect("mkdir");
         let orphan_dest = orphan_dir.join("x.bin");
         let temp = dir.path().join("explicit.part");
-        let mut sink =
-            FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false)
-                .expect("open");
+        let mut sink = FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false)
+            .expect("open");
         sink.write_at(0, b"data").expect("write");
         sink.finalize().expect("finalize");
         std::fs::remove_dir_all(&orphan_dir).expect("remove target dir");

@@ -101,9 +101,9 @@ pub mod resume;
 pub mod scheduler;
 
 pub use config::{
-    DurabilityMode, EngineConfig, ExpectedHash, HashAlgorithm, H2ConnectionPolicy,
-    IntegrityPolicy, NetworkPolicy, OverwritePolicy, PoolConfig, ProxyConfig, ResumePolicy,
-    TlsConfig, TransferPolicy,
+    DurabilityMode, EngineConfig, ExpectedHash, H2ConnectionPolicy, HashAlgorithm, IntegrityPolicy,
+    NetworkPolicy, OverwritePolicy, PoolConfig, ProxyConfig, ResumePolicy, TlsConfig,
+    TransferPolicy,
 };
 pub use error::{DownloadError, ErrorCategory, Retryability};
 pub use http::HttpTransport;

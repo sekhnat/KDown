@@ -27,9 +27,9 @@ use crate::metrics::counters::JobCounters;
 use crate::metrics::events::SharedHub;
 use crate::resume::checkpoint::Checkpoint;
 use crate::resume::checkpoint_store::{CheckpointStore as _, FileCheckpointStore};
+use crate::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 use crate::scheduler::lease::SegmentLease;
 use crate::scheduler::LeaseId;
-use crate::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 
 /// Shared worker↔controller state for one segmented job.
 pub struct SegmentedJob {
@@ -76,13 +76,20 @@ impl LeaseProgress {
         self.lease_id.store(lease_id, Ordering::Relaxed);
         self.generation.store(generation, Ordering::Relaxed);
         self.lease_start.store(lease_start, Ordering::Relaxed);
-        self.durable_through.store(durable_through, Ordering::Relaxed);
+        self.durable_through
+            .store(durable_through, Ordering::Relaxed);
     }
 
     /// Test hook mirroring [`Self::publish`] for scheduler reconciliation
     /// tests (the real publish is chunk-path-internal).
     #[cfg(test)]
-    pub(crate) fn test_publish(&self, lease_id: LeaseId, generation: u64, lease_start: u64, durable_through: u64) {
+    pub(crate) fn test_publish(
+        &self,
+        lease_id: LeaseId,
+        generation: u64,
+        lease_start: u64,
+        durable_through: u64,
+    ) {
         self.publish(lease_id, generation, lease_start, durable_through);
     }
 
@@ -134,20 +141,13 @@ impl SegmentedJob {
 
     /// Attach or replace the job rate bucket (§18.2).
     pub fn set_rate_bucket(&self, bucket: Option<Arc<crate::control::rate_limit::TokenBucket>>) {
-        *self
-            .rate_bucket
-            .lock()
-            .expect("rate bucket lock") = bucket;
+        *self.rate_bucket.lock().expect("rate bucket lock") = bucket;
     }
 
     /// Acquire tokens for `len` payload bytes, sleeping when the bucket
     /// gates (§18.2: payload bytes only, no busy wait).
     async fn acquire_rate(&self, len: u64) {
-        let bucket = self
-            .rate_bucket
-            .lock()
-            .expect("rate bucket lock")
-            .clone();
+        let bucket = self.rate_bucket.lock().expect("rate bucket lock").clone();
         if let Some(b) = bucket {
             b.acquire_async(len).await;
         }
@@ -206,9 +206,7 @@ pub(crate) async fn run_segmented(
     cancel: CancellationToken,
     start_offset_ranges: Vec<(u64, u64)>,
     started: Instant,
-    handle_cell: Option<
-        Arc<std::sync::OnceLock<Arc<SegmentedJob>>>,
-    >,
+    handle_cell: Option<Arc<std::sync::OnceLock<Arc<SegmentedJob>>>>,
     initial_rate_bucket: Option<Arc<crate::control::rate_limit::TokenBucket>>,
 ) -> SegmentedOutcome {
     let warnings: Vec<String> = vec![];
@@ -218,8 +216,9 @@ pub(crate) async fn run_segmented(
     );
     let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
     let desired = u64::from(config.transfer.max_workers.max(1));
-    let worker_progress: Vec<Arc<LeaseProgress>> =
-        (0..desired.max(16)).map(|_| Arc::new(LeaseProgress::default())).collect();
+    let worker_progress: Vec<Arc<LeaseProgress>> = (0..desired.max(16))
+        .map(|_| Arc::new(LeaseProgress::default()))
+        .collect();
     let job = Arc::new(SegmentedJob {
         scheduler: AsyncMutex::new(scheduler),
         origin_backoff_until: AsyncMutex::new(None),
@@ -508,8 +507,7 @@ async fn worker_loop(
                     error.category(),
                     crate::error::ErrorCategory::Server | crate::error::ErrorCategory::RateLimited
                 ) {
-                    let earliest = retry_after
-                        .unwrap_or_else(|| classifier.backoff_delay(attempt));
+                    let earliest = retry_after.unwrap_or_else(|| classifier.backoff_delay(attempt));
                     let until = Instant::now() + earliest;
                     let mut gate = job.origin_backoff_until.lock().await;
                     if gate.is_none_or(|g| until > g) {
@@ -527,7 +525,10 @@ async fn worker_loop(
                     })
                     .await;
                 match classifier.decide(&error, attempt, retry_after) {
-                    RetryDecision::Retry { attempt: next, delay } => {
+                    RetryDecision::Retry {
+                        attempt: next,
+                        delay,
+                    } => {
                         attempt = next;
                         tokio::time::sleep(delay).await;
                     }
@@ -713,12 +714,12 @@ async fn transfer_lease(
         };
         // Body overrun detection (§11.2).
         if crate::http::range::body_overrun(in_range_offset, data.len() as u64, accepted_len) {
-            return Err(WorkerError::Fatal(
-                DownloadError::InvalidRangeResponse(format!(
+            return Err(WorkerError::Fatal(DownloadError::InvalidRangeResponse(
+                format!(
                     "response body exceeds accepted range [{}, {}]",
                     validated.start, validated.end
-                )),
-            ));
+                ),
+            )));
         }
         // Write at the absolute offset (positional, §14.2). Rate tokens
         // first: payload bytes only (§18.2).
@@ -743,8 +744,12 @@ async fn transfer_lease(
         // scheduler lock on the chunk path. The scheduler reconciles at
         // lease boundaries and the checkpoint cadence.
         let durable_through = validated.start + in_range_offset;
-        job.worker_progress[worker_idx]
-            .publish(lease.id, lease.generation, lease.start, durable_through);
+        job.worker_progress[worker_idx].publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            durable_through,
+        );
 
         // Checkpoint cadence (§15.4): completed ranges only; this is a
         // lease-boundary-quality reconciliation where the scheduler lock is
@@ -764,11 +769,7 @@ async fn transfer_lease(
     {
         let mut sched = job.scheduler.lock().await;
         sched.absorb_worker_progress(&job.worker_progress);
-        let _ = sched.report_progress(
-            lease.id,
-            lease.generation,
-            validated.start + accepted_len,
-        );
+        let _ = sched.report_progress(lease.id, lease.generation, validated.start + accepted_len);
     }
     job.worker_progress[worker_idx].clear();
     job.hub

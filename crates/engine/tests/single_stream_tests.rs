@@ -7,8 +7,8 @@ mod support;
 use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm, IntegrityPolicy};
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::http::transport::HttpTransport;
+use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes, sha256_hex};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -75,7 +75,10 @@ async fn hash_mismatch_prevents_commit() {
     ));
     // Destination untouched (integrity spec: no file created/replaced).
     assert!(!dest.exists(), "mismatch must not commit");
-    assert!(!dir.path().join("hash.bin.part").exists(), "no temp residue");
+    assert!(
+        !dir.path().join("hash.bin.part").exists(),
+        "no temp residue"
+    );
 }
 
 #[tokio::test]
@@ -141,7 +144,10 @@ async fn non_retryable_404_fails_immediately() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = controller();
     let result = c
-        .run(DownloadRequest::new(server.url("/missing"), dir.path().join("x")))
+        .run(DownloadRequest::new(
+            server.url("/missing"),
+            dir.path().join("x"),
+        ))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Failed);

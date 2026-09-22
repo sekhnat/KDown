@@ -70,7 +70,9 @@ impl JobCounters {
     #[must_use]
     pub fn new(worker_count: u32) -> Self {
         Self {
-            workers: (0..worker_count).map(|_| WorkerCounters::default()).collect(),
+            workers: (0..worker_count)
+                .map(|_| WorkerCounters::default())
+                .collect(),
             started: Instant::now(),
         }
     }
@@ -83,17 +85,16 @@ impl JobCounters {
     /// Fold all worker counters into a consistent snapshot (D12).
     #[must_use]
     pub fn fold(&self) -> ProgressSnapshot {
-        let raw: RawCounters = self
-            .workers
-            .iter()
-            .map(WorkerCounters::snapshot)
-            .fold(RawCounters::default(), |acc, r| RawCounters {
+        let raw: RawCounters = self.workers.iter().map(WorkerCounters::snapshot).fold(
+            RawCounters::default(),
+            |acc, r| RawCounters {
                 network: acc.network + r.network,
                 completed: acc.completed + r.completed,
                 reused: acc.reused + r.reused,
                 retries: acc.retries + r.retries,
                 wasted: acc.wasted + r.wasted,
-            });
+            },
+        );
         ProgressSnapshot {
             network_bytes: raw.network,
             completed_bytes: raw.completed,
@@ -125,13 +126,28 @@ mod tests {
     fn completed_bytes_uniqueness_under_re_reads() {
         let counters = JobCounters::new(2);
         // Worker 0 reads 10 MiB but only the first 4 MiB is acknowledged.
-        counters.worker(0).expect("slot").add_network(10 * 1024 * 1024);
-        counters.worker(0).expect("slot").add_completed(4 * 1024 * 1024);
-        counters.worker(0).expect("slot").add_wasted(6 * 1024 * 1024);
+        counters
+            .worker(0)
+            .expect("slot")
+            .add_network(10 * 1024 * 1024);
+        counters
+            .worker(0)
+            .expect("slot")
+            .add_completed(4 * 1024 * 1024);
+        counters
+            .worker(0)
+            .expect("slot")
+            .add_wasted(6 * 1024 * 1024);
         // Retry re-reads 6 MiB, 6 MiB acknowledged: network grows, completed
         // only grows by the newly acknowledged 6 MiB (§19.1, invariant 5).
-        counters.worker(0).expect("slot").add_network(6 * 1024 * 1024);
-        counters.worker(0).expect("slot").add_completed(6 * 1024 * 1024);
+        counters
+            .worker(0)
+            .expect("slot")
+            .add_network(6 * 1024 * 1024);
+        counters
+            .worker(0)
+            .expect("slot")
+            .add_completed(6 * 1024 * 1024);
         counters.worker(0).expect("slot").add_retries(1);
         let snap = counters.fold();
         assert_eq!(snap.network_bytes, 16 * 1024 * 1024);

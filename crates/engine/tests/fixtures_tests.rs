@@ -21,7 +21,17 @@ fn boundary_sizes_match_spec() {
     let sizes = boundary_sizes(chunk, segment);
     assert_eq!(
         sizes,
-        vec![0, 1, chunk - 1, chunk, chunk + 1, segment - 1, segment, segment + 1, 4 * chunk]
+        vec![
+            0,
+            1,
+            chunk - 1,
+            chunk,
+            chunk + 1,
+            segment - 1,
+            segment,
+            segment + 1,
+            4 * chunk
+        ]
     );
 }
 
@@ -36,7 +46,10 @@ fn exact_comparison_helper_detects_mismatches() {
         .err()
         .and_then(|e| e.downcast_ref::<String>().cloned())
         .unwrap_or_default();
-    assert!(msg.contains("byte 100"), "mismatch message names the offset: {msg}");
+    assert!(
+        msg.contains("byte 100"),
+        "mismatch message names the offset: {msg}"
+    );
 
     // Length mismatch reported first.
     let result = std::panic::catch_unwind(|| assert_bytes_exact(&expected[..10], &expected));

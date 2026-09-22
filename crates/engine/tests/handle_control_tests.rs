@@ -8,9 +8,9 @@ mod support;
 use std::time::Duration;
 
 use kdown_engine::config::EngineConfig;
+use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use kdown_engine::job::state::JobState;
-use kdown_engine::http::transport::HttpTransport;
 use support::fixtures::deterministic_bytes;
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -35,10 +35,7 @@ async fn pause_stops_network_activity_promptly() {
     let dest = dir.path().join("paused.bin");
 
     let c = controller();
-    let (handle, join) = c.start(DownloadRequest::new(
-        server.url("/pausable"),
-        dest.clone(),
-    ));
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/pausable"), dest.clone()));
     // Let it transfer for a bit, then pause.
     tokio::time::sleep(Duration::from_millis(300)).await;
     handle.pause();
@@ -88,10 +85,7 @@ async fn resume_after_pause_completes() {
     let dest = dir.path().join("resumed.bin");
 
     let c = controller();
-    let (handle, join) = c.start(DownloadRequest::new(
-        server.url("/resumable"),
-        dest.clone(),
-    ));
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/resumable"), dest.clone()));
     tokio::time::sleep(Duration::from_millis(200)).await;
     handle.pause();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -121,10 +115,7 @@ async fn cancel_midstream_deletes_temp() {
     let dest = dir.path().join("cancelled.bin");
 
     let c = controller();
-    let (handle, join) = c.start(DownloadRequest::new(
-        server.url("/cancelme"),
-        dest.clone(),
-    ));
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/cancelme"), dest.clone()));
     tokio::time::sleep(Duration::from_millis(300)).await;
     handle.cancel();
     let result = tokio::time::timeout(Duration::from_secs(10), join)

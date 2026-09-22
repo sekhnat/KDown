@@ -104,7 +104,8 @@ impl EngineMetrics {
             _ => {}
         }
         let mut map = self.retry_categories.lock().expect("category metrics");
-        *map.entry(format!("errors/{:?}", error.category())).or_default() += 1;
+        *map.entry(format!("errors/{:?}", error.category()))
+            .or_default() += 1;
     }
 
     pub fn record_latency(&self, elapsed: Duration) {

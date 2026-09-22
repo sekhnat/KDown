@@ -72,9 +72,8 @@ impl CheckpointStore for FileCheckpointStore {
         let path = self.path_for(job_identity);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let json = String::from_utf8(bytes).map_err(|e| {
-                    CheckpointError::Corrupt(format!("checkpoint not utf-8: {e}"))
-                })?;
+                let json = String::from_utf8(bytes)
+                    .map_err(|e| CheckpointError::Corrupt(format!("checkpoint not utf-8: {e}")))?;
                 Checkpoint::from_json(&json).map(Some)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -88,24 +87,20 @@ impl CheckpointStore for FileCheckpointStore {
     fn save_atomic(&self, checkpoint: &Checkpoint) -> Result<(), CheckpointError> {
         let json = checkpoint.to_json()?;
         let path = self.path_for(&checkpoint.job_id);
-        let tmp_path = self.dir.join(format!(
-            "{}.{}.tmp",
-            checkpoint.job_id,
-            std::process::id()
-        ));
+        let tmp_path = self
+            .dir
+            .join(format!("{}.{}.tmp", checkpoint.job_id, std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
                 CheckpointError::Corrupt(format!("create {}: {e}", tmp_path.display()))
             })?;
             f.write_all(json.as_bytes())
                 .map_err(|e| CheckpointError::Corrupt(format!("write: {e}")))?;
-            f.flush().map_err(|e| {
-                CheckpointError::Corrupt(format!("flush: {e}"))
-            })?;
+            f.flush()
+                .map_err(|e| CheckpointError::Corrupt(format!("flush: {e}")))?;
             if self.durability == DurabilityMode::Durable {
-                f.sync_all().map_err(|e| {
-                    CheckpointError::Corrupt(format!("fsync checkpoint: {e}"))
-                })?;
+                f.sync_all()
+                    .map_err(|e| CheckpointError::Corrupt(format!("fsync checkpoint: {e}")))?;
             }
         }
         std::fs::rename(&tmp_path, &path).map_err(|e| {
@@ -190,11 +185,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("dir")
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "tmp files must be renamed away");
     }
@@ -202,8 +193,7 @@ mod tests {
     #[test]
     fn delete_removes_and_missing_ok() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store =
-            FileCheckpointStore::new(dir.path(), DurabilityMode::Durable).expect("store");
+        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Durable).expect("store");
         store.save_atomic(&sample("job-c")).expect("save");
         store.delete("job-b").expect("missing delete is ok");
         store.delete("job-a").expect("delete");

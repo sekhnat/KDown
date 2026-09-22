@@ -278,11 +278,17 @@ mod tests {
         .await;
         assert!(matches!(
             stream.next().await,
-            Some(Event::StateChanged { to: JobState::Probing, .. })
+            Some(Event::StateChanged {
+                to: JobState::Probing,
+                ..
+            })
         ));
         assert!(matches!(
             stream.next().await,
-            Some(Event::StateChanged { to: JobState::Running, .. })
+            Some(Event::StateChanged {
+                to: JobState::Running,
+                ..
+            })
         ));
         assert!(matches!(stream.next().await, Some(Event::Failed { .. })));
     }

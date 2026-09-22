@@ -24,7 +24,9 @@ use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::{Event, EventHub, SharedHub};
 use crate::metrics::export::EngineMetrics;
-use crate::resume::checkpoint_store::{CheckpointStore as _, DurabilityMode as StoreDurability, FileCheckpointStore};
+use crate::resume::checkpoint_store::{
+    CheckpointStore as _, DurabilityMode as StoreDurability, FileCheckpointStore,
+};
 use crate::resume::durable_ranges::DurableRangeTracker;
 
 /// What a job downloads (§7.2 subset for v1 single-stream).
@@ -199,10 +201,7 @@ impl DownloadHandle {
     /// The cancellation mode in effect.
     #[must_use]
     pub fn cancel_mode(&self) -> CancelMode {
-        match self
-            .cancel_mode
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        match self.cancel_mode.load(std::sync::atomic::Ordering::SeqCst) {
             1 => CancelMode::KeepPartial,
             2 => CancelMode::KeepFileDiscardCheckpoint,
             _ => CancelMode::DeletePartial,
@@ -244,9 +243,9 @@ impl DownloadHandle {
             let bucket = if bytes_per_second == 0 {
                 None
             } else {
-                Some(Arc::new(
-                    crate::control::rate_limit::TokenBucket::new(bytes_per_second),
-                ))
+                Some(Arc::new(crate::control::rate_limit::TokenBucket::new(
+                    bytes_per_second,
+                )))
             };
             job.set_rate_bucket(bucket);
         }
@@ -254,9 +253,9 @@ impl DownloadHandle {
         *bucket = if bytes_per_second == 0 {
             None
         } else {
-            Some(Arc::new(
-                crate::control::rate_limit::TokenBucket::new(bytes_per_second),
-            ))
+            Some(Arc::new(crate::control::rate_limit::TokenBucket::new(
+                bytes_per_second,
+            )))
         };
     }
 
@@ -299,7 +298,11 @@ impl SingleStreamController {
 
     /// Build a controller sharing an engine-wide metrics registry (§19.5).
     #[must_use]
-    pub fn with_metrics(transport: HttpTransport, config: EngineConfig, metrics: Arc<EngineMetrics>) -> Self {
+    pub fn with_metrics(
+        transport: HttpTransport,
+        config: EngineConfig,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let classifier = RetryClassifier::new(config.retry.clone());
         Self {
             transport,
@@ -322,10 +325,7 @@ impl SingleStreamController {
     /// # Errors
     /// Terminal errors surface in [`DownloadResult::error`]; the function
     /// itself returns `Ok` for all three terminal statuses.
-    pub async fn run(
-        &self,
-        request: DownloadRequest,
-    ) -> Result<DownloadResult, DownloadError> {
+    pub async fn run(&self, request: DownloadRequest) -> Result<DownloadResult, DownloadError> {
         self.run_with_handle(request).await.map(|(r, _)| r)
     }
 
@@ -383,17 +383,18 @@ impl SingleStreamController {
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 metrics: metrics_for_run.clone(),
             };
-            let terminal = this.run_inner(
-                request,
-                inner_state,
-                inner_cancel,
-                handle_cancel_mode,
-                inner_counters,
-                inner_hub,
-                handle_cell.clone(),
-                rate_bucket_for_run,
-            )
-            .await;
+            let terminal = this
+                .run_inner(
+                    request,
+                    inner_state,
+                    inner_cancel,
+                    handle_cancel_mode,
+                    inner_counters,
+                    inner_hub,
+                    handle_cell.clone(),
+                    rate_bucket_for_run,
+                )
+                .await;
             match &terminal {
                 Ok(result) => metrics_for_run.record_result(result),
                 Err(error) => metrics_for_run.record_task_error(error),
@@ -414,8 +415,7 @@ impl SingleStreamController {
         let (handle, join) = self.start(request);
         let result = join
             .await
-            .map_err(|e| DownloadError::Protocol(format!("job task panicked: {e}")))?
-            ?;
+            .map_err(|e| DownloadError::Protocol(format!("job task panicked: {e}")))??;
         Ok((result, handle))
     }
 
@@ -429,9 +429,7 @@ impl SingleStreamController {
         cancel_mode: Arc<std::sync::atomic::AtomicU8>,
         counters: Arc<JobCounters>,
         hub: SharedHub,
-        segmented_cell: Arc<
-            std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>,
-        >,
+        segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
         rate_bucket_shared: Arc<
             std::sync::Mutex<Option<Arc<crate::control::rate_limit::TokenBucket>>>,
         >,
@@ -457,11 +455,10 @@ impl SingleStreamController {
             });
         }
 
-        // ---- Resume state (§15.5, tasks 4.4-4.6) ----
-        let identity = crate::resume::flow::job_identity(
-            &request.url,
-            &request.destination,
-        );
+        // ---- Resume admission, phase 1 (§15.5, §7.2): policy-aware
+        // checkpoint loading before any network activity. Required-state
+        // failures reject before the job enters Probing.
+        let identity = crate::resume::flow::job_identity(&request.url, &request.destination);
         let store = FileCheckpointStore::new(
             &request
                 .destination
@@ -469,23 +466,29 @@ impl SingleStreamController {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from(".")),
             match self.config.transfer.durability {
-                crate::config::DurabilityMode::Performance => {
-                    StoreDurability::Performance
-                }
+                crate::config::DurabilityMode::Performance => StoreDurability::Performance,
                 crate::config::DurabilityMode::Durable => StoreDurability::Durable,
             },
         )
         .map_err(|e| DownloadError::Checkpoint(e.to_string()))?;
-        let loaded_cp = match crate::resume::flow::ResumeSupport::check_resume_policy(
+        let pending_admission = match crate::resume::flow::begin_admission(
             request.resume,
-            &store,
             &identity,
+            TempFileSpec::default().temp_path_for(&request.destination),
+            &store,
         ) {
-            Ok(cp) => cp,
-            Err(e) => {
+            Ok(pending) => pending,
+            Err(failure) => {
+                Self::emit_resume_notices(&hub, &failure.notices).await;
                 let _ = state.transition(JobState::Failing);
                 let _ = state.transition(JobState::Failed);
-                return Ok(self.failed_result(request, counters, Duration::ZERO, e, ResourceValidators::default()));
+                return Ok(self.failed_result(
+                    request,
+                    counters,
+                    Duration::ZERO,
+                    failure.error,
+                    ResourceValidators::default(),
+                ));
             }
         };
 
@@ -494,7 +497,8 @@ impl SingleStreamController {
         hub.emit(Event::StateChanged {
             from: JobState::Created,
             to: JobState::Probing,
-        }).await;
+        })
+        .await;
         crate::observability::log_info(
             &crate::observability::Correlation::new().origin(request.url.clone()),
             "job probing",
@@ -514,8 +518,7 @@ impl SingleStreamController {
         let mut probe_auth_guard = crate::control::auth::AuthStageGuard::new();
         loop {
             if cancel.is_cancelled() {
-                return self
-                    .terminal_cancelled(&state, request, counters, Duration::ZERO);
+                return self.terminal_cancelled(&state, request, counters, Duration::ZERO);
             }
             match self.probe_with_retry_after(&spec, &cancel).await {
                 Ok((m, _ra, _ch)) => {
@@ -525,17 +528,17 @@ impl SingleStreamController {
                 Err((e, retry_after, challenge)) => {
                     // Credential challenge at probe time (§29): consult the
                     // provider (bounded stages), attach headers, re-probe.
-                    if let (Some(ch), Some(provider)) = (&challenge, &request.credential_provider)
-                    {
+                    if let (Some(ch), Some(provider)) = (&challenge, &request.credential_provider) {
                         if probe_auth_guard.can_provide() {
                             probe_auth_guard.record();
-                            if let Ok(
-                                crate::control::auth::CredentialDecision::Headers(hdrs),
-                            ) = provider.request(ch)
+                            if let Ok(crate::control::auth::CredentialDecision::Headers(hdrs)) =
+                                provider.request(ch)
                             {
                                 for (k, v) in hdrs {
-                                    if let Some(existing) =
-                                        spec.headers.iter_mut().find(|(hk, _)| hk.eq_ignore_ascii_case(&k))
+                                    if let Some(existing) = spec
+                                        .headers
+                                        .iter_mut()
+                                        .find(|(hk, _)| hk.eq_ignore_ascii_case(&k))
                                     {
                                         existing.1 = v;
                                     } else {
@@ -547,7 +550,10 @@ impl SingleStreamController {
                         }
                     }
                     match self.classifier.decide(&e, attempt, retry_after) {
-                        RetryDecision::Retry { attempt: next, delay } => {
+                        RetryDecision::Retry {
+                            attempt: next,
+                            delay,
+                        } => {
                             counters.worker(0).expect("worker slot").add_retries(1);
                             attempt = next;
                             tokio::time::sleep(delay).await;
@@ -568,68 +574,37 @@ impl SingleStreamController {
                             });
                         }
                     }
-                },
+                }
             }
         }
         hub.emit(Event::ProbeCompleted {
             total_size: meta.total_size,
             range_support: meta.accept_ranges,
-        }).await;
+        })
+        .await;
 
-        // ---- Resume validation (§15.5 steps 2-7) ----
-        #[allow(unused_assignments)] // read through the Prepare section below
-        let mut resume_offset: u64 = 0;
-        let mut resume_ranges: Vec<crate::resume::checkpoint::ByteRange> = vec![];
-        let mut cp_validators: Option<ResourceValidators> = None;
-        let mut warnings: Vec<String> = vec![];
-        if let Some(cp) = &loaded_cp {
-            // Generation comparison first (§15.5 step 4): mismatch applies
-            // the change policy and never mixes generations (§26).
-            let generation_ok = crate::resume::flow::ResumeSupport::compare_generations(
-                &cp.validators,
-                &meta.validators,
-            )
-            .map(|_| true)
-            .unwrap_or(false);
-            if !generation_ok {
-                hub.emit(Event::ResourceChanged {
-                    detail: "validators differ from checkpoint".into(),
-                }).await;
-                match self.change_policy() {
-                    crate::resume::flow::GenerationChangePolicy::Fail => {
-                        let _ = state.transition(JobState::Failing);
-                        let _ = state.transition(JobState::Failed);
-                        return Ok(self.failed_result(
-                            request,
-                            counters,
-                            Duration::ZERO,
-                            DownloadError::ResourceChanged(
-                                "resource changed since checkpoint".into(),
-                            ),
-                            meta.validators.clone(),
-                        ));
-                    }
-                    crate::resume::flow::GenerationChangePolicy::RestartFromZero => {
-                        // Truncate: fresh sink and empty checkpoint.
-                        let _ = store.delete(&identity);
-                        counters.worker(0).expect("w").add_reused(0);
-                        warnings.push("resource changed; restarting from zero".into());
-                    }
-                }
-            } else {
-                // Validate temp file plausibility (§15.5 step 2).
-                let temp_path = TempFileSpec::default().temp_path_for(&request.destination);
-                if let Err(e) = crate::resume::flow::ResumeSupport::validate_temp_file(cp, &temp_path) {
-                    // Corrupt/missing temp: restart per §15.5/§38 (conservative).
-                    warnings.push(format!("checkpoint unusable ({e}); restarting from zero"));
-                    let _ = store.delete(&identity);
-                } else {
-                    resume_ranges = cp.completed_ranges.clone();
-                    cp_validators = Some(cp.validators.clone());
-                    counters.worker(0).expect("w").add_reused(cp.completed_bytes());
-                }
+        // ---- Resume admission, phase 2 (§15.5 steps 2-7) ----
+        // One decision: generation safety first (never mixing, §26),
+        // then temp-output plausibility, then continue/restart selection
+        // with the checkpoint cleanup a restart requires.
+        let plan = match pending_admission.finalize(&meta.validators) {
+            crate::resume::flow::AdmissionDecision::Proceed(plan) => *plan,
+            crate::resume::flow::AdmissionDecision::Reject(failure) => {
+                Self::emit_resume_notices(&hub, &failure.notices).await;
+                let _ = state.transition(JobState::Failing);
+                let _ = state.transition(JobState::Failed);
+                return Ok(self.failed_result(
+                    request,
+                    counters,
+                    Duration::ZERO,
+                    failure.error,
+                    meta.validators.clone(),
+                ));
             }
-        }
+        };
+        Self::emit_resume_notices(&hub, plan.notices()).await;
+        let warnings: Vec<String> = plan.warnings().to_vec();
+        let resume_validators: Option<ResourceValidators> = plan.validators();
 
         // Size expectation check (§4.1): caller-provided size must match.
         if let (Some(expected), Some(actual)) = (request.expected_size, meta.total_size) {
@@ -711,13 +686,12 @@ impl SingleStreamController {
             } else {
                 meta.accept_ranges
             };
-            let _ = cp_validators.is_some(); // resume validators gated below
             size_ok && range_ok && meta.status == 200
         };
 
         // ---- Prepare (§9.1 Preparing, §14) ----
         let _ = state.transition(JobState::Preparing);
-        let resuming = !resume_ranges.is_empty();
+        let resuming = plan.is_resuming();
         let mut sink = if resuming {
             // Reuse the existing temp file (§15.5: continue, never
             // truncate when ranges validate). Preserve across drops.
@@ -736,11 +710,6 @@ impl SingleStreamController {
         if !resuming {
             sink.prepare(meta.total_size).map_err(|e| e.0)?;
         }
-        // Single-stream resume: the completed prefix is [0, n); continue at n.
-        resume_offset = resume_ranges
-            .last()
-            .map(|(_, e)| e.saturating_add(1))
-            .unwrap_or(0);
 
         // ---- Segmented mode dispatch (§12, task 5.5) ----
         if eligible {
@@ -751,19 +720,20 @@ impl SingleStreamController {
             })
             .await;
             let started = std::time::Instant::now();
-            let total = meta
-                .total_size
-                .expect("eligible requires known size");
+            let total = meta.total_size.expect("eligible requires known size");
             // The sink must survive worker drops (workers hold clones of
             // the Arc; the last Drop would delete the temp file otherwise).
             sink.set_keep_on_drop(true);
             let sink_shared = Arc::new(tokio::sync::Mutex::new(sink));
             // Pre-set rate limit (set before the probe completed) carries
             // into the segmented job (task 5.8).
-            let initial_bucket = rate_bucket_shared
-                .lock()
-                .expect("rate bucket lock")
-                .clone();
+            let initial_bucket = rate_bucket_shared.lock().expect("rate bucket lock").clone();
+            // Segmented view: every admitted range is reusable (§12.1).
+            let resumed = plan.segmented();
+            counters
+                .worker(0)
+                .expect("w")
+                .add_reused(resumed.reused_bytes);
             let outcome = crate::job::segmented::run_segmented(
                 self.transport.clone(),
                 &self.config,
@@ -777,26 +747,27 @@ impl SingleStreamController {
                 counters.clone(),
                 &hub,
                 cancel.clone(),
-                resume_ranges.clone(),
+                resumed.ranges.to_vec(),
                 started,
                 Some(segmented_cell.clone()),
                 initial_bucket,
             )
             .await;
-            return self.finish_segmented(
-                &request,
-                state,
-                counters,
-                hub,
-                &store,
-                &identity,
-                &meta,
-                outcome,
-                request.destination.clone(),
-                warnings,
-                started,
-            )
-            .await;
+            return self
+                .finish_segmented(
+                    &request,
+                    state,
+                    counters,
+                    hub,
+                    &store,
+                    &identity,
+                    &meta,
+                    outcome,
+                    request.destination.clone(),
+                    warnings,
+                    started,
+                )
+                .await;
         }
 
         // ---- Running: sequential GET with chunked writes (§13) ----
@@ -804,20 +775,29 @@ impl SingleStreamController {
         hub.emit(Event::StateChanged {
             from: JobState::Preparing,
             to: JobState::Running,
-        }).await;
+        })
+        .await;
         let started = std::time::Instant::now();
-        let mut offset: u64 = resume_offset;
+        // Sequential view: only the contiguous [0, n) prefix is reused;
+        // continue at n. Disjoint admitted ranges are rewritten by the
+        // sequential stream, not skipped.
+        let resumed = plan.sequential();
+        counters
+            .worker(0)
+            .expect("w")
+            .add_reused(resumed.reused_bytes);
+        let mut offset: u64 = resumed.offset;
         let mut validators = meta.validators.clone();
         let mut attempt: u32 = 0;
         // Checkpoint cadence state (§8.1 checkpoint_flush_interval).
         let mut last_checkpoint = std::time::Instant::now();
         let mut durable = DurableRangeTracker::from_config(self.config.transfer.durability);
-        durable.page_cache_ack(resume_offset);
+        durable.page_cache_ack(offset);
 
         // Persist an initial checkpoint when resuming (§15.5: carry
         // validators forward so a later resume still validates).
         if resuming {
-            if let Some(cp) = loaded_cp.as_ref() {
+            if let Some(cp) = plan.checkpoint() {
                 let mut fresh = cp.clone();
                 fresh.final_url = meta.final_url.clone();
                 let _ = store.save_atomic(&fresh);
@@ -826,12 +806,12 @@ impl SingleStreamController {
 
         // Request: ranged resume with If-Range (§11.3), or full GET when
         // fresh. Rebuild spec for the transfer (probe spec has no range).
-        let transfer_spec = if resuming && cp_validators.is_some() {
+        let transfer_spec = if resuming && resume_validators.is_some() {
             RequestSpec {
                 url: spec.url.clone(),
                 headers: spec.headers.clone(),
                 range: None, // set per-request below
-                validators: cp_validators.clone(),
+                validators: resume_validators.clone(),
                 identity_encoding: true,
                 sensitive: false,
             }
@@ -848,9 +828,7 @@ impl SingleStreamController {
             if cancel.is_cancelled() {
                 let elapsed = started.elapsed();
                 self.cleanup_cancelled(
-                    CancelMode::from_u8(
-                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                    ),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                     &mut sink,
                     &store,
                     &identity,
@@ -866,7 +844,7 @@ impl SingleStreamController {
             // fresh at offset 0. Credential-provider headers (§29) attach
             // to every re-issued request after a challenge.
             let mut this_spec = if resuming || offset > 0 {
-                let mut s = if cp_validators.is_some() {
+                let mut s = if resume_validators.is_some() {
                     transfer_spec.clone()
                 } else {
                     let mut s2 = spec.clone();
@@ -898,7 +876,10 @@ impl SingleStreamController {
                 Ok(r) => r,
                 Err(e) => {
                     match self.classifier.decide(&e, attempt, None) {
-                        RetryDecision::Retry { attempt: next, delay } => {
+                        RetryDecision::Retry {
+                            attempt: next,
+                            delay,
+                        } => {
                             counters.worker(0).expect("w").add_retries(1);
                             attempt = next;
                             offset = 0; // restart from zero (no checkpoint yet)
@@ -916,7 +897,15 @@ impl SingleStreamController {
                         RetryDecision::GiveUp => {
                             let _ = sink.abort();
                             return self
-                                .terminal_failed(&state, request, counters, started.elapsed(), e, validators, warnings)
+                                .terminal_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    e,
+                                    validators,
+                                    warnings,
+                                )
                                 .map(|mut r| {
                                     r.final_path = None;
                                     r
@@ -940,8 +929,15 @@ impl SingleStreamController {
                         if !auth_guard.can_provide() {
                             let _ = sink.abort();
                             return self
-                                .terminal_failed(&state, request, counters, started.elapsed(),
-                                    DownloadError::AuthenticationRequired, validators, warnings)
+                                .terminal_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    DownloadError::AuthenticationRequired,
+                                    validators,
+                                    warnings,
+                                )
                                 .map(|mut r| {
                                     r.final_path = None;
                                     r
@@ -958,8 +954,15 @@ impl SingleStreamController {
                             _ => {
                                 let _ = sink.abort();
                                 return self
-                                    .terminal_failed(&state, request, counters, started.elapsed(),
-                                        DownloadError::AuthenticationRequired, validators, warnings)
+                                    .terminal_failed(
+                                        &state,
+                                        request,
+                                        counters,
+                                        started.elapsed(),
+                                        DownloadError::AuthenticationRequired,
+                                        validators,
+                                        warnings,
+                                    )
                                     .map(|mut r| {
                                         r.final_path = None;
                                         r
@@ -971,12 +974,13 @@ impl SingleStreamController {
                     }
                 }
                 let err = status_error(resp.status);
-                let retry_after = parse_retry_after(
-                    resp.header("retry-after"),
-                );
+                let retry_after = parse_retry_after(resp.header("retry-after"));
                 let _ = sink.abort();
                 match self.classifier.decide(&err, attempt, retry_after) {
-                    RetryDecision::Retry { attempt: next, delay } => {
+                    RetryDecision::Retry {
+                        attempt: next,
+                        delay,
+                    } => {
                         counters.worker(0).expect("w").add_retries(1);
                         attempt = next;
                         offset = 0;
@@ -996,7 +1000,15 @@ impl SingleStreamController {
                     }
                     RetryDecision::GiveUp => {
                         return self
-                            .terminal_failed(&state, request, counters, started.elapsed(), err, validators, warnings)
+                            .terminal_failed(
+                                &state,
+                                request,
+                                counters,
+                                started.elapsed(),
+                                err,
+                                validators,
+                                warnings,
+                            )
                             .map(|mut r| {
                                 r.final_path = None;
                                 r
@@ -1030,7 +1042,7 @@ impl SingleStreamController {
                             );
                         }
                     }
-                } else if resp.status == 200 && resuming && cp_validators.is_some() {
+                } else if resp.status == 200 && resuming && resume_validators.is_some() {
                     // Full representation to an If-Range request: the
                     // resource changed mid-resume (§26).
                     let _ = sink.abort();
@@ -1072,13 +1084,11 @@ impl SingleStreamController {
                 if cancel.is_cancelled() {
                     let elapsed = started.elapsed();
                     self.cleanup_cancelled(
-                    CancelMode::from_u8(
-                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                    ),
-                    &mut sink,
-                    &store,
-                    &identity,
-                );
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                        &mut sink,
+                        &store,
+                        &identity,
+                    );
                     return self.terminal_cancelled(&state, request, counters, elapsed);
                 }
                 if cancel.is_paused() {
@@ -1088,15 +1098,13 @@ impl SingleStreamController {
                     let _ = sink.flush(FlushLevel::PageCache);
                     durable.page_cache_ack(offset);
                     if meta.total_size.is_some() && offset > 0 {
-                        let mut cp = loaded_cp
-                            .clone()
-                            .unwrap_or_else(|| {
-                                crate::resume::checkpoint::Checkpoint::new(
-                                    identity.clone(),
-                                    request.url.clone(),
-                                    format!("tmp-{}", identity),
-                                )
-                            });
+                        let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
+                            crate::resume::checkpoint::Checkpoint::new(
+                                identity.clone(),
+                                request.url.clone(),
+                                format!("tmp-{}", identity),
+                            )
+                        });
                         cp.total_size = meta.total_size;
                         cp.validators = validators.clone();
                         cp.final_url = meta.final_url.clone();
@@ -1110,103 +1118,110 @@ impl SingleStreamController {
                     }
                     if cancel.is_cancelled() {
                         self.cleanup_cancelled(
-                    CancelMode::from_u8(
-                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                    ),
-                    &mut sink,
-                    &store,
-                    &identity,
-                );
-                        return self.terminal_cancelled(&state, request, counters, started.elapsed());
-                    }
-                }
-                let frame = match tokio::time::timeout(
-                    self.config.network.read_idle_timeout,
-                    body.frame(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(frame))) => frame,
-                    Ok(Some(Err(e))) => {
-                        let err = classify_body_error(&e);
-                        match self.classifier.decide(&err, attempt, None) {
-                            RetryDecision::Retry { attempt: next, delay } => {
-                                counters.worker(0).expect("w").add_retries(1);
-                                counters
-                                    .worker(0)
-                                    .expect("w")
-                                    .add_wasted(written_this_stream);
-                                attempt = next;
-                                // Retry from the durable prefix (§17.3):
-                                // reuse checkpointed offset when a
-                                // checkpoint exists, else restart from zero.
-                                let durable_through = durable.admissible_through();
-                                if durable_through > 0 {
-                                    offset = durable_through;
-                                    // Keep the temp file; reopen without
-                                    // truncate to preserve the prefix.
-                                    let _ = sink.flush(FlushLevel::PageCache);
-                                    // Prevent the old sink's Drop from
-                                    // deleting the temp file we are
-                                    // preserving.
-                                    sink.set_keep_on_drop(true);
-                                    sink = FileSink::open(
-                                        &request.destination,
-                                        &TempFileSpec::default(),
-                                        false,
-                                    )
-                                    .map_err(|se| se.0)?;
-                                } else {
-                                    offset = 0;
-                                    let _ = sink.abort();
-                                    sink = FileSink::open(
-                                        &request.destination,
-                                        &TempFileSpec::default(),
-                                        self.config.transfer.preallocate_output,
-                                    )
-                                    .map_err(|se| se.0)?;
-                                    sink.prepare(meta.total_size).map_err(|se| se.0)?;
-                                }
-                                hub.emit(Event::Warning {
-                                    detail: format!(
-                                        "stream reset; retrying from offset {offset} ({err})"
-                                    ),
-                                }).await;
-                                tokio::time::sleep(delay).await;
-                                continue 'download;
-                            }
-                            RetryDecision::GiveUp => {
-                                let _ = sink.abort();
-                                return self.terminal_failed(
-                                    &state,
-                                    request,
-                                    counters,
-                                    started.elapsed(),
-                                    err,
-                                    validators,
-                                    warnings,
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => break, // clean EOF
-                    Err(_) => {
-                        // Read idle timeout.
-                        let _ = sink.abort();
-                        return self.terminal_failed(
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                            &mut sink,
+                            &store,
+                            &identity,
+                        );
+                        return self.terminal_cancelled(
                             &state,
                             request,
                             counters,
                             started.elapsed(),
-                            DownloadError::Connection("read idle timeout".into()),
-                            validators,
-                            warnings,
                         );
                     }
-                };
-                let data = frame.into_data().map_err(|_f| {
-                    DownloadError::Protocol("unexpected trailer frame".into())
-                })?;
+                }
+                let frame =
+                    match tokio::time::timeout(self.config.network.read_idle_timeout, body.frame())
+                        .await
+                    {
+                        Ok(Some(Ok(frame))) => frame,
+                        Ok(Some(Err(e))) => {
+                            let err = classify_body_error(&e);
+                            match self.classifier.decide(&err, attempt, None) {
+                                RetryDecision::Retry {
+                                    attempt: next,
+                                    delay,
+                                } => {
+                                    counters.worker(0).expect("w").add_retries(1);
+                                    counters
+                                        .worker(0)
+                                        .expect("w")
+                                        .add_wasted(written_this_stream);
+                                    attempt = next;
+                                    // Retry from the durable prefix (§17.3):
+                                    // reuse checkpointed offset when a
+                                    // checkpoint exists, else restart from zero.
+                                    let durable_through = durable.admissible_through();
+                                    if durable_through > 0 {
+                                        offset = durable_through;
+                                        // Keep the temp file; reopen without
+                                        // truncate to preserve the prefix.
+                                        let _ = sink.flush(FlushLevel::PageCache);
+                                        // Prevent the old sink's Drop from
+                                        // deleting the temp file we are
+                                        // preserving.
+                                        sink.set_keep_on_drop(true);
+                                        sink = FileSink::open(
+                                            &request.destination,
+                                            &TempFileSpec::default(),
+                                            false,
+                                        )
+                                        .map_err(|se| se.0)?;
+                                    } else {
+                                        offset = 0;
+                                        let _ = sink.abort();
+                                        sink = FileSink::open(
+                                            &request.destination,
+                                            &TempFileSpec::default(),
+                                            self.config.transfer.preallocate_output,
+                                        )
+                                        .map_err(|se| se.0)?;
+                                        sink.prepare(meta.total_size).map_err(|se| se.0)?;
+                                    }
+                                    hub.emit(Event::Warning {
+                                        detail: format!(
+                                            "stream reset; retrying from offset {offset} ({err})"
+                                        ),
+                                    })
+                                    .await;
+                                    tokio::time::sleep(delay).await;
+                                    continue 'download;
+                                }
+                                RetryDecision::GiveUp => {
+                                    let _ = sink.abort();
+                                    return self.terminal_failed(
+                                        &state,
+                                        request,
+                                        counters,
+                                        started.elapsed(),
+                                        err,
+                                        validators,
+                                        warnings,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => break, // clean EOF
+                        Err(_) => {
+                            // Read idle timeout.
+                            let _ = sink.abort();
+                            return self.terminal_failed(
+                                &state,
+                                request,
+                                counters,
+                                started.elapsed(),
+                                DownloadError::Connection("read idle timeout".into()),
+                                validators,
+                                warnings,
+                            );
+                        }
+                    };
+                let data = frame
+                    .into_data()
+                    .map_err(|_f| DownloadError::Protocol("unexpected trailer frame".into()))?;
                 let len = data.len() as u64;
                 if let Some(max) = request.expected_size {
                     if offset + len > max {
@@ -1217,9 +1232,7 @@ impl SingleStreamController {
                             request,
                             counters,
                             started.elapsed(),
-                            DownloadError::Protocol(format!(
-                                "body exceeds expected size {max}"
-                            )),
+                            DownloadError::Protocol(format!("body exceeds expected size {max}")),
                             validators,
                             warnings,
                         );
@@ -1228,11 +1241,10 @@ impl SingleStreamController {
 
                 // Backpressure: single in-flight chunk; write then read
                 // (§13.1).
-                sink.write_at(offset, &data)
-                    .map_err(|se| {
-                        let _ = sink.abort();
-                        se.0
-                    })?;
+                sink.write_at(offset, &data).map_err(|se| {
+                    let _ = sink.abort();
+                    se.0
+                })?;
                 counters.worker(0).expect("w").add_network(len);
                 counters.worker(0).expect("w").add_completed(len);
                 offset += len;
@@ -1241,19 +1253,16 @@ impl SingleStreamController {
 
                 // Checkpoint cadence (§8.1): record progress on the
                 // configured interval (§15.4 performance mode).
-                if last_checkpoint.elapsed() >= self.config.checkpoint_flush_interval
-                    && offset > 0
+                if last_checkpoint.elapsed() >= self.config.checkpoint_flush_interval && offset > 0
                 {
                     last_checkpoint = std::time::Instant::now();
-                    let mut cp = loaded_cp
-                        .clone()
-                        .unwrap_or_else(|| {
-                            crate::resume::checkpoint::Checkpoint::new(
-                                identity.clone(),
-                                request.url.clone(),
-                                format!("tmp-{}", identity),
-                            )
-                        });
+                    let mut cp = plan.checkpoint().cloned().unwrap_or_else(|| {
+                        crate::resume::checkpoint::Checkpoint::new(
+                            identity.clone(),
+                            request.url.clone(),
+                            format!("tmp-{}", identity),
+                        )
+                    });
                     cp.total_size = meta.total_size;
                     cp.validators = validators.clone();
                     cp.final_url = meta.final_url.clone();
@@ -1306,9 +1315,18 @@ impl SingleStreamController {
                 Err(e) => {
                     hub.emit(Event::IntegrityCheckFailed {
                         detail: e.to_string(),
-                    }).await;
+                    })
+                    .await;
                     return self
-                        .terminal_failed(&state, request, counters, started.elapsed(), e, validators, warnings)
+                        .terminal_failed(
+                            &state,
+                            request,
+                            counters,
+                            started.elapsed(),
+                            e,
+                            validators,
+                            warnings,
+                        )
                         .map(|mut r| {
                             r.final_path = None;
                             r
@@ -1328,7 +1346,8 @@ impl SingleStreamController {
                 let _ = store.delete(&identity);
                 hub.emit(Event::Committed {
                     path: final_path.display().to_string(),
-                }).await;
+                })
+                .await;
                 let snap = counters.fold();
                 Ok(DownloadResult {
                     status: ResultStatus::Completed,
@@ -1386,9 +1405,20 @@ impl SingleStreamController {
         }
     }
 
-    /// Generation-change policy (§26): fail by default (D-design safety).
-    fn change_policy(&self) -> crate::resume::flow::GenerationChangePolicy {
-        crate::resume::flow::GenerationChangePolicy::Fail
+    /// Publish admission notification facts as events. The resume module
+    /// decides; the job owns the observable effect (§26: ResourceChanged
+    /// precedes any terminal transition).
+    async fn emit_resume_notices(hub: &SharedHub, notices: &[crate::resume::flow::ResumeNotice]) {
+        for notice in notices {
+            match notice {
+                crate::resume::flow::ResumeNotice::ResourceChanged { detail } => {
+                    hub.emit(Event::ResourceChanged {
+                        detail: detail.clone(),
+                    })
+                    .await;
+                }
+            }
+        }
     }
 
     /// Post-segmented-transfer completion path: verify size + hashes over
@@ -1452,7 +1482,10 @@ impl SingleStreamController {
             .map_err(|e| DownloadError::from_io(&e))?;
         if sink_size != outcome.total_size {
             hub.emit(Event::IntegrityCheckFailed {
-                detail: format!("size mismatch: got {sink_size}, expected {}", outcome.total_size),
+                detail: format!(
+                    "size mismatch: got {sink_size}, expected {}",
+                    outcome.total_size
+                ),
             })
             .await;
             let _ = state.transition(JobState::Failing);
@@ -1508,12 +1541,9 @@ impl SingleStreamController {
             // Reopen a sink over the temp file strictly for the commit:
             // the worker-shared sink stays locked inside run_segmented's
             // scope; FileSink::commit performs the atomic rename.
-            let mut commit_sink = FileSink::open(
-                &request.destination,
-                &TempFileSpec::default(),
-                false,
-            )
-            .map_err(|e| e.0)?;
+            let mut commit_sink =
+                FileSink::open(&request.destination, &TempFileSpec::default(), false)
+                    .map_err(|e| e.0)?;
             commit_sink.set_keep_on_drop(true);
             commit_sink.finalize().map_err(|e| e.0)?;
             commit_sink.commit()
@@ -1564,7 +1594,18 @@ impl SingleStreamController {
         &self,
         spec: &RequestSpec,
         cancel: &CancellationToken,
-    ) -> Result<(ProbeMetadata, Option<Duration>, Option<crate::control::auth::Challenge>), (DownloadError, Option<Duration>, Option<crate::control::auth::Challenge>)> {
+    ) -> Result<
+        (
+            ProbeMetadata,
+            Option<Duration>,
+            Option<crate::control::auth::Challenge>,
+        ),
+        (
+            DownloadError,
+            Option<Duration>,
+            Option<crate::control::auth::Challenge>,
+        ),
+    > {
         let head = self
             .transport
             .head(spec, cancel)
@@ -1577,18 +1618,9 @@ impl SingleStreamController {
                 .map(|(_, v)| v.as_str()),
         );
         let status = head.parts.status.as_u16();
-        let challenge = crate::control::auth::challenge_from_headers(
-            status,
-            spec.url.as_str(),
-            &head.headers,
-        );
-        match interpret(
-            status,
-            spec.url.as_str(),
-            &head.headers,
-            None,
-            "HTTP/1.1",
-        ) {
+        let challenge =
+            crate::control::auth::challenge_from_headers(status, spec.url.as_str(), &head.headers);
+        match interpret(status, spec.url.as_str(), &head.headers, None, "HTTP/1.1") {
             Ok(m) => Ok((m, retry_after, None)),
             Err(e) => Err((e, retry_after, challenge)),
         }
@@ -1665,10 +1697,7 @@ impl SingleStreamController {
 /// Sequential hash verification of a file against the expected digests
 /// (§16.2): used by the segmented completion path over the assembled
 /// temp file.
-fn verify_hashes_path(
-    integrity: &IntegrityPolicy,
-    path: &Path,
-) -> Result<(), DownloadError> {
+fn verify_hashes_path(integrity: &IntegrityPolicy, path: &Path) -> Result<(), DownloadError> {
     for expected in &integrity.expected_hashes {
         let file = std::fs::File::open(path).map_err(|e| DownloadError::from_io(&e))?;
         let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
@@ -1722,8 +1751,7 @@ fn classify_body_error(e: &hyper::Error) -> DownloadError {
 /// Sequential hash verification of the completed temp file (§16.2).
 fn verify_hashes(request: &DownloadRequest, temp: &Path) -> Result<(), DownloadError> {
     for expected in &request.integrity.expected_hashes {
-        let file = std::fs::File::open(temp)
-            .map_err(|e| DownloadError::from_io(&e))?;
+        let file = std::fs::File::open(temp).map_err(|e| DownloadError::from_io(&e))?;
         let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
         let computed = match expected.algorithm {
             crate::config::HashAlgorithm::Sha256 => {

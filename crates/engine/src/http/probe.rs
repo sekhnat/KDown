@@ -76,19 +76,26 @@ pub(crate) fn interpret(
         200 | 206 => {}
         404 | 410 => return Err(DownloadError::NotFound { status }),
         401 => return Err(DownloadError::AuthenticationRequired),
-        407 => return Err(DownloadError::Proxy("proxy authentication required (407)".into())),
+        407 => {
+            return Err(DownloadError::Proxy(
+                "proxy authentication required (407)".into(),
+            ))
+        }
         403 => return Err(DownloadError::AuthorizationFailed),
         408 => return Err(DownloadError::Protocol("408 request timeout".into())),
         429 => return Err(DownloadError::RateLimited { status }),
         s if (500..=599).contains(&s) => return Err(DownloadError::Server { status: s }),
-        s => return Err(DownloadError::Protocol(format!("unexpected probe status {s}"))),
+        s => {
+            return Err(DownloadError::Protocol(format!(
+                "unexpected probe status {s}"
+            )))
+        }
     }
-    let content_length = header("content-length").and_then(|v| v.parse().ok()).or(body_size);
-    let validators = ResourceValidators::from_headers(
-        header("etag"),
-        header("last-modified"),
-        content_length,
-    );
+    let content_length = header("content-length")
+        .and_then(|v| v.parse().ok())
+        .or(body_size);
+    let validators =
+        ResourceValidators::from_headers(header("etag"), header("last-modified"), content_length);
     Ok(ProbeMetadata {
         final_url: final_url.to_string(),
         status,

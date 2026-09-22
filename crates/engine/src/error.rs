@@ -4,7 +4,6 @@
 //! optional origin/status/segment context. Sensitive data is redacted at
 //! the formatting boundary by [`crate::redact::Redactor`].
 
-
 /// Stable machine-readable category of an error (§20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -48,11 +47,25 @@ impl ErrorCategory {
         match self {
             Dns | ConnectTimeout | Connection | Server | RateLimited | Protocol
             | RetryExhausted => Retryability::Transient,
-            Configuration | InvalidUrl | UnsupportedScheme | Tls | Proxy
-            | AuthenticationRequired | AuthorizationFailed | NotFound
-            | RangeUnsupported | InvalidRangeResponse | ResourceChanged
-            | UnknownLengthUnsupportedForMode | SinkOpen | SinkWrite | DiskFull
-            | PermissionDenied | Checkpoint | IntegrityMismatch | Commit
+            Configuration
+            | InvalidUrl
+            | UnsupportedScheme
+            | Tls
+            | Proxy
+            | AuthenticationRequired
+            | AuthorizationFailed
+            | NotFound
+            | RangeUnsupported
+            | InvalidRangeResponse
+            | ResourceChanged
+            | UnknownLengthUnsupportedForMode
+            | SinkOpen
+            | SinkWrite
+            | DiskFull
+            | PermissionDenied
+            | Checkpoint
+            | IntegrityMismatch
+            | Commit
             | DeadlineExceeded => Retryability::Never,
             Redirect => Retryability::Never,
             Cancelled => Retryability::Never,
@@ -215,4 +228,3 @@ impl DownloadError {
         }
     }
 }
-

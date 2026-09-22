@@ -257,8 +257,7 @@ impl TestServer {
         add: impl Fn(&mut Vec<(String, String)>) + Send + Sync + 'static,
     ) -> Self {
         let add = Arc::new(add);
-        self.default_headers
-            .insert(path.to_string(), add);
+        self.default_headers.insert(path.to_string(), add);
         self
     }
 
@@ -362,7 +361,12 @@ fn parse_range_header(v: &str) -> Option<(u64, u64)> {
 
 fn resolve_response(state: &ServerState, info: &RequestInfo) -> ScriptedResponse {
     // 1. Explicit handler wins.
-    if let Some(h) = state.handlers.lock().expect("handlers lock").get(&info.path) {
+    if let Some(h) = state
+        .handlers
+        .lock()
+        .expect("handlers lock")
+        .get(&info.path)
+    {
         return h(info);
     }
     // 2. Scripted behaviors (fire `times` each, prefix match).
@@ -386,10 +390,7 @@ fn resolve_response(state: &ServerState, info: &RequestInfo) -> ScriptedResponse
         .unwrap_or_else(|| ScriptedResponse::new(404))
 }
 
-async fn serve_conn(
-    socket: tokio::net::TcpStream,
-    state: Arc<ServerState>,
-) -> std::io::Result<()> {
+async fn serve_conn(socket: tokio::net::TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     loop {
@@ -431,7 +432,11 @@ async fn serve_conn(
                 .map(|(_, v)| v.clone()),
             headers,
         };
-        state.requests.lock().expect("requests lock").push(info.clone());
+        state
+            .requests
+            .lock()
+            .expect("requests lock")
+            .push(info.clone());
 
         let mut resp = resolve_response(&state, &info);
         {
@@ -495,9 +500,7 @@ async fn write_response(
             while off < limit {
                 let n = 16 * 1024u64.min(limit - off);
                 let chunk: Vec<u8> = (off..off + n).map(|i| fill(i)).collect();
-                writer
-                    .write_all(format!("{n:x}\r\n").as_bytes())
-                    .await?;
+                writer.write_all(format!("{n:x}\r\n").as_bytes()).await?;
                 writer.write_all(&chunk).await?;
                 writer.write_all(b"\r\n").await?;
                 off += n;

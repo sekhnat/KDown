@@ -34,7 +34,8 @@ async fn get_returns_metadata_and_body() {
         .await
         .expect("start");
     let t = transport();
-    let mut resp = t.get(&spec(&server.url("/file")), &CancellationToken::new())
+    let mut resp = t
+        .get(&spec(&server.url("/file")), &CancellationToken::new())
         .await
         .expect("get");
     assert_eq!(resp.status, 200);
@@ -102,7 +103,10 @@ async fn probe_head_then_ranged_get_validates_ranges() {
     let cancel = CancellationToken::new();
 
     // HEAD (§10.2 step 1)
-    let head = t.head(&spec(&server.url("/data")), &cancel).await.expect("head");
+    let head = t
+        .head(&spec(&server.url("/data")), &cancel)
+        .await
+        .expect("head");
     let h = |name: &str| {
         head.headers
             .iter()
@@ -117,10 +121,8 @@ async fn probe_head_then_ranged_get_validates_ranges() {
         .await
         .expect("ranged get");
     assert_eq!(ranged.status, 206);
-    let cr = parse_content_range(
-        ranged.header("content-range").expect("content-range"),
-    )
-    .expect("valid content-range");
+    let cr = parse_content_range(ranged.header("content-range").expect("content-range"))
+        .expect("valid content-range");
     assert_eq!(cr.total, Some(64 * 1024));
     assert_eq!(ranged.validators.total_size, Some(64 * 1024));
 }
@@ -137,7 +139,10 @@ async fn validator_capture_etag_and_last_modified() {
         .await
         .expect("start");
     let t = transport();
-    let resp = t.get(&spec(&server.url("/v")), &CancellationToken::new()).await.expect("get");
+    let resp = t
+        .get(&spec(&server.url("/v")), &CancellationToken::new())
+        .await
+        .expect("get");
     assert_eq!(resp.validators.etag.as_deref(), Some("\"gen-1\""));
     assert_eq!(
         resp.validators.last_modified.as_deref(),
@@ -163,7 +168,10 @@ async fn range_request_carries_if_range_when_validators_present() {
         total_size: Some(2048),
     });
     s.identity_encoding = true;
-    let mut resp = t.get_range(&s, (1024, 2047), &CancellationToken::new()).await.expect("range");
+    let mut resp = t
+        .get_range(&s, (1024, 2047), &CancellationToken::new())
+        .await
+        .expect("range");
     assert_eq!(resp.status, 206);
     // The server must have received Range + If-Range.
     let reqs = server.requests().await;
@@ -201,7 +209,8 @@ async fn credentials_stripped_on_cross_origin_redirect() {
         .expect("start");
     let t = transport();
     let mut s = spec(&server.url("/auth"));
-    s.headers.push(("Authorization".into(), "Bearer tok".into()));
+    s.headers
+        .push(("Authorization".into(), "Bearer tok".into()));
     let resp = t.get(&s, &CancellationToken::new()).await.expect("get");
     // First-party request keeps credentials.
     let had = resp
