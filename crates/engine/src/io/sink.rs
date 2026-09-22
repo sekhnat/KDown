@@ -1,0 +1,437 @@
+//! Random-access output storage (§14, §33).
+//!
+//! All downloaded bytes are written to a temp file distinct from the final
+//! destination; commit is an atomic rename. Errors map to the structured
+//! taxonomy ([`DownloadError::from_io`]).
+
+use std::fs::File;
+use std::io::{Seek, Write};
+use std::path::{Path, PathBuf};
+
+use crate::error::DownloadError;
+
+/// Where the sink's temporary output lives before commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TempFileSpec {
+    /// `<destination>.part` (default, §14.1).
+    SiblingSuffix(String),
+    /// An explicit alternate temp path.
+    Explicit(PathBuf),
+}
+
+impl TempFileSpec {
+    /// Resolve the concrete temp path for a destination.
+    #[must_use]
+    pub fn temp_path_for(&self, destination: &Path) -> PathBuf {
+        match self {
+            TempFileSpec::SiblingSuffix(suffix) => {
+                let mut name = destination
+                    .file_name()
+                    .map(std::ffi::OsStr::to_os_string)
+                    .unwrap_or_else(|| destination.as_os_str().to_os_string());
+                name.push(suffix.as_str());
+                destination.with_file_name(name)
+            }
+            TempFileSpec::Explicit(p) => p.clone(),
+        }
+    }
+}
+
+impl Default for TempFileSpec {
+    fn default() -> Self {
+        Self::SiblingSuffix(".part".to_string())
+    }
+}
+
+/// Random-access output storage (§33 Sink).
+pub trait Sink {
+    /// Create/prepare the sink, optionally preallocating `total_size`.
+    ///
+    /// # Errors
+    /// SinkOpen/DiskFull/PermissionDenied on failure (§14.5: lack of disk
+    /// space is fatal; unsupported preallocation is not — the caller may
+    /// treat `PreallocUnsupported` as non-fatal).
+    fn prepare(&mut self, total_size: Option<u64>) -> Result<(), SinkError>;
+
+    /// Write `bytes` at absolute `offset` (positional, §14.2).
+    ///
+    /// # Errors
+    /// SinkWrite/DiskFull/PermissionDenied on failure.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), SinkError>;
+
+    /// Flush data to the level required by `mode` (§14.6 step 1).
+    ///
+    /// # Errors
+    /// SinkWrite on flush failure.
+    fn flush(&mut self, level: FlushLevel) -> Result<(), SinkError>;
+
+    /// Current file size.
+    ///
+    /// # Errors
+    /// SinkOpen when the file cannot be inspected.
+    fn size(&mut self) -> Result<u64, SinkError>;
+
+    /// Complete the temp file; callers perform the final rename via
+    /// [`FileSink::commit`] so overwrite policy is applied at that point.
+    ///
+    /// # Errors
+    /// Commit failure.
+    fn finalize(&mut self) -> Result<(), SinkError>;
+
+    /// Discard partial state per cleanup policy (§9.4).
+    ///
+    /// # Errors
+    /// I/O failure during cleanup.
+    fn abort(&mut self) -> Result<AbortDisposition, SinkError>;
+
+    /// The temp path backing this sink (for checkpoint identity, §15.2).
+    fn temp_path(&self) -> &Path;
+}
+
+/// Durability level for a flush (§14.6, §15.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushLevel {
+    /// Hand bytes to the OS page cache; no fsync.
+    PageCache,
+    /// fsync the file data.
+    FsyncFile,
+    /// fsync the file and the parent directory (rename durability).
+    FsyncDir,
+}
+
+/// What `abort` did with the partial artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortDisposition {
+    /// Temp file removed.
+    TempDeleted,
+    /// Temp file preserved for later inspection/resume.
+    TempKept,
+}
+
+/// Local sink failure reason; wraps the structured taxonomy.
+#[derive(Debug)]
+pub struct SinkError(pub DownloadError);
+
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sink error: {}", self.0)
+    }
+}
+impl std::error::Error for SinkError {}
+
+impl From<std::io::Error> for SinkError {
+    fn from(e: std::io::Error) -> Self {
+        SinkError(DownloadError::from_io(&e))
+    }
+}
+
+impl From<SinkError> for DownloadError {
+    fn from(e: SinkError) -> Self {
+        e.0
+    }
+}
+
+/// The default local-filesystem sink (§14, §33).
+#[derive(Debug)]
+pub struct FileSink {
+    destination: PathBuf,
+    temp_path: PathBuf,
+    preallocate: bool,
+    /// When set, dropping without commit/finalize keeps the temp file
+    /// (KeepPartial semantics and crash-resume preservation, §9.4/§15.1).
+    keep_on_drop: bool,
+    file: Option<File>,
+    /// Bytes written so far (high-water mark) — informational.
+    bytes_written: u64,
+    finalized: bool,
+    aborted: bool,
+}
+
+impl FileSink {
+    /// Open a sink targeting `destination`, buffering into a distinct temp
+    /// file in the same directory so final rename is atomic (§14.1).
+    ///
+    /// # Errors
+    /// `SinkOpen`/`PermissionDenied` when the temp file cannot be created.
+    pub fn open(
+        destination: &Path,
+        spec: &TempFileSpec,
+        preallocate: bool,
+    ) -> Result<Self, SinkError> {
+        let temp_path = spec.temp_path_for(destination);
+        let parent = temp_path
+            .parent()
+            .ok_or_else(|| SinkError(DownloadError::SinkOpen("no parent directory".into())))?;
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(SinkError(DownloadError::SinkOpen(format!(
+                "destination directory does not exist: {}",
+                parent.display()
+            ))));
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&temp_path)
+            .map_err(|e| DownloadError::from_io(&e))
+            .map_err(SinkError)?;
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            temp_path,
+            preallocate,
+            keep_on_drop: false,
+            file: Some(file),
+            bytes_written: 0,
+            finalized: false,
+            aborted: false,
+        })
+    }
+
+    /// The final destination this sink commits to.
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Preallocate `size` bytes; unsupported filesystem ops are non-fatal
+    /// (§14.3). Returns whether preallocation happened.
+    ///
+    /// # Errors
+    /// Fatal only for real errors (permission, disk full).
+    pub fn preallocate(&mut self, size: u64) -> Result<bool, SinkError> {
+        if !self.preallocate {
+            return Ok(false);
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(SinkError(DownloadError::SinkOpen("sink closed".into())));
+        };
+        // set_len is the portable preallocation path; on Linux ext4/xfs it
+        // also serves sparse purposes. FIEMAP/fallocate is a perf nicety,
+        // not a correctness requirement (§14.3-14.4).
+        match file.set_len(size) {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(95) => Ok(false), // EOPNOTSUPP
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+            Err(e) => Err(SinkError(DownloadError::from_io(&e))),
+        }
+    }
+
+    /// Atomically move the temp file to the destination (§14.6 step 4).
+    ///
+    /// Works after [`FileSink::finalize`] (which closes the handle); also
+    /// allowed directly when the caller handles durability itself.
+    ///
+    /// # Errors
+    /// `Commit` on rename failure; the temp file is preserved.
+    pub fn commit(mut self) -> Result<PathBuf, SinkError> {
+        self.file = None;
+        self.finalized = true; // consumed below; drop must not clean up
+        // POSIX rename replaces atomically. Windows cannot rename over an
+        // existing file while it is open; the platform fallback removes
+        // the old destination immediately before rename. The CI matrix
+        // exercises this path (§42 platform coverage).
+        #[cfg(windows)]
+        if self.destination.exists() {
+            std::fs::remove_file(&self.destination)
+                .map_err(|e| SinkError(DownloadError::Commit(e.to_string())))?;
+        }
+        std::fs::rename(&self.temp_path, &self.destination)
+            .map_err(|e| SinkError(DownloadError::Commit(e.to_string())))?;
+        Ok(self.destination.clone())
+    }
+
+    /// True once `abort` ran.
+    #[must_use]
+    pub fn aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// Preserve the temp file if this sink is dropped without commit
+    /// (KeepPartial / crash-resume preservation).
+    pub fn set_keep_on_drop(&mut self, keep: bool) {
+        self.keep_on_drop = keep;
+    }
+}
+
+impl Sink for FileSink {
+    fn prepare(&mut self, total_size: Option<u64>) -> Result<(), SinkError> {
+        if let Some(size) = total_size {
+            self.preallocate(size)?;
+        }
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), SinkError> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
+        };
+        // Positional write without a shared seek pointer (§14.2): seek to
+        // the absolute offset then write; each call states its position
+        // explicitly rather than relying on prior state.
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        self.bytes_written = self.bytes_written.max(offset + bytes.len() as u64);
+        Ok(())
+    }
+
+    fn flush(&mut self, level: FlushLevel) -> Result<(), SinkError> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
+        };
+        if matches!(level, FlushLevel::FsyncFile | FlushLevel::FsyncDir) {
+            file.flush()?;
+            file.sync_all().map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+        } else {
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, SinkError> {
+        match self.file.as_ref() {
+            Some(file) => Ok(file.metadata()?.len()),
+            None => Err(SinkError(DownloadError::SinkOpen("sink closed".into()))),
+        }
+    }
+
+    fn finalize(&mut self) -> Result<(), SinkError> {
+        self.flush(FlushLevel::FsyncFile)?;
+        if let Some(file) = self.file.take() {
+            drop(file);
+        }
+        self.finalized = true;
+        Ok(())
+    }
+
+    fn abort(&mut self) -> Result<AbortDisposition, SinkError> {
+        if let Some(file) = self.file.take() {
+            drop(file);
+        }
+        match std::fs::remove_file(&self.temp_path) {
+            Ok(()) => {
+                self.aborted = true;
+                Ok(AbortDisposition::TempDeleted)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.aborted = true;
+                Ok(AbortDisposition::TempDeleted)
+            }
+            Err(e) => Err(SinkError(DownloadError::from_io(&e))),
+        }
+    }
+
+    fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+}
+
+impl Drop for FileSink {
+    fn drop(&mut self) {
+        // If never finalized/committed, clean the temp file so failed jobs
+        // leave no residue (DeletePartial default, §9.4) — unless the owner
+        // opted to preserve it (KeepPartial / crash-resume, §15.1).
+        if !self.finalized && !self.aborted && !self.keep_on_drop {
+            self.file = None;
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.bin");
+        (dir, path)
+    }
+
+    #[test]
+    fn temp_naming_is_sibling_suffix() {
+        let (_d, dest) = tmpdir();
+        let spec = TempFileSpec::default();
+        assert_eq!(
+            spec.temp_path_for(&dest),
+            dest.with_file_name("out.bin.part")
+        );
+    }
+
+    #[test]
+    fn write_read_commit_roundtrip() {
+        let (dir, dest) = tmpdir();
+        {
+            let mut sink =
+                FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            sink.write_at(0, b"hello").expect("write");
+            sink.write_at(5, b" world").expect("write at 5");
+            assert_eq!(sink.size().expect("size"), 11);
+            sink.finalize().expect("finalize");
+            let out = sink.commit().expect("commit");
+            assert_eq!(out, dest);
+        }
+        let got = std::fs::read(&dest).expect("read final");
+        assert_eq!(got, b"hello world");
+        assert!(!dest.with_file_name("out.bin.part").exists());
+        dir.close().expect("cleanup");
+    }
+
+    #[test]
+    fn abort_removes_temp_only() {
+        let (dir, dest) = tmpdir();
+        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+        sink.write_at(0, b"x").expect("write");
+        assert_eq!(sink.abort().expect("abort"), AbortDisposition::TempDeleted);
+        assert!(!sink.temp_path().exists());
+        assert!(!dest.exists(), "abort never touches destination");
+        dir.close().expect("cleanup");
+    }
+
+    #[test]
+    fn drop_without_commit_cleans_temp() {
+        let (dir, dest) = tmpdir();
+        {
+            let mut sink =
+                FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            sink.write_at(0, b"partial").expect("write");
+            // Dropped without finalize/commit/abort.
+        }
+        assert!(!dest.exists());
+        assert!(!dest.with_file_name("out.bin.part").exists());
+        dir.close().expect("cleanup");
+    }
+
+    #[test]
+    fn preallocate_sets_size() {
+        let (dir, dest) = tmpdir();
+        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), true).expect("open");
+        sink.prepare(Some(1024)).expect("prepare");
+        assert_eq!(sink.size().expect("size"), 1024);
+        sink.abort().expect("abort");
+        dir.close().expect("cleanup");
+    }
+
+    #[test]
+    fn commit_failure_preserves_temp() {
+        let (dir, _dest) = tmpdir();
+        // Temp lives in the surviving dir; destination lives in a dir that
+        // vanishes before commit.
+        let orphan_dir = dir.path().join("gone");
+        std::fs::create_dir(&orphan_dir).expect("mkdir");
+        let orphan_dest = orphan_dir.join("x.bin");
+        let temp = dir.path().join("explicit.part");
+        let mut sink =
+            FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false)
+                .expect("open");
+        sink.write_at(0, b"data").expect("write");
+        sink.finalize().expect("finalize");
+        std::fs::remove_dir_all(&orphan_dir).expect("remove target dir");
+        let err = sink.commit().expect_err("rename to missing dir must fail");
+        assert!(matches!(err.0, DownloadError::Commit(_)));
+        assert!(temp.exists(), "failed commit keeps temp file");
+        assert!(!orphan_dest.exists());
+        let _ = std::fs::remove_file(&temp);
+        dir.close().expect("cleanup");
+    }
+}

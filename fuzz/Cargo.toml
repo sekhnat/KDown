@@ -1,0 +1,49 @@
+[package]
+name = "kdown-engine-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kdown-engine = { path = "../crates/engine" }
+
+[[bin]]
+name = "fuzz_url"
+path = "fuzz_targets/fuzz_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_content_range"
+path = "fuzz_targets/fuzz_content_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_etag"
+path = "fuzz_targets/fuzz_etag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_content_disposition"
+path = "fuzz_targets/fuzz_content_disposition.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_checkpoint"
+path = "fuzz_targets/fuzz_checkpoint.rs"
+test = false
+doc = false
+bench = false
