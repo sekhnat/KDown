@@ -35,5 +35,5 @@
 ## 6. Compatibility and Release Evidence
 
 - [x] 6.1 Update output/overwrite and ownership documentation to describe no-clobber publication, safe unsupported-platform failure, lockfile persistence, and unchanged resume/checkpoint semantics; verify examples, rustdoc, and existing v1 acceptance text agree with the implementation.
-- [ ] 6.2 Run format, workspace all-target tests, strict Clippy, warnings-denied rustdoc, real-file crash/restart, and the supported OS CI matrix; verify every gate passes with no change to public construction patterns or checkpoint fixtures.
+- [x] 6.2 Run format, workspace all-target tests, strict Clippy, warnings-denied rustdoc, real-file crash/restart, and the supported OS CI matrix; verify every gate passes with no change to public construction patterns or checkpoint fixtures.
 - [x] 6.3 Run the same-host post-change four-worker HTTP/1.1 and HTTP/2 benchmark with memory measurements; verify a recorded before/after comparison and investigate any material throughput or memory regression before marking the change complete.
