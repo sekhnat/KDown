@@ -28,7 +28,7 @@ use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::SharedHub;
 use crate::resume::checkpoint::Checkpoint;
-use crate::resume::checkpoint_store::{CheckpointStore as _, FileCheckpointStore};
+use crate::resume::checkpoint_store::CheckpointStore;
 use crate::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 use crate::scheduler::lease::SegmentLease;
 use crate::scheduler::LeaseId;
@@ -199,19 +199,20 @@ pub(crate) async fn run_segmented(
     request: &DownloadRequest,
     state: &Arc<StateMachine>,
     sink: Arc<AsyncMutex<FileSink>>,
-    store: &FileCheckpointStore,
+    store: &Arc<dyn CheckpointStore>,
     identity: &str,
     meta: &ProbeMetadata,
     total_size: u64,
     counters: Arc<JobCounters>,
     hub: &SharedHub,
     cancel: CancellationToken,
+    cancel_mode: Arc<std::sync::atomic::AtomicU8>,
     start_offset_ranges: Vec<(u64, u64)>,
     started: Instant,
     handle_cell: Option<Arc<std::sync::OnceLock<Arc<SegmentedJob>>>>,
     initial_rate_bucket: Option<Arc<crate::control::rate_limit::TokenBucket>>,
 ) -> SegmentedOutcome {
-    let warnings: Vec<String> = vec![];
+    let mut warnings: Vec<String> = vec![];
     let policy = SchedulerPolicy::new(
         config.transfer.min_segment_size,
         config.transfer.max_segment_size,
@@ -301,8 +302,23 @@ pub(crate) async fn run_segmented(
     }
 
     // Cancelled: report cancelled with the scheduler's completed set.
+    // All workers have joined, so terminal cleanup cannot race with saves:
+    // the selected cancellation mode settles artifacts (§9.4) and delete
+    // failures become warnings without rewriting the outcome (§9.2).
     if job.cancel.is_cancelled() {
         let completed = job.completed_ranges().await;
+        let cleanup_warnings = {
+            let mut sink_guard = sink.lock().await;
+            crate::job::controller::SingleStreamController::cleanup_cancelled(
+                crate::job::controller::CancelMode::from_u8(
+                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+                &mut sink_guard,
+                store.as_ref(),
+                identity,
+            )
+        };
+        warnings.extend(cleanup_warnings);
         return SegmentedOutcome {
             status: ResultStatus::Cancelled,
             error: outcome_error.or(Some(DownloadError::Cancelled)),
@@ -406,7 +422,7 @@ async fn worker_loop(
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
     sink: Arc<AsyncMutex<FileSink>>,
-    store: FileCheckpointStore,
+    store: Arc<dyn CheckpointStore>,
     identity: String,
     req_spec: WorkerRequestSpec,
     buffer_budget: u64,
@@ -490,7 +506,7 @@ async fn worker_loop(
             &job,
             &lease,
             &sink,
-            &store,
+            store.as_ref(),
             &identity,
             &req_spec,
             &pool,
@@ -607,7 +623,7 @@ async fn transfer_lease(
     job: &Arc<SegmentedJob>,
     lease: &SegmentLease,
     sink: &Arc<AsyncMutex<FileSink>>,
-    store: &FileCheckpointStore,
+    store: &dyn CheckpointStore,
     identity: &str,
     req_spec: &WorkerRequestSpec,
     pool: &Arc<crate::io::BufferPool>,
@@ -732,13 +748,27 @@ async fn transfer_lease(
                         sched.absorb_worker_progress(&job.worker_progress);
                         sched.completed_ranges()
                     };
-                    persist_checkpoint(store, identity, job, ranges);
+                    persist_checkpoint(store, identity, job, ranges).map_err(WorkerError::Fatal)?;
                 }
             }
             Ok(BodyEvent::End) => break, // clean EOF
             Ok(BodyEvent::Paused) => {
-                // §9.3: pause interrupts body delivery; settle the current
-                // state and wait, then resume the same owned source.
+                // §9.3: pause converges at a safe boundary. Before waiting,
+                // the scheduler snapshot is absorbed and persisted so the
+                // paused state is genuinely resumable (§15.4). A save
+                // failure is fatal: the observing worker installs the shared
+                // error and all workers converge before the job fails.
+                {
+                    let ranges = {
+                        let mut sched = job.scheduler.lock().await;
+                        sched.absorb_worker_progress(&job.worker_progress);
+                        sched.settled_ranges()
+                    };
+                    if !ranges.is_empty() {
+                        persist_checkpoint(store, identity, job, ranges)
+                            .map_err(WorkerError::Fatal)?;
+                    }
+                }
                 while job.cancel.is_paused() && !job.cancel.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -774,12 +804,17 @@ async fn transfer_lease(
 
 /// Persist a checkpoint from the scheduler's completed set (§15.4):
 /// only durably acknowledged bytes are recorded.
+///
+/// # Errors
+/// [`DownloadError::Checkpoint`] when the persistence fails: callers
+/// route it into the shared fatal path instead of continuing without
+/// the promised resumable state.
 fn persist_checkpoint(
-    store: &FileCheckpointStore,
+    store: &dyn CheckpointStore,
     identity: &str,
     job: &SegmentedJob,
     ranges: Vec<(u64, u64)>,
-) {
+) -> Result<(), DownloadError> {
     let mut cp = Checkpoint::new(
         identity,
         String::new(), // original URL is set by the caller's checkpoint; identity hash suffices here
@@ -788,5 +823,7 @@ fn persist_checkpoint(
     cp.total_size = Some(job.total_size);
     cp.validators = job.validators.clone();
     cp.completed_ranges = ranges;
-    let _ = store.save_atomic(&cp);
+    store
+        .save_atomic(&cp)
+        .map_err(|e| DownloadError::Checkpoint(e.to_string()))
 }

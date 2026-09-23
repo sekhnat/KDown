@@ -29,10 +29,10 @@ use crate::metrics::counters::JobCounters;
 use crate::metrics::events::{Event, EventHub, SharedHub};
 use crate::metrics::export::EngineMetrics;
 use crate::resume::checkpoint_store::{
-    CheckpointStore as _, DurabilityMode as StoreDurability, FileCheckpointStore,
+    CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver,
+    DurabilityMode as StoreDurability, SidecarCheckpointResolver,
 };
 use crate::resume::durable_ranges::DurableRangeTracker;
-
 /// What a job downloads (§7.2 subset for v1 single-stream).
 #[derive(Clone)]
 pub struct DownloadRequest {
@@ -129,7 +129,7 @@ pub enum CancelMode {
 }
 
 impl CancelMode {
-    fn from_u8(v: u8) -> Self {
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             1 => CancelMode::KeepPartial,
             2 => CancelMode::KeepFileDiscardCheckpoint,
@@ -287,6 +287,10 @@ pub struct SingleStreamController {
     execution: HttpExecution,
     config: EngineConfig,
     classifier: RetryClassifier,
+    /// The substitutable checkpoint-store resolver (§34): resolved once
+    /// per job before admission; the default creates destination-relative
+    /// file sidecars so existing construction is unchanged.
+    checkpoint_resolver: Arc<dyn CheckpointStoreResolver>,
     next_id: std::sync::atomic::AtomicU64,
     metrics: Arc<EngineMetrics>,
 }
@@ -318,9 +322,20 @@ impl SingleStreamController {
             execution,
             config,
             classifier,
+            checkpoint_resolver: Arc::new(SidecarCheckpointResolver),
             next_id: std::sync::atomic::AtomicU64::new(1),
             metrics,
         }
+    }
+
+    /// Replace the checkpoint-store resolver (§34): one consuming
+    /// injection — `controller.with_checkpoint_resolver(resolver)` — so
+    /// every existing construction path can opt into another adapter
+    /// without a constructor matrix.
+    #[must_use]
+    pub fn with_checkpoint_resolver(mut self, resolver: Arc<dyn CheckpointStoreResolver>) -> Self {
+        self.checkpoint_resolver = resolver;
+        self
     }
 
     /// Build a controller sharing an engine-wide metrics registry (§19.5).
@@ -394,12 +409,14 @@ impl SingleStreamController {
         let inner_hub = hub;
         let execution = self.execution.clone();
         let config = self.config.clone();
+        let checkpoint_resolver = self.checkpoint_resolver.clone();
         let classifier = RetryClassifier::new(self.config.retry.clone());
         let join = tokio::spawn(async move {
             let this = Self {
                 execution,
                 config,
                 classifier,
+                checkpoint_resolver,
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 metrics: metrics_for_run.clone(),
             };
@@ -479,23 +496,40 @@ impl SingleStreamController {
         // checkpoint loading before any network activity. Required-state
         // failures reject before the job enters Probing.
         let identity = crate::resume::flow::job_identity(&request.url, &request.destination);
-        let store = FileCheckpointStore::new(
-            &request
-                .destination
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from(".")),
+        // ---- Checkpoint adapter selection (§34): one resolution per job,
+        // before any checkpoint operation and before probing. Resolution
+        // failure is a checkpoint-category terminal failure.
+        let resolve_context = CheckpointResolveContext::new(
+            identity.clone(),
+            request.destination.clone(),
             match self.config.transfer.durability {
                 crate::config::DurabilityMode::Performance => StoreDurability::Performance,
                 crate::config::DurabilityMode::Durable => StoreDurability::Durable,
             },
-        )
-        .map_err(|e| DownloadError::Checkpoint(e.to_string()))?;
+        );
+        let selected = match self.checkpoint_resolver.resolve(&resolve_context) {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = state.transition(JobState::Failing);
+                let _ = state.transition(JobState::Failed);
+                return Ok(self.failed_result(
+                    request,
+                    counters,
+                    Duration::ZERO,
+                    DownloadError::Checkpoint(e.to_string()),
+                    ResourceValidators::default(),
+                ));
+            }
+        };
+        // Per-job mutation coordination: every operation reaches the one
+        // selected adapter through a single serialized order (§12).
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(crate::resume::coordinated_store::CoordinatedCheckpointStore::new(selected));
         let pending_admission = match crate::resume::flow::begin_admission(
             request.resume,
             &identity,
             TempFileSpec::default().temp_path_for(&request.destination),
-            &store,
+            store.as_ref(),
         ) {
             Ok(pending) => pending,
             Err(failure) => {
@@ -546,7 +580,9 @@ impl SingleStreamController {
                 verify_range_support: self.config.transfer.verify_range_support,
             };
             if cancel.is_cancelled() {
-                return self.terminal_cancelled(&state, request, counters, Duration::ZERO);
+                return self
+                    .terminal_cancelled(&state, request, counters, Duration::ZERO, &hub, vec![])
+                    .await;
             }
             // Semantic probe (§32): the HTTP layer owns HEAD interpretation
             // and any configured validating range request; the controller
@@ -647,7 +683,7 @@ impl SingleStreamController {
             }
         };
         Self::emit_resume_notices(&hub, plan.notices()).await;
-        let warnings: Vec<String> = plan.warnings().to_vec();
+        let mut warnings: Vec<String> = plan.warnings().to_vec();
         let resume_validators: Option<ResourceValidators> = plan.validators();
 
         // Size expectation check (§4.1): caller-provided size must match.
@@ -734,6 +770,7 @@ impl SingleStreamController {
                 counters.clone(),
                 &hub,
                 cancel.clone(),
+                cancel_mode.clone(),
                 resumed.ranges.to_vec(),
                 started,
                 Some(segmented_cell.clone()),
@@ -746,7 +783,7 @@ impl SingleStreamController {
                     state,
                     counters,
                     hub,
-                    &store,
+                    store.as_ref(),
                     &identity,
                     &meta,
                     outcome,
@@ -787,7 +824,20 @@ impl SingleStreamController {
             if let Some(cp) = plan.checkpoint() {
                 let mut fresh = cp.clone();
                 fresh.final_url = meta.final_url.clone();
-                let _ = store.save_atomic(&fresh);
+                if let Err(e) = store.save_atomic(&fresh) {
+                    // A failed refresh cannot promise resumability: stop
+                    // with the previous checkpoint untouched (§15.4).
+                    return self.checkpoint_save_failed(
+                        &state,
+                        request,
+                        counters,
+                        started.elapsed(),
+                        &mut sink,
+                        validators.clone(),
+                        warnings,
+                        e,
+                    );
+                }
             }
         }
 
@@ -804,13 +854,15 @@ impl SingleStreamController {
         'download: loop {
             if cancel.is_cancelled() {
                 let elapsed = started.elapsed();
-                self.cleanup_cancelled(
+                let cleanup_warnings = Self::cleanup_cancelled(
                     CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                     &mut sink,
-                    &store,
+                    store.as_ref(),
                     &identity,
                 );
-                return self.terminal_cancelled(&state, request, counters, elapsed);
+                return self
+                    .terminal_cancelled(&state, request, counters, elapsed, &hub, cleanup_warnings)
+                    .await;
             }
             // Fast path: nothing left to fetch (resume covered everything).
             if meta.total_size.is_some_and(|t| offset >= t) {
@@ -1009,13 +1061,22 @@ impl SingleStreamController {
                 // Chunk read with cancellation checks (§9.2 invariant 8).
                 if cancel.is_cancelled() {
                     let elapsed = started.elapsed();
-                    self.cleanup_cancelled(
+                    let cleanup_warnings = Self::cleanup_cancelled(
                         CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                         &mut sink,
-                        &store,
+                        store.as_ref(),
                         &identity,
                     );
-                    return self.terminal_cancelled(&state, request, counters, elapsed);
+                    return self
+                        .terminal_cancelled(
+                            &state,
+                            request,
+                            counters,
+                            elapsed,
+                            &hub,
+                            cleanup_warnings,
+                        )
+                        .await;
                 }
                 match body.next_chunk(&cancel).await {
                     Ok(BodyEvent::Data(data)) => {
@@ -1067,7 +1128,21 @@ impl SingleStreamController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                            let _ = store.save_atomic(&cp);
+                            if let Err(e) = store.save_atomic(&cp) {
+                                // A failed cadence save must stop the job:
+                                // transfer continues would claim resumable
+                                // state that was never persisted (§15.4).
+                                return self.checkpoint_save_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    &mut sink,
+                                    validators.clone(),
+                                    warnings,
+                                    e,
+                                );
+                            }
                             sink.set_keep_on_drop(true);
                         }
                     }
@@ -1091,7 +1166,21 @@ impl SingleStreamController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                            let _ = store.save_atomic(&cp);
+                            if let Err(e) = store.save_atomic(&cp) {
+                                // Pause must not claim a resumable state
+                                // that failed to persist: stop with the
+                                // partial output preserved (§9.3, §15.4).
+                                return self.checkpoint_save_failed(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    &mut sink,
+                                    validators.clone(),
+                                    warnings,
+                                    e,
+                                );
+                            }
                             sink.set_keep_on_drop(true);
                         }
                         // Wait while paused, then continue or cancel.
@@ -1099,35 +1188,48 @@ impl SingleStreamController {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                         if cancel.is_cancelled() {
-                            self.cleanup_cancelled(
+                            let cleanup_warnings = Self::cleanup_cancelled(
                                 CancelMode::from_u8(
                                     cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                                 ),
                                 &mut sink,
-                                &store,
+                                store.as_ref(),
                                 &identity,
                             );
-                            return self.terminal_cancelled(
-                                &state,
-                                request,
-                                counters,
-                                started.elapsed(),
-                            );
+                            return self
+                                .terminal_cancelled(
+                                    &state,
+                                    request,
+                                    counters,
+                                    started.elapsed(),
+                                    &hub,
+                                    cleanup_warnings,
+                                )
+                                .await;
                         }
                     }
                     Err(DownloadError::Cancelled) => {
                         // Cancellation interrupts a pending read (§32): same
                         // terminal path as an observed cancel.
                         let elapsed = started.elapsed();
-                        self.cleanup_cancelled(
+                        let cleanup_warnings = Self::cleanup_cancelled(
                             CancelMode::from_u8(
                                 cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                             ),
                             &mut sink,
-                            &store,
+                            store.as_ref(),
                             &identity,
                         );
-                        return self.terminal_cancelled(&state, request, counters, elapsed);
+                        return self
+                            .terminal_cancelled(
+                                &state,
+                                request,
+                                counters,
+                                elapsed,
+                                &hub,
+                                cleanup_warnings,
+                            )
+                            .await;
                     }
                     Err(err) => {
                         // Body fault or read-idle timeout, already classified
@@ -1278,10 +1380,23 @@ impl SingleStreamController {
         sink.finalize().map_err(|se| se.0)?;
         match sink.commit() {
             Ok(final_path) => {
+                // Checkpoint removal (§14.6 step 5) happens before the
+                // terminal transition. The destination rename is already
+                // irreversible, so a delete failure does not rewrite the
+                // outcome: `Completed` is retained with a checkpoint-
+                // cleanup warning (§9.2 Completed definition, §14.6).
+                let cleanup_warnings = match store.delete(&identity) {
+                    Ok(()) => Vec::new(),
+                    Err(e) => vec![Self::checkpoint_cleanup_warning(e)],
+                };
+                for warning in &cleanup_warnings {
+                    hub.emit(Event::Warning {
+                        detail: warning.clone(),
+                    })
+                    .await;
+                }
+                warnings.extend(cleanup_warnings);
                 let _ = state.transition(JobState::Completed);
-                // Checkpoint removal (§14.6 step 5): committed downloads
-                // leave no resumable state.
-                let _ = store.delete(&identity);
                 hub.emit(Event::Committed {
                     path: final_path.display().to_string(),
                 })
@@ -1320,27 +1435,42 @@ impl SingleStreamController {
     /// Cleanup for a cancelled job per [`CancelMode`] (§9.4):
     /// DeletePartial removes temp+checkpoint; KeepPartial keeps both;
     /// KeepFileDiscardCheckpoint removes only the checkpoint.
-    #[allow(clippy::too_many_arguments)]
-    fn cleanup_cancelled(
-        &self,
+    ///
+    /// Returns checkpoint-cleanup warnings: deletion happens after the
+    /// cancellation outcome is already determined, so a delete failure is
+    /// surfaced as an actionable warning instead of rewriting the result
+    /// (§9.2: `Cancelled` is defined by the caller's request).
+    pub(crate) fn cleanup_cancelled(
         mode: CancelMode,
         sink: &mut FileSink,
-        store: &FileCheckpointStore,
+        store: &dyn CheckpointStore,
         identity: &str,
-    ) {
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
         match mode {
             CancelMode::DeletePartial => {
                 let _ = sink.abort();
-                let _ = store.delete(identity);
+                if let Err(e) = store.delete(identity) {
+                    warnings.push(Self::checkpoint_cleanup_warning(e));
+                }
             }
             CancelMode::KeepPartial => {
                 let _ = sink.flush(FlushLevel::PageCache);
             }
             CancelMode::KeepFileDiscardCheckpoint => {
                 let _ = sink.flush(FlushLevel::PageCache);
-                let _ = store.delete(identity);
+                if let Err(e) = store.delete(identity) {
+                    warnings.push(Self::checkpoint_cleanup_warning(e));
+                }
             }
         }
+        warnings
+    }
+
+    /// The actionable warning for incomplete checkpoint cleanup after an
+    /// irreversible terminal decision (§9.2, §14.6).
+    fn checkpoint_cleanup_warning(error: crate::resume::CheckpointError) -> String {
+        format!("checkpoint cleanup incomplete ({error}); manual cleanup may be required")
     }
 
     /// Publish admission notification facts as events. The resume module
@@ -1368,7 +1498,7 @@ impl SingleStreamController {
         state: Arc<StateMachine>,
         counters: Arc<JobCounters>,
         hub: SharedHub,
-        store: &FileCheckpointStore,
+        store: &dyn CheckpointStore,
         identity: &str,
         _meta: &ProbeMetadata,
         outcome: crate::job::segmented::SegmentedOutcome,
@@ -1380,6 +1510,9 @@ impl SingleStreamController {
         if outcome.status == ResultStatus::Cancelled {
             let _ = state.transition(JobState::Cancelling);
             let _ = state.transition(JobState::Cancelled);
+            // Segmented cleanup warnings (delete failures) join the
+            // admission warnings; the outcome remains Cancelled (§9.2).
+            warnings.extend(outcome.warnings);
             let snap = counters.fold();
             return Ok(DownloadResult {
                 status: ResultStatus::Cancelled,
@@ -1389,7 +1522,7 @@ impl SingleStreamController {
                 total_size: None,
                 elapsed: outcome.elapsed,
                 validators: outcome.validators,
-                warnings: warnings.clone(),
+                warnings,
                 error: outcome.error,
             });
         }
@@ -1488,9 +1621,21 @@ impl SingleStreamController {
         };
         match commit {
             Ok(final_path) => {
+                // Checkpoint removal (§14.6 step 5) before the terminal
+                // transition; a delete failure after the irreversible
+                // commit keeps `Completed` with a cleanup warning (§9.2).
+                let cleanup_warnings = match store.delete(identity) {
+                    Ok(()) => Vec::new(),
+                    Err(e) => vec![Self::checkpoint_cleanup_warning(e)],
+                };
+                for warning in &cleanup_warnings {
+                    hub.emit(Event::Warning {
+                        detail: warning.clone(),
+                    })
+                    .await;
+                }
+                warnings.extend(cleanup_warnings);
                 let _ = state.transition(JobState::Completed);
-                // Checkpoint removal (§14.6 step 5).
-                let _ = store.delete(identity);
                 hub.emit(Event::Committed {
                     path: final_path.display().to_string(),
                 })
@@ -1547,6 +1692,36 @@ impl SingleStreamController {
         }
     }
 
+    /// Map a checkpoint save failure to the structured fatal path
+    /// (§15.4, design §4): the job stops with a checkpoint-category
+    /// error, keeps consistent partial output for diagnosis or recovery,
+    /// and never deletes the previous checkpoint (atomic replacement
+    /// leaves the last complete state usable).
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_save_failed(
+        &self,
+        state: &Arc<StateMachine>,
+        request: DownloadRequest,
+        counters: Arc<JobCounters>,
+        elapsed: Duration,
+        sink: &mut FileSink,
+        validators: ResourceValidators,
+        warnings: Vec<String>,
+        error: crate::resume::CheckpointError,
+    ) -> Result<DownloadResult, DownloadError> {
+        // Preserve the partial output beyond the last good checkpoint.
+        let _ = sink.flush(FlushLevel::PageCache);
+        sink.set_keep_on_drop(true);
+        self.terminal_failed(
+            state,
+            request,
+            counters,
+            elapsed,
+            DownloadError::Checkpoint(error.to_string()),
+            validators,
+            warnings,
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn terminal_failed(
         &self,
@@ -1569,13 +1744,23 @@ impl SingleStreamController {
         Ok(r)
     }
 
-    fn terminal_cancelled(
+    async fn terminal_cancelled(
         &self,
         state: &Arc<StateMachine>,
         _request: DownloadRequest,
         counters: Arc<JobCounters>,
         elapsed: Duration,
+        hub: &SharedHub,
+        warnings: Vec<String>,
     ) -> Result<DownloadResult, DownloadError> {
+        // Cleanup warnings are published before the terminal transition:
+        // the outcome stays Cancelled, the observation is not hidden.
+        for warning in &warnings {
+            hub.emit(Event::Warning {
+                detail: warning.clone(),
+            })
+            .await;
+        }
         let _ = state.transition(JobState::Cancelling);
         let _ = state.transition(JobState::Cancelled);
         let snap = counters.fold();
@@ -1587,7 +1772,7 @@ impl SingleStreamController {
             total_size: None,
             elapsed,
             validators: ResourceValidators::default(),
-            warnings: vec![],
+            warnings,
             error: Some(DownloadError::Cancelled),
         })
     }

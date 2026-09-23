@@ -4,5 +4,6 @@
 // not every binary uses every helper yet.
 #![allow(dead_code)]
 
+pub mod checkpoint;
 pub mod fixtures;
 pub mod test_server;

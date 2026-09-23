@@ -504,3 +504,31 @@ async fn stale_generation_emits_resource_changed_before_failure() {
     );
     assert_eq!(handle.state(), kdown_engine::job::JobState::Failed);
 }
+
+#[tokio::test]
+async fn required_resume_with_corrupt_checkpoint_fails_closed() {
+    // §15.1/§15.5 fail-closed: `Required` never trusts corrupt state and
+    // never deletes it for inspection — the job fails with a structured
+    // checkpoint error before probing, and the sidecar is retained.
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("req-corrupt.bin");
+    let identity = kdown_engine::resume::job_identity("https://scripted/req-corrupt.bin", &dest);
+    let sidecar = dir.path().join(format!("{identity}.kdown"));
+    std::fs::write(&sidecar, b"{corrupt").expect("corrupt cp");
+    let scripted = ScriptedHttp::new(); // any call would mismatch
+    let mut request = DownloadRequest::new("https://scripted/req-corrupt.bin", dest.clone());
+    request.resume = kdown_engine::config::ResumePolicy::Required;
+    let c = scripted_controller(&scripted);
+    let result = c.run(request).await.expect("terminal");
+    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+    assert!(matches!(
+        result.error,
+        Some(kdown_engine::DownloadError::Checkpoint(_))
+    ));
+    assert!(scripted.request_log().is_empty(), "no probe before failure");
+    // Corrupt state retained for inspection (fail-closed, not silent).
+    assert!(
+        sidecar.exists(),
+        "required policy keeps the corrupt sidecar"
+    );
+}

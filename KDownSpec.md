@@ -444,6 +444,12 @@ Partially transferred segments may be retained at chunk granularity only if the 
 - `DeletePartial` — delete temp output and checkpoint after workers stop;
 - `KeepFileDiscardCheckpoint` — for advanced callers; preserved file is not guaranteed resumable.
 
+Checkpoint deletion in `DeletePartial` and `KeepFileDiscardCheckpoint` happens
+after transfer activity has stopped. A deletion failure at that point does not
+rewrite the already-determined `Cancelled` outcome: it is reported as an
+actionable checkpoint-cleanup warning in the terminal result and warning
+events. `KeepPartial` performs no checkpoint deletion.
+
 ---
 
 ## 10. Probe and capability detection
@@ -745,6 +751,16 @@ On successful verification:
 5. remove checkpoint;
 6. enter `Completed`.
 
+Checkpoint removal (step 5) is attempted before the terminal transition. Once
+the destination rename has happened the commit is irreversible, so a checkpoint
+deletion failure at this point MUST NOT rewrite the outcome: the job remains
+`Completed` with the committed final path, and the deletion failure is surfaced
+as an actionable checkpoint-cleanup warning (in the terminal result and as a
+warning event). The same rule applies to cancellation cleanup after the
+cancelled outcome is already determined. Cleanup deletion required before
+transfer (discarding stale or unusable checkpoint state at admission) remains
+fail-closed: its failure is a terminal checkpoint error.
+
 Overwrite behavior must follow `OverwritePolicy`:
 
 - `FailIfExists`;
@@ -800,10 +816,17 @@ Never update a checkpoint in place if a torn write could make the only copy unre
 
 Use an atomic replace pattern:
 
-1. write new checkpoint to temporary metadata file;
+1. write new checkpoint to a collision-resistant temporary metadata file (concurrent workers of one job must never contend for one shared temp path);
 2. optionally fsync metadata file;
 3. rename over old checkpoint atomically where supported;
 4. optionally fsync parent directory when strong crash durability is required.
+
+In durable mode a file or parent-directory synchronization failure on a
+platform that supports the synchronization is reported as a checkpoint error: a
+save is never reported successful after an ignored durability failure.
+Platforms without directory synchronization support skip step 4 explicitly. A
+failed save leaves the previous complete checkpoint in place (atomic
+replacement) and cleans up its temporary file.
 
 ### 15.4 Ordering between data and checkpoint
 
@@ -827,6 +850,44 @@ Before resuming:
 5. optionally sample or hash persisted data if stronger validation is needed;
 6. reconstruct remaining intervals;
 7. resume only if generation identity is acceptable.
+
+### 15.6 Checkpoint store selection and per-job ordering
+
+The controller owns checkpoint adapter selection as a substitutable port:
+
+- A thread-safe checkpoint-store resolver is supplied at controller
+  construction (one consuming injection method; all existing production
+  constructors install the destination-relative file-sidecar resolver by
+  default).
+- The resolver receives one redaction-safe context per job: job identity,
+  destination path, and configured durability. It resolves exactly once per
+  job, before any checkpoint operation and before probing; resolution failure
+  fails the job with a checkpoint-category error.
+- The selected adapter is shared for the job's entire lifecycle: resume
+  admission, resume-state refresh, transfer checkpoint cadence, pause
+  persistence, segmented-worker persistence, cancellation cleanup, and
+  successful-commit cleanup. Job orchestration never requires a concrete
+  checkpoint-store implementation and never switches adapters mid-job.
+
+Checkpoint mutations are coordinated per job:
+
+- All load, save, and delete operations for one job are serialized through a
+  per-job coordinator wrapping the selected adapter, so at most one mutation
+  is active at a time and no coordinator lock is held across an await point.
+- Within one resource generation, a later progress snapshot never overwrites
+  an older one: recorded completed ranges fold forward (normalized union), and
+  a strictly superseded snapshot is suppressed. A snapshot from a different
+  identity or generation is a checkpoint inconsistency, never mixed state.
+- Successful deletion clears the remembered snapshot so admission may remove
+  unusable state and a fresh job can create a new checkpoint afterwards.
+- Terminal deletion happens only after sequential activity stopped or
+  segmented workers joined, so no save can recreate a deleted checkpoint.
+
+Checkpoint save failures during resume-state refresh, transfer cadence, or
+pause persistence are fatal: the job stops with a structured checkpoint error,
+workers converge, partial output and the previous checkpoint are preserved,
+and the job is never reported completed or successfully paused without the
+promised checkpoint state.
 
 ---
 
@@ -1445,7 +1506,21 @@ CheckpointStore {
     save_atomic(checkpoint) -> Result
     delete(job_identity) -> Result
 }
+
+CheckpointStoreResolver {
+    resolve(CheckpointResolveContext {
+        job_identity,
+        destination,
+        durability
+    }) -> Result<Arc<dyn CheckpointStore>>
+}
 ```
+
+The controller resolves one shareable checkpoint adapter per job through the
+resolver before admission; the adapter serves every checkpoint operation of
+that job's lifecycle (see §15.6). `Send + Sync` makes an adapter shareable
+across spawned workers; per-job mutation ordering is provided by the engine's
+coordinator, not by individual adapters.
 
 This permits the future download manager to store checkpoints in:
 
@@ -1454,7 +1529,7 @@ This permits the future download manager to store checkpoints in:
 - another transactional database;
 - application state storage.
 
-The initial default can be a sidecar metadata file.
+The initial default is the destination-relative file-sidecar resolver.
 
 ---
 

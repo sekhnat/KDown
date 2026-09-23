@@ -3,9 +3,13 @@
 
 pub mod checkpoint;
 pub mod checkpoint_store;
+pub(crate) mod coordinated_store;
 pub mod durable_ranges;
 pub mod flow;
 
 pub use checkpoint::{ByteRange, Checkpoint, CheckpointError, CHECKPOINT_FORMAT_VERSION};
-pub use checkpoint_store::{CheckpointStore, DurabilityMode, FileCheckpointStore};
+pub use checkpoint_store::{
+    CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver, DurabilityMode,
+    FileCheckpointStore, SidecarCheckpointResolver,
+};
 pub use flow::{job_identity, GenerationChangePolicy};

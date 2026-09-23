@@ -305,6 +305,21 @@ impl SegmentScheduler {
         self.completed.ranges()
     }
 
+    /// The settled progress snapshot (§9.3 step 4): completed ranges plus
+    /// the absorbed prefixes of active leases — every byte durably
+    /// acknowledged by the sinks at this moment. Used for pause
+    /// persistence so a paused job is genuinely resumable (§15.4).
+    #[must_use]
+    pub fn settled_ranges(&self) -> Vec<ByteRange> {
+        let mut settled = self.completed.clone();
+        for lease in self.active.values() {
+            if lease.start < lease.next_offset {
+                settled.insert(lease.start, lease.next_offset.saturating_sub(1));
+            }
+        }
+        settled.ranges()
+    }
+
     #[must_use]
     pub fn completed_set(&self) -> &IntervalSet {
         &self.completed

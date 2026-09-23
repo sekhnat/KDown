@@ -243,3 +243,90 @@ async fn randomized_multi_kill_suite() {
         assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
     }
 }
+
+#[tokio::test]
+async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
+    // Durable-mode variant of the pause/kill/resume scenario: the sidecar
+    // fsyncs file data and the directory entry before rename, so the
+    // simulated process death after pause still resumes byte-exact
+    // (§15.3, §15.4, §36.3).
+    let content = Arc::new(vec![9u8; 2_400_000]);
+    let expected = content.clone();
+    let server = TestServer::new()
+        .serve_handler("/durable.bin", move |req| {
+            let total = (*content).len() as u64;
+            let base = if let (Some((s, _e)), false) = (req.range, req.method == "HEAD") {
+                let body = (*content)[s as usize..].to_vec();
+                ScriptedResponse::new(206)
+                    .with_body(body)
+                    .with_header("content-range", &format!("bytes {s}-{}/{total}", total - 1))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+            };
+            base.chunked(Duration::from_millis(20))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("durable.bin");
+    let identity = job_identity(&server.url("/durable.bin"), &dest);
+
+    let mut cfg = fast_config();
+    cfg.transfer.durability = kdown_engine::config::DurabilityMode::Durable;
+    {
+        let c = SingleStreamController::new(
+            HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+            cfg.clone(),
+        );
+        let (handle, join) = c.start(DownloadRequest::new(
+            server.url("/durable.bin"),
+            dest.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.pause();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            handle.snapshot().completed_bytes > 0,
+            "progress before kill"
+        );
+        join.abort(); // simulated SIGKILL during Running
+    }
+    // The durable checkpoint survived the simulated kill with no temp
+    // residue (durable mode syncs contents and directory entry).
+    let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Durable).expect("store");
+    let cp = store
+        .load(&identity)
+        .expect("load")
+        .expect("durable checkpoint survived simulated kill");
+    assert!(cp.completed_bytes() > 0);
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "no temp residue: {leftovers:?}");
+
+    // Fresh controller resumes byte-exact (§36.3).
+    let c2 = SingleStreamController::new(
+        HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+        cfg,
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        c2.run(DownloadRequest::new(
+            server.url("/durable.bin"),
+            dest.clone(),
+        )),
+    )
+    .await
+    .expect("no hang")
+    .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert!(
+        result.bytes_reused_from_checkpoint > 0,
+        "resume reused the persisted prefix: {result:?}"
+    );
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
+    assert!(!dir.path().join("durable.bin.part").exists());
+}
