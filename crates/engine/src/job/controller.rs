@@ -23,7 +23,10 @@ use crate::http::{
     BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, ProbeRequest, RangeIntent,
     TransferIntent, TransferRequest,
 };
-use crate::io::sink::{FileSink, FlushLevel, Sink, TempFileSpec};
+use crate::io::destination_lease::DestinationLease;
+use crate::io::output_session::{OutputSession, PartialArtifactOwner};
+use crate::io::publish::PublishMode;
+use crate::io::sink::{FlushLevel, Sink, TempFileSpec};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::{Event, EventHub, SharedHub};
@@ -33,6 +36,14 @@ use crate::resume::checkpoint_store::{
     DurabilityMode as StoreDurability, SidecarCheckpointResolver,
 };
 use crate::resume::durable_ranges::DurableRangeTracker;
+fn publication_mode(policy: OverwritePolicy) -> PublishMode {
+    match policy {
+        OverwritePolicy::FailIfExists => PublishMode::NoReplace,
+        OverwritePolicy::Replace => PublishMode::Replace,
+        OverwritePolicy::ResumeIfMatching => PublishMode::Replace,
+    }
+}
+
 /// What a job downloads (§7.2 subset for v1 single-stream).
 #[derive(Clone)]
 pub struct DownloadRequest {
@@ -111,6 +122,16 @@ pub enum ResultStatus {
     Completed,
     Cancelled,
     Failed,
+}
+
+#[derive(Debug)]
+struct CompletionSummary {
+    network_bytes: u64,
+    reused_bytes: u64,
+    total_size: Option<u64>,
+    elapsed: Duration,
+    validators: ResourceValidators,
+    warnings: Vec<String>,
 }
 
 /// Handle for observing/controlling one running job (§7.3).
@@ -485,12 +506,30 @@ impl SingleStreamController {
                 elapsed: Duration::ZERO,
                 validators: ResourceValidators::default(),
                 warnings: vec![],
-                error: Some(DownloadError::Commit(format!(
+                error: Some(DownloadError::DestinationConflict(format!(
                     "destination exists: {}",
                     request.destination.display()
                 ))),
             });
         }
+
+        // Hold destination ownership before any checkpoint resolution/admission
+        // or temp output open. The binding lives through worker joins and
+        // terminal cleanup, including the awaited segmented completion path.
+        let _destination_lease = match DestinationLease::acquire(&request.destination) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return self.terminal_failed(
+                    &state,
+                    request,
+                    counters,
+                    Duration::ZERO,
+                    error,
+                    ResourceValidators::default(),
+                    vec![],
+                );
+            }
+        };
 
         // ---- Resume admission, phase 1 (§15.5, §7.2): policy-aware
         // checkpoint loading before any network activity. Required-state
@@ -683,7 +722,7 @@ impl SingleStreamController {
             }
         };
         Self::emit_resume_notices(&hub, plan.notices()).await;
-        let mut warnings: Vec<String> = plan.warnings().to_vec();
+        let warnings: Vec<String> = plan.warnings().to_vec();
         let resume_validators: Option<ResourceValidators> = plan.validators();
 
         // Size expectation check (§4.1): caller-provided size must match.
@@ -716,24 +755,19 @@ impl SingleStreamController {
         let _ = state.transition(JobState::Preparing);
         let resuming = plan.is_resuming();
         let mut sink = if resuming {
-            // Reuse the existing temp file (§15.5: continue, never
-            // truncate when ranges validate). Preserve across drops.
-            let mut s = FileSink::open(&request.destination, &TempFileSpec::default(), false)
-                .map_err(|e| e.0)?;
-            s.set_keep_on_drop(true);
-            s
+            // Reuse the admitted temp file without truncating it; the session
+            // preserves these bytes unless the caller explicitly aborts.
+            OutputSession::reopen(&request.destination, &TempFileSpec::default())
+                .map_err(|error| error.0)?
         } else {
-            FileSink::open(
+            OutputSession::create(
                 &request.destination,
                 &TempFileSpec::default(),
                 self.config.transfer.preallocate_output,
+                meta.total_size,
             )
-            .map_err(|e| e.0)?
+            .map_err(|error| error.0)?
         };
-        if !resuming {
-            sink.prepare(meta.total_size).map_err(|e| e.0)?;
-        }
-
         // ---- Segmented mode dispatch (§12, task 5.5) ----
         if eligible {
             let _ = state.transition(JobState::Running);
@@ -744,10 +778,9 @@ impl SingleStreamController {
             .await;
             let started = std::time::Instant::now();
             let total = meta.total_size.expect("eligible requires known size");
-            // The sink must survive worker drops (workers hold clones of
-            // the Arc; the last Drop would delete the temp file otherwise).
-            sink.set_keep_on_drop(true);
-            let sink_shared = Arc::new(tokio::sync::Mutex::new(sink));
+            // Preserve the session while segmented workers borrow bounded
+            // write handles; ownership is reclaimed only after they join.
+            sink.preserve_partial();
             // Pre-set rate limit (set before the probe completed) carries
             // into the segmented job (task 5.8).
             let initial_bucket = rate_bucket_shared.lock().expect("rate bucket lock").clone();
@@ -762,7 +795,7 @@ impl SingleStreamController {
                 &self.config,
                 &request,
                 &state,
-                sink_shared,
+                &mut sink,
                 &store,
                 &identity,
                 &meta,
@@ -785,11 +818,9 @@ impl SingleStreamController {
                     hub,
                     store.as_ref(),
                     &identity,
-                    &meta,
                     outcome,
-                    request.destination.clone(),
+                    sink,
                     warnings,
-                    started,
                 )
                 .await;
         }
@@ -986,7 +1017,6 @@ impl SingleStreamController {
                                     });
                             }
                         }
-                        let _ = sink.abort();
                         continue 'download; // re-issue with provider headers
                     }
                     // Retry classification (§17.1-§17.2) with server-provided
@@ -1001,13 +1031,13 @@ impl SingleStreamController {
                             counters.worker(0).expect("w").add_retries(1);
                             attempt = next;
                             offset = 0;
-                            sink = FileSink::open(
+                            sink = OutputSession::create(
                                 &request.destination,
                                 &TempFileSpec::default(),
                                 self.config.transfer.preallocate_output,
+                                meta.total_size,
                             )
-                            .map_err(|se| se.0)?;
-                            sink.prepare(meta.total_size).map_err(|se| se.0)?;
+                            .map_err(|error| error.0)?;
                             if let Some(status) = e.http_status() {
                                 hub.emit(Event::Warning {
                                     detail: format!("status {status} retrying from zero ({e})"),
@@ -1143,7 +1173,7 @@ impl SingleStreamController {
                                     e,
                                 );
                             }
-                            sink.set_keep_on_drop(true);
+                            sink.preserve_partial();
                         }
                     }
                     Ok(BodyEvent::End) => break, // clean EOF
@@ -1181,7 +1211,7 @@ impl SingleStreamController {
                                     e,
                                 );
                             }
-                            sink.set_keep_on_drop(true);
+                            sink.preserve_partial();
                         }
                         // Wait while paused, then continue or cancel.
                         while cancel.is_paused() && !cancel.is_cancelled() {
@@ -1258,23 +1288,22 @@ impl SingleStreamController {
                                     // Prevent the old sink's Drop from
                                     // deleting the temp file we are
                                     // preserving.
-                                    sink.set_keep_on_drop(true);
-                                    sink = FileSink::open(
+                                    sink.preserve_partial();
+                                    sink = OutputSession::reopen(
                                         &request.destination,
                                         &TempFileSpec::default(),
-                                        false,
                                     )
-                                    .map_err(|se| se.0)?;
+                                    .map_err(|error| error.0)?;
                                 } else {
                                     offset = 0;
                                     let _ = sink.abort();
-                                    sink = FileSink::open(
+                                    sink = OutputSession::create(
                                         &request.destination,
                                         &TempFileSpec::default(),
                                         self.config.transfer.preallocate_output,
+                                        meta.total_size,
                                     )
-                                    .map_err(|se| se.0)?;
-                                    sink.prepare(meta.total_size).map_err(|se| se.0)?;
+                                    .map_err(|error| error.0)?;
                                 }
                                 hub.emit(Event::Warning {
                                     detail: format!(
@@ -1316,120 +1345,27 @@ impl SingleStreamController {
             break 'download;
         }
 
-        // ---- Verifying (§16) ----
-        let _ = state.transition(JobState::Verifying);
-        hub.emit(Event::IntegrityCheckStarted).await;
-        let total = if meta.total_size.is_some() {
-            meta.total_size
-        } else {
-            None
+        let total_size = meta.total_size.or(request.expected_size);
+        let snapshot = counters.fold();
+        let summary = CompletionSummary {
+            network_bytes: snapshot.network_bytes,
+            reused_bytes: snapshot.reused_bytes,
+            total_size,
+            elapsed: started.elapsed(),
+            validators,
+            warnings,
         };
-        // Exact size verification (§16.3).
-        let sink_size = sink.size().map_err(|se| se.0)?;
-        if let Some(expected) = meta.total_size {
-            if sink_size != expected {
-                return self
-                    .terminal_failed(
-                        &state,
-                        request,
-                        counters,
-                        started.elapsed(),
-                        DownloadError::IntegrityMismatch(format!(
-                            "size mismatch: got {sink_size}, expected {expected}"
-                        )),
-                        validators,
-                        warnings,
-                    )
-                    .map(|mut r| {
-                        r.final_path = None;
-                        r
-                    });
-            }
-        }
-        // Hash verification: sequential read of the completed file (§16.2).
-        if !request.integrity.expected_hashes.is_empty() {
-            match verify_hashes(&request, sink.temp_path()) {
-                Ok(()) => {
-                    hub.emit(Event::IntegrityCheckPassed).await;
-                }
-                Err(e) => {
-                    hub.emit(Event::IntegrityCheckFailed {
-                        detail: e.to_string(),
-                    })
-                    .await;
-                    return self
-                        .terminal_failed(
-                            &state,
-                            request,
-                            counters,
-                            started.elapsed(),
-                            e,
-                            validators,
-                            warnings,
-                        )
-                        .map(|mut r| {
-                            r.final_path = None;
-                            r
-                        });
-                }
-            }
-        }
-
-        // ---- Committing (§14.6) ----
-        let _ = state.transition(JobState::Committing);
-        sink.finalize().map_err(|se| se.0)?;
-        match sink.commit() {
-            Ok(final_path) => {
-                // Checkpoint removal (§14.6 step 5) happens before the
-                // terminal transition. The destination rename is already
-                // irreversible, so a delete failure does not rewrite the
-                // outcome: `Completed` is retained with a checkpoint-
-                // cleanup warning (§9.2 Completed definition, §14.6).
-                let cleanup_warnings = match store.delete(&identity) {
-                    Ok(()) => Vec::new(),
-                    Err(e) => vec![Self::checkpoint_cleanup_warning(e)],
-                };
-                for warning in &cleanup_warnings {
-                    hub.emit(Event::Warning {
-                        detail: warning.clone(),
-                    })
-                    .await;
-                }
-                warnings.extend(cleanup_warnings);
-                let _ = state.transition(JobState::Completed);
-                hub.emit(Event::Committed {
-                    path: final_path.display().to_string(),
-                })
-                .await;
-                let snap = counters.fold();
-                Ok(DownloadResult {
-                    status: ResultStatus::Completed,
-                    final_path: Some(final_path),
-                    bytes_downloaded_from_network: snap.network_bytes,
-                    bytes_reused_from_checkpoint: snap.reused_bytes,
-                    total_size: total,
-                    elapsed: started.elapsed(),
-                    validators,
-                    warnings,
-                    error: None,
-                })
-            }
-            Err(e) => {
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                Ok(DownloadResult {
-                    status: ResultStatus::Failed,
-                    final_path: None,
-                    bytes_downloaded_from_network: counters.fold().network_bytes,
-                    bytes_reused_from_checkpoint: 0,
-                    total_size: total,
-                    elapsed: started.elapsed(),
-                    validators,
-                    warnings,
-                    error: Some(e.0),
-                })
-            }
-        }
+        Ok(self
+            .complete_verified_output(
+                &request,
+                &state,
+                &hub,
+                store.as_ref(),
+                &identity,
+                sink,
+                summary,
+            )
+            .await)
     }
 
     /// Cleanup for a cancelled job per [`CancelMode`] (§9.4):
@@ -1440,9 +1376,9 @@ impl SingleStreamController {
     /// cancellation outcome is already determined, so a delete failure is
     /// surfaced as an actionable warning instead of rewriting the result
     /// (§9.2: `Cancelled` is defined by the caller's request).
-    pub(crate) fn cleanup_cancelled(
+    pub(crate) fn cleanup_cancelled<S: Sink + PartialArtifactOwner>(
         mode: CancelMode,
-        sink: &mut FileSink,
+        sink: &mut S,
         store: &dyn CheckpointStore,
         identity: &str,
     ) -> Vec<String> {
@@ -1456,9 +1392,11 @@ impl SingleStreamController {
             }
             CancelMode::KeepPartial => {
                 let _ = sink.flush(FlushLevel::PageCache);
+                sink.preserve_partial();
             }
             CancelMode::KeepFileDiscardCheckpoint => {
                 let _ = sink.flush(FlushLevel::PageCache);
+                sink.preserve_partial();
                 if let Err(e) = store.delete(identity) {
                     warnings.push(Self::checkpoint_cleanup_warning(e));
                 }
@@ -1500,13 +1438,10 @@ impl SingleStreamController {
         hub: SharedHub,
         store: &dyn CheckpointStore,
         identity: &str,
-        _meta: &ProbeMetadata,
         outcome: crate::job::segmented::SegmentedOutcome,
-        destination: PathBuf,
+        sink: OutputSession,
         mut warnings: Vec<String>,
-        started: std::time::Instant,
     ) -> Result<DownloadResult, DownloadError> {
-        let total = Some(outcome.total_size);
         if outcome.status == ResultStatus::Cancelled {
             let _ = state.transition(JobState::Cancelling);
             let _ = state.transition(JobState::Cancelled);
@@ -1542,131 +1477,145 @@ impl SingleStreamController {
             });
         }
         warnings.extend(outcome.warnings);
+        let summary = CompletionSummary {
+            network_bytes: outcome.network_bytes,
+            reused_bytes: outcome.reused_bytes,
+            total_size: Some(outcome.total_size),
+            elapsed: outcome.elapsed,
+            validators: outcome.validators,
+            warnings,
+        };
+        Ok(self
+            .complete_verified_output(request, &state, &hub, store, identity, sink, summary)
+            .await)
+    }
 
-        // ---- Verifying (§16) ----
+    /// Sequence verification, durable finalization, publication, checkpoint
+    /// cleanup, and the terminal result for a successful transfer.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_verified_output(
+        &self,
+        request: &DownloadRequest,
+        state: &Arc<StateMachine>,
+        hub: &SharedHub,
+        store: &dyn CheckpointStore,
+        identity: &str,
+        mut sink: OutputSession,
+        mut summary: CompletionSummary,
+    ) -> DownloadResult {
         let _ = state.transition(JobState::Verifying);
         hub.emit(Event::IntegrityCheckStarted).await;
-        // Exact size verification (§16.3) over the assembled temp file.
-        let temp_path = TempFileSpec::default().temp_path_for(&destination);
-        let sink_size = std::fs::metadata(&temp_path)
-            .map(|m| m.len())
-            .map_err(|e| DownloadError::from_io(&e))?;
-        if sink_size != outcome.total_size {
-            hub.emit(Event::IntegrityCheckFailed {
-                detail: format!(
-                    "size mismatch: got {sink_size}, expected {}",
-                    outcome.total_size
-                ),
-            })
-            .await;
-            let _ = state.transition(JobState::Failing);
-            let _ = state.transition(JobState::Failed);
-            return Ok(DownloadResult {
-                status: ResultStatus::Failed,
-                final_path: None,
-                bytes_downloaded_from_network: outcome.network_bytes,
-                bytes_reused_from_checkpoint: outcome.reused_bytes,
-                total_size: Some(outcome.total_size),
-                elapsed: outcome.elapsed,
-                validators: outcome.validators,
-                warnings,
-                error: Some(DownloadError::IntegrityMismatch(format!(
-                    "size mismatch: got {sink_size}, expected {}",
-                    outcome.total_size
-                ))),
-            });
-        }
-        // Whole-file hash verification via sequential read of the
-        // assembled temp file (§16.2, integrity spec).
-        if !request.integrity.expected_hashes.is_empty() {
-            match verify_hashes_path(&request.integrity, &temp_path) {
-                Ok(()) => {
-                    hub.emit(Event::IntegrityCheckPassed).await;
-                }
-                Err(e) => {
-                    hub.emit(Event::IntegrityCheckFailed {
-                        detail: e.to_string(),
-                    })
-                    .await;
-                    let _ = state.transition(JobState::Failing);
-                    let _ = state.transition(JobState::Failed);
-                    return Ok(DownloadResult {
-                        status: ResultStatus::Failed,
-                        final_path: None,
-                        bytes_downloaded_from_network: outcome.network_bytes,
-                        bytes_reused_from_checkpoint: outcome.reused_bytes,
-                        total_size: Some(outcome.total_size),
-                        elapsed: outcome.elapsed,
-                        validators: outcome.validators,
-                        warnings,
-                        error: Some(e),
-                    });
-                }
-            }
-        }
-
-        // ---- Committing (§14.6) ----
-        let _ = state.transition(JobState::Committing);
-        let _ = identity;
-        let commit = {
-            // Reopen a sink over the temp file strictly for the commit:
-            // the worker-shared sink stays locked inside run_segmented's
-            // scope; FileSink::commit performs the atomic rename.
-            let mut commit_sink =
-                FileSink::open(&request.destination, &TempFileSpec::default(), false)
-                    .map_err(|e| e.0)?;
-            commit_sink.set_keep_on_drop(true);
-            commit_sink.finalize().map_err(|e| e.0)?;
-            commit_sink.commit()
-        };
-        match commit {
-            Ok(final_path) => {
-                // Checkpoint removal (§14.6 step 5) before the terminal
-                // transition; a delete failure after the irreversible
-                // commit keeps `Completed` with a cleanup warning (§9.2).
-                let cleanup_warnings = match store.delete(identity) {
-                    Ok(()) => Vec::new(),
-                    Err(e) => vec![Self::checkpoint_cleanup_warning(e)],
-                };
-                for warning in &cleanup_warnings {
-                    hub.emit(Event::Warning {
-                        detail: warning.clone(),
-                    })
-                    .await;
-                }
-                warnings.extend(cleanup_warnings);
-                let _ = state.transition(JobState::Completed);
-                hub.emit(Event::Committed {
-                    path: final_path.display().to_string(),
+        let sink_size = match sink.size() {
+            Ok(size) => size,
+            Err(error) => {
+                let error = error.0;
+                hub.emit(Event::IntegrityCheckFailed {
+                    detail: error.to_string(),
                 })
                 .await;
-                Ok(DownloadResult {
-                    status: ResultStatus::Completed,
-                    final_path: Some(final_path),
-                    bytes_downloaded_from_network: outcome.network_bytes,
-                    bytes_reused_from_checkpoint: outcome.reused_bytes,
-                    total_size: total,
-                    elapsed: outcome.elapsed,
-                    validators: outcome.validators,
-                    warnings,
-                    error: None,
-                })
+                return Self::completion_failed(state, request, summary, error);
             }
-            Err(e) => {
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                Ok(DownloadResult {
-                    status: ResultStatus::Failed,
-                    final_path: None,
-                    bytes_downloaded_from_network: outcome.network_bytes,
-                    bytes_reused_from_checkpoint: outcome.reused_bytes,
-                    total_size: total,
-                    elapsed: started.elapsed(),
-                    validators: outcome.validators,
-                    warnings,
-                    error: Some(e.0),
+        };
+        if let Some(expected) = summary.total_size {
+            if sink_size != expected {
+                let error = DownloadError::IntegrityMismatch(format!(
+                    "size mismatch: got {sink_size}, expected {expected}"
+                ));
+                hub.emit(Event::IntegrityCheckFailed {
+                    detail: error.to_string(),
                 })
+                .await;
+                return Self::completion_failed(state, request, summary, error);
             }
+        }
+        if !request.integrity.expected_hashes.is_empty() {
+            if let Err(error) = sink.verification_read() {
+                hub.emit(Event::IntegrityCheckFailed {
+                    detail: error.to_string(),
+                })
+                .await;
+                return Self::completion_failed(state, request, summary, error);
+            }
+            match verify_hashes(&request.integrity, sink.temp_path()) {
+                Ok(()) => hub.emit(Event::IntegrityCheckPassed).await,
+                Err(error) => {
+                    hub.emit(Event::IntegrityCheckFailed {
+                        detail: error.to_string(),
+                    })
+                    .await;
+                    return Self::completion_failed(state, request, summary, error);
+                }
+            }
+        }
+        let _ = state.transition(JobState::Committing);
+        if let Err(error) = sink.finalize() {
+            return Self::completion_failed(state, request, summary, error.0);
+        }
+        let (final_path, publication_warning) =
+            match sink.commit_with_policy(publication_mode(request.overwrite)) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Self::completion_failed(state, request, summary, error.0);
+                }
+            };
+        if let Some(warning) = publication_warning {
+            hub.emit(Event::Warning {
+                detail: warning.clone(),
+            })
+            .await;
+            summary.warnings.push(warning);
+        }
+        let cleanup_warnings = match store.delete(identity) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![Self::checkpoint_cleanup_warning(error)],
+        };
+        for warning in &cleanup_warnings {
+            hub.emit(Event::Warning {
+                detail: warning.clone(),
+            })
+            .await;
+        }
+        summary.warnings.extend(cleanup_warnings);
+        let _ = state.transition(JobState::Completed);
+        hub.emit(Event::Committed {
+            path: final_path.display().to_string(),
+        })
+        .await;
+        DownloadResult {
+            status: ResultStatus::Completed,
+            final_path: Some(final_path),
+            bytes_downloaded_from_network: summary.network_bytes,
+            bytes_reused_from_checkpoint: summary.reused_bytes,
+            total_size: summary.total_size,
+            elapsed: summary.elapsed,
+            validators: summary.validators,
+            warnings: summary.warnings,
+            error: None,
+        }
+    }
+
+    fn completion_failed(
+        state: &Arc<StateMachine>,
+        request: &DownloadRequest,
+        summary: CompletionSummary,
+        error: DownloadError,
+    ) -> DownloadResult {
+        let _ = state.transition(JobState::Failing);
+        let _ = state.transition(JobState::Failed);
+        crate::observability::log_terminal_error(
+            &crate::observability::Correlation::new().origin(request.url.clone()),
+            &error,
+        );
+        DownloadResult {
+            status: ResultStatus::Failed,
+            final_path: None,
+            bytes_downloaded_from_network: summary.network_bytes,
+            bytes_reused_from_checkpoint: summary.reused_bytes,
+            total_size: summary.total_size,
+            elapsed: summary.elapsed,
+            validators: summary.validators,
+            warnings: summary.warnings,
+            error: Some(error),
         }
     }
 
@@ -1704,14 +1653,14 @@ impl SingleStreamController {
         request: DownloadRequest,
         counters: Arc<JobCounters>,
         elapsed: Duration,
-        sink: &mut FileSink,
+        sink: &mut (impl Sink + PartialArtifactOwner),
         validators: ResourceValidators,
         warnings: Vec<String>,
         error: crate::resume::CheckpointError,
     ) -> Result<DownloadResult, DownloadError> {
         // Preserve the partial output beyond the last good checkpoint.
         let _ = sink.flush(FlushLevel::PageCache);
-        sink.set_keep_on_drop(true);
+        sink.preserve_partial();
         self.terminal_failed(
             state,
             request,
@@ -1778,54 +1727,23 @@ impl SingleStreamController {
     }
 }
 
-/// Sequential hash verification of a file against the expected digests
-/// (§16.2): used by the segmented completion path over the assembled
-/// temp file.
-fn verify_hashes_path(integrity: &IntegrityPolicy, path: &Path) -> Result<(), DownloadError> {
+/// Sequential SHA-256/SHA-512 verification of the completed temporary file.
+fn verify_hashes(integrity: &IntegrityPolicy, path: &Path) -> Result<(), DownloadError> {
     for expected in &integrity.expected_hashes {
-        let file = std::fs::File::open(path).map_err(|e| DownloadError::from_io(&e))?;
+        let file = std::fs::File::open(path).map_err(|error| DownloadError::from_io(&error))?;
         let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
         let computed = match expected.algorithm {
             HashAlgorithm::Sha256 => {
-                let mut h = Sha256::new();
-                std::io::copy(&mut reader, &mut h)
-                    .map_err(|e| DownloadError::SinkWrite(e.to_string()))?;
-                hex(&h.finalize())
+                let mut hasher = Sha256::new();
+                std::io::copy(&mut reader, &mut hasher)
+                    .map_err(|error| DownloadError::SinkWrite(error.to_string()))?;
+                hex(&hasher.finalize())
             }
             HashAlgorithm::Sha512 => {
-                let mut h = Sha512::new();
-                std::io::copy(&mut reader, &mut h)
-                    .map_err(|e| DownloadError::SinkWrite(e.to_string()))?;
-                hex(&h.finalize())
-            }
-        };
-        if computed != expected.hex.to_ascii_lowercase() {
-            return Err(DownloadError::IntegrityMismatch(format!(
-                "{:?} digest mismatch: expected {}, computed {}",
-                expected.algorithm, expected.hex, computed
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Sequential hash verification of the completed temp file (§16.2).
-fn verify_hashes(request: &DownloadRequest, temp: &Path) -> Result<(), DownloadError> {
-    for expected in &request.integrity.expected_hashes {
-        let file = std::fs::File::open(temp).map_err(|e| DownloadError::from_io(&e))?;
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
-        let computed = match expected.algorithm {
-            crate::config::HashAlgorithm::Sha256 => {
-                let mut h = Sha256::new();
-                std::io::copy(&mut reader, &mut h)
-                    .map_err(|e| DownloadError::SinkWrite(e.to_string()))?;
-                hex(&h.finalize())
-            }
-            crate::config::HashAlgorithm::Sha512 => {
-                let mut h = Sha512::new();
-                std::io::copy(&mut reader, &mut h)
-                    .map_err(|e| DownloadError::SinkWrite(e.to_string()))?;
-                hex(&h.finalize())
+                let mut hasher = Sha512::new();
+                std::io::copy(&mut reader, &mut hasher)
+                    .map_err(|error| DownloadError::SinkWrite(error.to_string()))?;
+                hex(&hasher.finalize())
             }
         };
         if computed != expected.hex.to_ascii_lowercase() {
@@ -1840,4 +1758,331 @@ fn verify_hashes(request: &DownloadRequest, temp: &Path) -> Result<(), DownloadE
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::config::{ExpectedHash, HashAlgorithm, IntegrityPolicy};
+    use crate::error::ErrorCategory;
+    use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
+    use crate::io::fault_script::{OutputFaultScript, OutputOperation};
+    use crate::resume::checkpoint_store::FileCheckpointStore;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn finalization_failure_is_structured_and_preserves_old_destination() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        std::fs::write(&destination, b"previous destination").expect("seed old destination");
+        let mut sink =
+            OutputSession::create(&destination, &TempFileSpec::default(), false, Some(3))
+                .expect("open output session");
+        sink.write_at(0, b"new").expect("write temp output");
+        sink.fail_next_flush();
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(ScriptedHttp::new()),
+            EngineConfig::default(),
+        );
+        let mut request =
+            DownloadRequest::new("https://completion.test/output", destination.clone());
+        request.overwrite = OverwritePolicy::Replace;
+        let state = StateMachine::new();
+        state
+            .transition(JobState::Probing)
+            .expect("created to probing");
+        state
+            .transition(JobState::Preparing)
+            .expect("probing to preparing");
+        state
+            .transition(JobState::Running)
+            .expect("preparing to running");
+        let (hub, mut events) = EventHub::new(16, Duration::from_secs(1));
+        let hub = Arc::new(hub);
+        let store = FileCheckpointStore::new(directory.path(), StoreDurability::Performance)
+            .expect("checkpoint store");
+        let result = controller
+            .complete_verified_output(
+                &request,
+                &state,
+                &hub,
+                &store,
+                "test-identity",
+                sink,
+                CompletionSummary {
+                    network_bytes: 3,
+                    reused_bytes: 0,
+                    total_size: Some(3),
+                    elapsed: Duration::ZERO,
+                    validators: ResourceValidators::default(),
+                    warnings: Vec::new(),
+                },
+            )
+            .await;
+
+        assert_eq!(result.status, ResultStatus::Failed);
+        assert_eq!(
+            result.error.as_ref().map(DownloadError::category),
+            Some(crate::error::ErrorCategory::SinkWrite)
+        );
+        assert_eq!(state.get(), JobState::Failed);
+        assert_eq!(
+            std::fs::read(&destination).expect("old destination remains"),
+            b"previous destination"
+        );
+        assert!(matches!(
+            events.try_next(),
+            Some(Event::IntegrityCheckStarted)
+        ));
+        assert!(
+            events.try_next().is_none(),
+            "finalize failure cannot commit"
+        );
+    }
+
+    const FAULT_TOTAL: u64 = 4000;
+
+    struct FaultObservation {
+        status: Option<ResultStatus>,
+        category: Option<ErrorCategory>,
+        operations: Vec<OutputOperation>,
+        committed: bool,
+        destination: Vec<u8>,
+        part_exists: bool,
+        destination_at_publish: Option<Vec<u8>>,
+        state_at_publish: Option<JobState>,
+    }
+
+    fn fault_config(segmented: bool) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.transfer.preallocate_output = false;
+        config.transfer.segmentation_threshold = if segmented { 1024 } else { u64::MAX };
+        config.transfer.max_workers = 4;
+        config.transfer.min_workers = 1;
+        config.transfer.max_segment_size = 1000;
+        config.transfer.min_segment_size = 1;
+        config.transfer.verify_range_support = false;
+        config.checkpoint_flush_interval = Duration::from_secs(60);
+        config
+    }
+
+    fn fault_http(segmented: bool, content: &[u8]) -> ScriptedHttp {
+        let scripted = ScriptedHttp::new().expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(FAULT_TOTAL),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }));
+        if segmented {
+            let ranges = (0..FAULT_TOTAL)
+                .step_by(1000)
+                .map(|start| {
+                    let end = (start + 999).min(FAULT_TOTAL - 1);
+                    TransferStep::new().range((start, end)).ok(TransferOk::new()
+                        .range(start, end)
+                        .total(FAULT_TOTAL)
+                        .chunk(content[start as usize..=end as usize].to_vec()))
+                })
+                .collect();
+            scripted.expect_unordered_ranges("output-faults", ranges)
+        } else {
+            scripted.expect_transfer(
+                TransferStep::new()
+                    .ok(TransferOk::new().total(FAULT_TOTAL).chunk(content.to_vec())),
+            )
+        }
+    }
+
+    fn digest_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn injected_error(operation: OutputOperation) -> DownloadError {
+        match operation {
+            OutputOperation::Open => DownloadError::SinkOpen("scripted open fault".into()),
+            OutputOperation::Publish => DownloadError::Commit("scripted publish fault".into()),
+            OutputOperation::Write
+            | OutputOperation::Flush
+            | OutputOperation::VerificationRead
+            | OutputOperation::Finalize
+            | OutputOperation::Cleanup => {
+                DownloadError::SinkWrite(format!("scripted {operation:?} fault"))
+            }
+        }
+    }
+
+    async fn run_output_fault(segmented: bool, operation: OutputOperation) -> FaultObservation {
+        let content: Vec<u8> = (0..FAULT_TOTAL)
+            .map(|index| ((index * 17 + 3) % 251) as u8)
+            .collect();
+        let scripted = fault_http(segmented, &content);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        std::fs::write(&destination, b"previous destination").expect("seed old destination");
+        let registration = OutputFaultScript::register(&destination);
+        registration
+            .script()
+            .fail_next(operation, injected_error(operation));
+        let gate = (operation == OutputOperation::Publish)
+            .then(|| registration.script().hold_next(OutputOperation::Publish));
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(scripted),
+            fault_config(segmented),
+        );
+        let mut request = DownloadRequest::new(
+            "https://completion.test/faulted-output",
+            destination.clone(),
+        );
+        request.overwrite = OverwritePolicy::Replace;
+        request.expected_size = Some(FAULT_TOTAL);
+        request.integrity = IntegrityPolicy {
+            expected_hashes: vec![ExpectedHash {
+                algorithm: HashAlgorithm::Sha256,
+                hex: digest_hex(&content),
+            }],
+            ..IntegrityPolicy::default()
+        };
+        let (handle, task) = controller.start(request);
+        let mut events = handle.events();
+        let (destination_at_publish, state_at_publish) = if let Some(gate) = gate {
+            let gate = tokio::task::spawn_blocking(move || {
+                gate.wait_until_entered();
+                gate
+            })
+            .await
+            .expect("publish gate waiter");
+            let bytes = std::fs::read(&destination).expect("old destination during publish");
+            let state = handle.state();
+            gate.release();
+            (Some(bytes), Some(state))
+        } else {
+            (None, None)
+        };
+        let terminal = task.await.expect("job task");
+        let (status, category) = match terminal {
+            Ok(result) => (
+                Some(result.status),
+                result.error.as_ref().map(DownloadError::category),
+            ),
+            Err(error) => (None, Some(error.category())),
+        };
+        let committed = std::iter::from_fn(|| events.try_next())
+            .any(|event| matches!(event, Event::Committed { .. }));
+        let part = TempFileSpec::default().temp_path_for(&destination);
+        FaultObservation {
+            status,
+            category,
+            operations: registration.script().operations(),
+            committed,
+            destination: std::fs::read(&destination).expect("old destination remains"),
+            part_exists: part.exists(),
+            destination_at_publish,
+            state_at_publish,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scripted_output_faults_are_ordered_and_fail_closed_in_both_modes() {
+        let cases = [
+            OutputOperation::Open,
+            OutputOperation::Write,
+            OutputOperation::Flush,
+            OutputOperation::VerificationRead,
+            OutputOperation::Finalize,
+            OutputOperation::Publish,
+        ];
+        for operation in cases {
+            for segmented in [false, true] {
+                let observed = run_output_fault(segmented, operation).await;
+                assert_eq!(
+                    observed.category,
+                    Some(injected_error(operation).category()),
+                    "{operation:?}, segmented={segmented}: structured category"
+                );
+                assert_ne!(observed.status, Some(ResultStatus::Completed));
+                assert!(!observed.committed, "{operation:?}: no false commit");
+                assert_eq!(observed.destination, b"previous destination");
+                assert_eq!(observed.operations.first(), Some(&OutputOperation::Open));
+                assert!(
+                    observed.operations.contains(&operation),
+                    "{:?}",
+                    observed.operations
+                );
+                let expected_partial = match operation {
+                    OutputOperation::Open => false,
+                    OutputOperation::Write
+                    | OutputOperation::Flush
+                    | OutputOperation::VerificationRead
+                    | OutputOperation::Finalize => segmented,
+                    OutputOperation::Publish => true,
+                    OutputOperation::Cleanup => unreachable!(),
+                };
+                assert_eq!(
+                    observed.part_exists, expected_partial,
+                    "{operation:?}, segmented={segmented}: partial artifact disposition {:?}",
+                    observed.operations
+                );
+                if operation == OutputOperation::Open {
+                    assert_eq!(observed.status, None);
+                    assert_eq!(observed.operations, [OutputOperation::Open]);
+                }
+                if operation == OutputOperation::Publish {
+                    assert_eq!(
+                        observed.destination_at_publish.as_deref(),
+                        Some(&b"previous destination"[..])
+                    );
+                    assert_eq!(observed.state_at_publish, Some(JobState::Committing));
+                    assert_eq!(observed.operations.last(), Some(&OutputOperation::Publish));
+                }
+                if operation == OutputOperation::Finalize {
+                    let flush = observed
+                        .operations
+                        .iter()
+                        .rposition(|op| *op == OutputOperation::Flush)
+                        .expect("flush before finalize");
+                    let finalize = observed
+                        .operations
+                        .iter()
+                        .position(|op| *op == OutputOperation::Finalize)
+                        .expect("finalize operation");
+                    assert!(flush < finalize, "{:?}", observed.operations);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scripted_cleanup_fault_preserves_the_partial_artifact() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("cleanup.bin");
+        let temporary = TempFileSpec::default().temp_path_for(&destination);
+        let registration = OutputFaultScript::register(&destination);
+        registration.script().fail_next(
+            OutputOperation::Cleanup,
+            injected_error(OutputOperation::Cleanup),
+        );
+        let mut session =
+            OutputSession::create(&destination, &TempFileSpec::default(), false, None)
+                .expect("output session");
+        session.write_at(0, b"partial").expect("write");
+
+        let error = session.abort().expect_err("scripted cleanup failure");
+        assert_eq!(error.0.category(), ErrorCategory::SinkWrite);
+        assert!(
+            temporary.exists(),
+            "failed cleanup leaves the partial for recovery"
+        );
+        assert_eq!(
+            registration.script().operations(),
+            [
+                OutputOperation::Open,
+                OutputOperation::Write,
+                OutputOperation::Cleanup
+            ]
+        );
+    }
 }

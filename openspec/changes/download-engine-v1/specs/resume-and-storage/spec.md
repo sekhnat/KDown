@@ -17,6 +17,17 @@ The engine SHALL write all downloaded bytes to a temp file distinct from the fin
 - **WHEN** multiple workers write to disjoint offsets of the same temp file concurrently
 - **THEN** each byte lands at its requested offset with no interleaving corruption
 
+### Requirement: Exclusive destination ownership
+Before resolving or mutating checkpoint state or opening shared temporary output, the engine SHALL acquire exclusive ownership of the destination-associated artifacts across controllers and processes sharing the filesystem. If ownership cannot be established, the engine SHALL fail before mutating those artifacts. The lock is OS-managed and crash-releasable; its stable lockfile may persist and SHALL NOT be unlinked as a release mechanism. The existing partial output and checkpoint format remain unchanged and SHALL be validated under the existing resume policy after ownership is reacquired.
+
+#### Scenario: Concurrent jobs target one destination
+- **WHEN** two live jobs target the same destination, including jobs using separate controllers or processes
+- **THEN** only one may mutate the destination's partial output/checkpoint state; the other receives a structured failure before mutation
+
+#### Scenario: Recover after owner exits
+- **WHEN** a process exits with partial output and a persistent lockfile
+- **THEN** a later job can acquire the released OS lock and safely validate or resume the existing partial output and checkpoint
+
 ### Requirement: Preallocation and disk errors
 When total size is known, the engine SHOULD preallocate the temp file where the platform supports it, treating unsupported preallocation as non-fatal and insufficient disk space as fatal. Disk-full, quota, permission, read-only filesystem, and I/O errors SHALL be terminal: network workers SHALL stop promptly and a structured sink error SHALL surface.
 
@@ -62,12 +73,12 @@ Pause SHALL converge quickly: stop segment assignment, stop workers at safe chun
 - **THEN** workers stop, then the temp file and checkpoint are removed, leaving no orphaned artifacts
 
 ### Requirement: Atomic final commit
-On successful verification the engine SHALL flush per durability policy, settle file handles, apply optional caller-requested metadata, atomically rename the temp file to the destination where the platform supports it, remove the checkpoint, and only then report Completed. Failure to commit SHALL never be reported as Completed even when all bytes were fetched.
+On successful verification the engine SHALL flush per durability policy, settle file handles, apply optional caller-requested metadata, and publish the temporary file according to the selected overwrite policy. `FailIfExists` SHALL use atomic no-replace publication; `Replace` SHALL use safe atomic replacement where supported. If the requested atomic operation is unavailable or fails, the engine SHALL fail without deleting or modifying the prior destination. The engine SHALL remove the checkpoint only after successful publication and only then report `Completed`. Failure to publish SHALL never be reported as `Completed`.
 
 #### Scenario: Commit failure is not completion
-- **WHEN** the final rename fails (e.g., cross-device link or permission error)
-- **THEN** the job reports a structured commit error with the partial artifacts preserved per policy, and never reports Completed
+- **WHEN** the requested publication operation fails or is unsupported
+- **THEN** the job reports a structured commit/conflict error, preserves the prior destination and partial artifacts per policy, and never reports `Completed`
 
 #### Scenario: Commit is atomic to observers
-- **WHEN** another process reads the destination path while the final rename occurs
-- **THEN** it observes either the previous file or the complete new file, never a partially written one
+- **WHEN** another process reads the destination while a supported replacement occurs
+- **THEN** it observes either the previous file or the complete new file, never a missing or partially written destination

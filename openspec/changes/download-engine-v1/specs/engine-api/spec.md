@@ -66,12 +66,16 @@ The engine SHALL validate configuration values (concurrency bounds, timeouts, bu
 - **THEN** the engine returns a structured configuration error and does not start the job
 
 ### Requirement: Destination conflict policy
-The engine SHALL honor the overwrite policy on the destination path: fail if an existing file is present and policy is FailIfExists, replace atomically when policy is Replace, defer automatic renaming to the embedding layer, and resume only when policy permits and validator identity matches.
+The engine SHALL honor the selected overwrite policy on the destination. `FailIfExists` SHALL reject a destination that already exists before network activity and SHALL use an atomic no-replace publication operation so a destination created during transfer is never overwritten; if that operation is unsupported, the job SHALL fail closed without publishing. `Replace` SHALL use safe atomic replacement where the platform and filesystem support it; if replacement fails or is unsupported, the engine SHALL return a structured failure without deleting or modifying the prior destination. Automatic renaming is delegated to the embedding layer. `ResumeIfMatching` SHALL resume only when validator identity matches and SHALL use replacement semantics for final publication.
 
 #### Scenario: Destination exists with FailIfExists
-- **WHEN** a job completes commit but the destination already exists and policy is FailIfExists
-- **THEN** the engine fails with a structured conflict error, leaves the existing file untouched, and does not silently overwrite
+- **WHEN** the destination exists at admission or is created before publication while a `FailIfExists` job is running
+- **THEN** the job fails with a structured conflict, leaves the existing entry and its bytes untouched, and does not report `Completed` or emit a committed event
 
 #### Scenario: Destination exists with Replace
-- **WHEN** a job completes commit and policy is Replace
-- **THEN** the existing file is replaced by an atomic rename so observers never see a partially written destination
+- **WHEN** a job completes verification with `Replace` selected and the platform supports safe atomic replacement
+- **THEN** the destination is replaced atomically so observers see either the complete old file or the complete new file
+
+#### Scenario: Replace cannot proceed safely
+- **WHEN** atomic replacement is unsupported or fails
+- **THEN** the job reports a structured commit failure and preserves the old destination bytes

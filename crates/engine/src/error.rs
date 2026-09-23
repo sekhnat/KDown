@@ -34,6 +34,7 @@ pub enum ErrorCategory {
     Checkpoint,
     IntegrityMismatch,
     Commit,
+    DestinationConflict,
     Cancelled,
     DeadlineExceeded,
     RetryExhausted,
@@ -65,6 +66,7 @@ impl ErrorCategory {
             | PermissionDenied
             | Checkpoint
             | IntegrityMismatch
+            | DestinationConflict
             | Commit
             | DeadlineExceeded => Retryability::Never,
             Redirect => Retryability::Never,
@@ -149,6 +151,8 @@ pub enum DownloadError {
     IntegrityMismatch(String),
     #[error("commit failed: {0}")]
     Commit(String),
+    #[error("destination conflict: {0}")]
+    DestinationConflict(String),
     #[error("cancelled")]
     Cancelled,
     #[error("deadline exceeded")]
@@ -188,6 +192,7 @@ impl DownloadError {
             Checkpoint(_) => ErrorCategory::Checkpoint,
             IntegrityMismatch(_) => ErrorCategory::IntegrityMismatch,
             Commit(_) => ErrorCategory::Commit,
+            DestinationConflict(_) => ErrorCategory::DestinationConflict,
             Cancelled => ErrorCategory::Cancelled,
             DeadlineExceeded => ErrorCategory::DeadlineExceeded,
             RetryExhausted { .. } => ErrorCategory::RetryExhausted,

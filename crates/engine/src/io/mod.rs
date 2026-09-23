@@ -1,6 +1,11 @@
 //! Output storage and buffer management (§13-§14, §33).
 
 pub mod buffer_pool;
+pub(crate) mod destination_lease;
+#[cfg(test)]
+pub(crate) mod fault_script;
+pub(crate) mod output_session;
+pub(crate) mod publish;
 pub mod sanitize;
 pub mod sink;
 

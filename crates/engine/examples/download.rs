@@ -3,6 +3,8 @@
 //! ```text
 //! cargo run --example download -- URL DESTINATION
 //! ```
+//! The default `FailIfExists` policy rejects an existing destination early and
+//! also prevents a destination created during the download from being replaced.
 
 use std::env;
 use std::path::PathBuf;

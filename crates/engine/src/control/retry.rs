@@ -64,6 +64,7 @@ impl RetryClassifier {
             | C::Checkpoint
             | C::IntegrityMismatch
             | C::Commit
+            | C::DestinationConflict
             | C::Cancelled
             | C::DeadlineExceeded
             | C::Configuration

@@ -14,6 +14,7 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Resume never mixes generations | `resume_tests`, generation-change tests in controller suite |
 | Hash mismatch prevents commit | integrity cases in `single_stream_tests`, `metrics_tests` |
 | >4 GiB offsets | `phase3_exit_tests::oversized_4gib_sparse_download_exact` |
+| Race-safe overwrite publication | Real-file `io::publish` tests cover no-replace conflicts, atomic replacement observation, and non-destructive failure; the suite runs in the Ubuntu/macOS/Windows CI matrix |
 
 ## Reliability
 
@@ -22,6 +23,7 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Transient retry without completed-range replay | randomized disconnect/retry suites; tail-only scheduler tests |
 | Pause/resume across restart | `resume_tests`, `crash_restart_tests` |
 | Corrupt checkpoints fail safely | checkpoint unit/store tests |
+| Destination ownership and crash recovery | `destination_lease` contention/release tests, controller conflict cases, and `crash_restart_tests`; persistent unlocked lockfiles remain reusable |
 | Disk/sink errors stop workers | sink tests and controller terminal-error paths |
 | Cancellation settles workers | handle-control and runtime-control suites |
 

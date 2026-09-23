@@ -747,12 +747,12 @@ On successful verification:
 1. flush according to durability policy;
 2. close/settle file handles as required by the platform;
 3. apply optional metadata such as modification time if desired by caller policy;
-4. atomically rename temp file to final path when possible;
+4. publish the temporary file to the final path using the selected overwrite policy and a safe atomic filesystem operation;
 5. remove checkpoint;
 6. enter `Completed`.
 
 Checkpoint removal (step 5) is attempted before the terminal transition. Once
-the destination rename has happened the commit is irreversible, so a checkpoint
+the successful publication has happened, the commit is irreversible, so a checkpoint
 deletion failure at this point MUST NOT rewrite the outcome: the job remains
 `Completed` with the committed final path, and the deletion failure is surfaced
 as an actionable checkpoint-cleanup warning (in the terminal result and as a
@@ -767,6 +767,8 @@ Overwrite behavior must follow `OverwritePolicy`:
 - `Replace`;
 - `AutoRename` handled by higher-level caller or optional utility;
 - `ResumeIfMatching`.
+
+`FailIfExists` is checked before network activity for early rejection and enforced again at publication by one atomic no-replace operation. If any destination entry exists at publication (including a dangling symbolic link), the job fails with a structured conflict and leaves that entry unchanged. If the filesystem cannot provide atomic no-replace, the job fails closed without publishing. `Replace` uses atomic same-directory replacement where the platform and filesystem provide it. The engine never deletes the old destination first; if safe replacement is unavailable or fails, it returns a structured commit error and preserves the old bytes. Neither policy has a non-atomic fallback.
 
 ---
 
@@ -888,6 +890,12 @@ pause persistence are fatal: the job stops with a structured checkpoint error,
 workers converge, partial output and the previous checkpoint are preserved,
 and the job is never reported completed or successfully paused without the
 promised checkpoint state.
+
+### 15.7 Exclusive destination ownership
+
+A job acquires exclusive ownership for its destination before checkpoint resolution/admission or temporary-file access and retains it until transfer workers have joined and terminal cleanup has finished. The lease coordinates controllers within the process and processes sharing the filesystem. If the engine cannot establish the lease safely, it fails before mutating shared partial-output or checkpoint artifacts.
+
+The OS-managed lock uses a stable lockfile that may remain after a job exits. The engine releases the OS lock but never unlinks the lockfile; its unlocked presence is harmless. Process exit or crash releases the OS lock, so a later job can reacquire ownership and validate the existing partial output and checkpoint under the unchanged resume policy. The lockfile is not a checkpoint, and this ownership mechanism does not change the checkpoint format or resume rules.
 
 ---
 

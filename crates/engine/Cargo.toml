@@ -24,6 +24,7 @@ sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 bytes = "1"
+fs2 = "0.4"
 
 [dev-dependencies]
 proptest = "1"

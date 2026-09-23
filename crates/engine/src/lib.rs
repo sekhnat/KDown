@@ -53,9 +53,9 @@
 //!
 //! Job orchestration never touches concrete HTTP client, response-body, or
 //! framing types. Both sequential and segmented transfers issue semantic
-//! [`kdown_engine::http::HttpExecutor::probe`] and
-//! [`kdown_engine::http::HttpExecutor::transfer`] operations through a
-//! cloneable [`kdown_engine::http::HttpExecution`] handle; statuses,
+//! [`http::HttpExecutor::probe`] and
+//! [`http::HttpExecutor::transfer`] operations through a
+//! cloneable [`http::HttpExecution`] handle; statuses,
 //! `Retry-After` timing, authentication challenges, range validation,
 //! generation conflicts, body overruns, and read-idle timeouts are all
 //! classified inside the HTTP layer before any body chunk is delivered.

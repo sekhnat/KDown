@@ -20,6 +20,7 @@ use kdown_engine::http::HttpExecution;
 use kdown_engine::job::controller::{
     CancelMode, DownloadRequest, ResultStatus, SingleStreamController,
 };
+use kdown_engine::job::JobState;
 use kdown_engine::metrics::events::Event;
 use kdown_engine::resume::checkpoint::Checkpoint;
 use kdown_engine::resume::checkpoint_store::{
@@ -35,6 +36,19 @@ fn sample(job: &str, end: u64) -> Checkpoint {
     cp.total_size = Some(1000);
     cp.record_completed(0, end);
     cp
+}
+
+async fn wait_for_delete(store: &ScriptedCheckpointStore) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store.ops().iter().any(|operation| operation.is_delete()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkpoint delete reached its synchronization gate");
 }
 
 // ---- Scripted adapter focused tests ----
@@ -594,7 +608,7 @@ async fn resume_refresh_save_failure_preserves_previous_checkpoint() {
     assert!(dir.path().join("out.bin.part").exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_commit_delete_failure_retains_completed_with_warning() {
     let scripted = ScriptedHttp::new()
         .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
@@ -607,6 +621,7 @@ async fn post_commit_delete_failure_retains_completed_with_warning() {
         );
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("delete boom".into()));
+    let delete_gate = store.hold_delete(1);
     let controller = SingleStreamController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
@@ -619,13 +634,27 @@ async fn post_commit_delete_failure_retains_completed_with_warning() {
         dest.clone(),
     ));
     let mut events = handle.events();
+    wait_for_delete(&store).await;
+    let published_before_delete = std::fs::read(&dest);
+    let state_before_delete = handle.state();
+    delete_gate.release();
     let result = tokio::time::timeout(Duration::from_secs(10), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
+    assert_eq!(
+        published_before_delete.expect("published before delete"),
+        b"hello"
+    );
+    assert_eq!(
+        state_before_delete,
+        JobState::Committing,
+        "delete precedes terminal state"
+    );
     // The committed outcome is preserved (§9.2, §14.6 exception).
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_eq!(handle.state(), JobState::Completed);
     assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
     assert!(
         result
@@ -636,15 +665,17 @@ async fn post_commit_delete_failure_retains_completed_with_warning() {
         result.warnings
     );
     // The warning is visible as an event too.
-    let mut saw_warning = false;
+    let mut completion_events = Vec::new();
     while let Some(event) = events.try_next() {
-        if let Event::Warning { detail } = event {
-            if detail.contains("checkpoint cleanup incomplete") {
-                saw_warning = true;
+        match event {
+            Event::Warning { detail } if detail.contains("checkpoint cleanup incomplete") => {
+                completion_events.push("warning");
             }
+            Event::Committed { .. } => completion_events.push("committed"),
+            _ => {}
         }
     }
-    assert!(saw_warning, "warning event published");
+    assert_eq!(completion_events, ["warning", "committed"]);
     scripted.assert_all_consumed();
 }
 
@@ -987,11 +1018,12 @@ async fn segmented_save_failure_converges_workers_to_failed() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segmented_post_commit_delete_failure_retains_completed() {
-    let (scripted, _content) = segmented_script(false);
+    let (scripted, content) = segmented_script(false);
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("seg delete boom".into()));
+    let delete_gate = store.hold_delete(1);
     // 1ns cadence: cadence saves record in-flight progress, so the
     // delete-after-save ordering is observable.
     let config = EngineConfig {
@@ -1005,15 +1037,34 @@ async fn segmented_post_commit_delete_failure_retains_completed() {
     .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("seg.bin");
-    let result = controller
-        .run(DownloadRequest::new(
-            "https://scripted/seg-commit.bin",
-            dest.clone(),
-        ))
+    let (handle, join) = controller.start(DownloadRequest::new(
+        "https://scripted/seg-commit.bin",
+        dest.clone(),
+    ));
+    let mut events = handle.events();
+    wait_for_delete(&store).await;
+    let published_before_delete = std::fs::read(&dest);
+    let state_before_delete = handle.state();
+    delete_gate.release();
+    let result = tokio::time::timeout(Duration::from_secs(10), join)
         .await
+        .expect("no hang")
+        .expect("join")
         .expect("terminal");
+    assert_eq!(
+        published_before_delete
+            .expect("published before delete")
+            .as_slice(),
+        content.as_slice()
+    );
+    assert_eq!(
+        state_before_delete,
+        JobState::Committing,
+        "delete precedes terminal state"
+    );
     // Completed is retained after the irreversible commit (§9.2, §14.6).
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_eq!(handle.state(), JobState::Completed);
     assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
     assert!(
         result
@@ -1023,6 +1074,17 @@ async fn segmented_post_commit_delete_failure_retains_completed() {
         "warning: {:?}",
         result.warnings
     );
+    let mut completion_events = Vec::new();
+    while let Some(event) = events.try_next() {
+        match event {
+            Event::Warning { detail } if detail.contains("checkpoint cleanup incomplete") => {
+                completion_events.push("warning");
+            }
+            Event::Committed { .. } => completion_events.push("committed"),
+            _ => {}
+        }
+    }
+    assert_eq!(completion_events, ["warning", "committed"]);
     // Delete-after-save order: the terminal delete came after every save.
     let ops = store.ops();
     let last_save = ops.iter().rposition(|o| o.is_save()).expect("saves");

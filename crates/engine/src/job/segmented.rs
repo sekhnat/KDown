@@ -22,7 +22,8 @@ use crate::http::{
     BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, RequestSpec,
     TransferIntent, TransferRequest,
 };
-use crate::io::sink::{FileSink, FlushLevel, Sink as _};
+use crate::io::output_session::{OutputSession, OutputWriteHandle};
+use crate::io::sink::FlushLevel;
 use crate::job::controller::{DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
@@ -198,7 +199,7 @@ pub(crate) async fn run_segmented(
     config: &EngineConfig,
     request: &DownloadRequest,
     state: &Arc<StateMachine>,
-    sink: Arc<AsyncMutex<FileSink>>,
+    session: &mut OutputSession,
     store: &Arc<dyn CheckpointStore>,
     identity: &str,
     meta: &ProbeMetadata,
@@ -244,11 +245,28 @@ pub(crate) async fn run_segmented(
     // job (task 5.8).
     let worker_count = job.desired_workers() as usize;
     let mut handles = Vec::with_capacity(worker_count);
+    let mut writers = match session.share_write_handles(worker_count) {
+        Ok(writers) => writers,
+        Err(error) => {
+            let snapshot = counters.fold();
+            return SegmentedOutcome {
+                status: ResultStatus::Failed,
+                error: Some(error.0),
+                network_bytes: snapshot.network_bytes,
+                reused_bytes: snapshot.reused_bytes,
+                total_size,
+                elapsed: started.elapsed(),
+                validators: meta.validators.clone(),
+                warnings,
+                completed_ranges: start_offset_ranges,
+            };
+        }
+    };
     for worker_idx in 0..worker_count {
         let execution = execution.clone();
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
-        let sink = Arc::clone(&sink);
+        let sink = writers.pop().expect("one output handle per worker");
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
             headers: request.headers.clone(),
@@ -300,6 +318,14 @@ pub(crate) async fn run_segmented(
             }
         }
     }
+    drop(writers);
+    let ownership_reclaimed = match session.reclaim_exclusive() {
+        Ok(()) => true,
+        Err(error) => {
+            outcome_error.get_or_insert(error.0);
+            false
+        }
+    };
 
     // Cancelled: report cancelled with the scheduler's completed set.
     // All workers have joined, so terminal cleanup cannot race with saves:
@@ -307,20 +333,25 @@ pub(crate) async fn run_segmented(
     // failures become warnings without rewriting the outcome (§9.2).
     if job.cancel.is_cancelled() {
         let completed = job.completed_ranges().await;
-        let cleanup_warnings = {
-            let mut sink_guard = sink.lock().await;
+        let cleanup_warnings = if ownership_reclaimed {
             crate::job::controller::SingleStreamController::cleanup_cancelled(
                 crate::job::controller::CancelMode::from_u8(
                     cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                 ),
-                &mut sink_guard,
+                session,
                 store.as_ref(),
                 identity,
             )
+        } else {
+            vec![]
         };
         warnings.extend(cleanup_warnings);
         return SegmentedOutcome {
-            status: ResultStatus::Cancelled,
+            status: if ownership_reclaimed {
+                ResultStatus::Cancelled
+            } else {
+                ResultStatus::Failed
+            },
             error: outcome_error.or(Some(DownloadError::Cancelled)),
             network_bytes: counters.fold().network_bytes,
             reused_bytes: counters.fold().reused_bytes,
@@ -421,7 +452,7 @@ async fn worker_loop(
     execution: HttpExecution,
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
-    sink: Arc<AsyncMutex<FileSink>>,
+    sink: OutputWriteHandle,
     store: Arc<dyn CheckpointStore>,
     identity: String,
     req_spec: WorkerRequestSpec,
@@ -622,7 +653,7 @@ async fn transfer_lease(
     classifier: &RetryClassifier,
     job: &Arc<SegmentedJob>,
     lease: &SegmentLease,
-    sink: &Arc<AsyncMutex<FileSink>>,
+    sink: &OutputWriteHandle,
     store: &dyn CheckpointStore,
     identity: &str,
     req_spec: &WorkerRequestSpec,
@@ -711,12 +742,12 @@ async fn transfer_lease(
                 // tokens first: payload bytes only (§18.2).
                 let abs_offset = validated_start + in_range_offset;
                 job.acquire_rate(data.len() as u64).await;
-                {
-                    let mut s = sink.lock().await;
-                    s.write_at(abs_offset, &data)
-                        .map_err(|se| WorkerError::Fatal(se.0))?;
-                    s.flush(FlushLevel::PageCache).ok();
-                }
+                sink.write_at(abs_offset, &data)
+                    .await
+                    .map_err(|se| WorkerError::Fatal(se.0))?;
+                sink.flush(FlushLevel::PageCache)
+                    .await
+                    .map_err(|error| WorkerError::Fatal(error.0))?;
                 if let Some(w) = job.counters_slot() {
                     w.add_network(data.len() as u64);
                     // Unique completed bytes: only newly-acknowledged file

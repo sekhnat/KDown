@@ -23,14 +23,25 @@ fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigurationError
     }
 }
 
-/// Overwrite behavior at final commit (§14.6).
+/// Policy for handling an existing destination at final publication (§14.6).
+///
+/// `FailIfExists` is rejected early when the destination exists and is enforced
+/// again with an atomic no-replace operation at commit; if that operation is
+/// unsupported, publication fails without changing the destination. `Replace`
+/// uses atomic replacement and fails non-destructively if the filesystem cannot
+/// provide it safely.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OverwritePolicy {
+    /// Reject an existing destination before network activity and never
+    /// overwrite an entry created before publication.
     #[default]
     FailIfExists,
+    /// Replace the destination atomically; a failed or unsupported replacement
+    /// leaves the existing destination unchanged.
     Replace,
-    /// Resume the existing partial output if validator identity matches.
+    /// Resume existing partial output only when validator identity matches;
+    /// final publication uses replacement semantics.
     ResumeIfMatching,
 }
 

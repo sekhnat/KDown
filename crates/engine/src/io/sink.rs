@@ -9,6 +9,7 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::DownloadError;
+use crate::io::publish::{self, PublishMode};
 
 /// Where the sink's temporary output lives before commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +72,15 @@ pub trait Sink {
     /// SinkOpen when the file cannot be inspected.
     fn size(&mut self) -> Result<u64, SinkError>;
 
-    /// Complete the temp file; callers perform the final rename via
-    /// [`FileSink::commit`] so overwrite policy is applied at that point.
+    /// Flush and settle the temporary output according to the active durability policy.
+    ///
+    /// This does not publish the file. The engine publishes it only after
+    /// verification, using the selected overwrite policy; the local `FileSink`
+    /// path uses an atomic no-replace operation for `FailIfExists` and safe
+    /// atomic replacement for `Replace`.
     ///
     /// # Errors
-    /// Commit failure.
+    /// SinkWrite if flushing or finalization fails.
     fn finalize(&mut self) -> Result<(), SinkError>;
 
     /// Discard partial state per cleanup policy (§9.4).
@@ -140,6 +145,10 @@ pub struct FileSink {
     /// When set, dropping without commit/finalize keeps the temp file
     /// (KeepPartial semantics and crash-resume preservation, §9.4/§15.1).
     keep_on_drop: bool,
+    #[cfg(test)]
+    fail_next_write: bool,
+    #[cfg(test)]
+    fail_next_flush: bool,
     file: Option<File>,
     /// Bytes written so far (high-water mark) — informational.
     bytes_written: u64,
@@ -181,6 +190,10 @@ impl FileSink {
             temp_path,
             preallocate,
             keep_on_drop: false,
+            #[cfg(test)]
+            fail_next_write: false,
+            #[cfg(test)]
+            fail_next_flush: false,
             file: Some(file),
             bytes_written: 0,
             finalized: false,
@@ -217,28 +230,46 @@ impl FileSink {
         }
     }
 
-    /// Atomically move the temp file to the destination (§14.6 step 4).
+    /// Atomically publish this completed temp file to the destination with replace semantics.
     ///
-    /// Works after [`FileSink::finalize`] (which closes the handle); also
-    /// allowed directly when the caller handles durability itself.
+    /// The old destination is never removed as a fallback: when the platform or
+    /// filesystem cannot safely replace it, this operation fails and preserves
+    /// the old bytes. Engine jobs using `FailIfExists` select atomic no-replace
+    /// semantics instead.
     ///
     /// # Errors
-    /// `Commit` on rename failure; the temp file is preserved.
-    pub fn commit(mut self) -> Result<PathBuf, SinkError> {
+    /// `Commit` on publication failure; the temp file and prior destination are preserved.
+    pub fn commit(self) -> Result<PathBuf, SinkError> {
+        self.commit_with_policy(PublishMode::Replace)
+            .map(|(destination, _warning)| destination)
+    }
+
+    /// Publish according to an explicit filesystem policy.
+    ///
+    /// # Errors
+    /// `Commit` if the requested atomic publication operation fails.
+    pub(crate) fn commit_with_policy(
+        mut self,
+        mode: PublishMode,
+    ) -> Result<(PathBuf, Option<String>), SinkError> {
+        // Close the handle before publication, which is required by Windows.
         self.file = None;
-        self.finalized = true; // consumed below; drop must not clean up
-                               // POSIX rename replaces atomically. Windows cannot rename over an
-                               // existing file while it is open; the platform fallback removes
-                               // the old destination immediately before rename. The CI matrix
-                               // exercises this path (§42 platform coverage).
-        #[cfg(windows)]
-        if self.destination.exists() {
-            std::fs::remove_file(&self.destination)
-                .map_err(|e| SinkError(DownloadError::Commit(e.to_string())))?;
-        }
-        std::fs::rename(&self.temp_path, &self.destination)
-            .map_err(|e| SinkError(DownloadError::Commit(e.to_string())))?;
-        Ok(self.destination.clone())
+        self.finalized = true; // Drop must preserve the temp file on failure.
+        let outcome =
+            publish::publish(&self.temp_path, &self.destination, mode).map_err(|error| {
+                let download_error = if mode == PublishMode::NoReplace
+                    && error.kind() == std::io::ErrorKind::AlreadyExists
+                {
+                    DownloadError::DestinationConflict(format!(
+                        "destination appeared before no-replace publication ({}): {error}",
+                        self.destination.display()
+                    ))
+                } else {
+                    DownloadError::Commit(error.to_string())
+                };
+                SinkError(download_error)
+            })?;
+        Ok((self.destination.clone(), outcome.temp_cleanup_warning))
     }
 
     /// True once `abort` ran.
@@ -252,6 +283,16 @@ impl FileSink {
     pub fn set_keep_on_drop(&mut self, keep: bool) {
         self.keep_on_drop = keep;
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&mut self) {
+        self.fail_next_write = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_flush(&mut self) {
+        self.fail_next_flush = true;
+    }
 }
 
 impl Sink for FileSink {
@@ -263,6 +304,12 @@ impl Sink for FileSink {
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), SinkError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(SinkError(DownloadError::SinkWrite(
+                "injected output-session write failure".into(),
+            )));
+        }
         let Some(file) = self.file.as_mut() else {
             return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
         };
@@ -276,6 +323,12 @@ impl Sink for FileSink {
     }
 
     fn flush(&mut self, level: FlushLevel) -> Result<(), SinkError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_flush) {
+            return Err(SinkError(DownloadError::SinkWrite(
+                "injected output-session flush failure".into(),
+            )));
+        }
         let Some(file) = self.file.as_mut() else {
             return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
         };

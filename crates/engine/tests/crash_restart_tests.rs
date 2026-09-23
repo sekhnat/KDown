@@ -39,6 +39,15 @@ fn controller() -> SingleStreamController {
     )
 }
 
+fn sequential_controller() -> SingleStreamController {
+    let mut cfg = fast_config();
+    cfg.transfer.segmentation_threshold = u64::MAX;
+    SingleStreamController::new(
+        HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+        cfg,
+    )
+}
+
 /// Server: kill after a partial-body write for the first `kill_count`
 /// GETs, then serve whole (honoring Range like a well-behaved origin).
 /// HEAD always full.
@@ -329,4 +338,157 @@ async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
     assert!(!dir.path().join("durable.bin.part").exists());
+}
+
+#[tokio::test]
+async fn real_process_crash_child() {
+    let Ok(url) = std::env::var("KDOWN_REAL_CRASH_URL") else {
+        return;
+    };
+    let destination = std::path::PathBuf::from(
+        std::env::var_os("KDOWN_REAL_CRASH_DESTINATION").expect("destination path"),
+    );
+    let ready = std::env::var_os("KDOWN_REAL_CRASH_READY").expect("ready path");
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let store = FileCheckpointStore::new(parent, DurabilityMode::Performance).expect("store");
+    let identity = job_identity(&url, &destination);
+    let controller = sequential_controller();
+    let (handle, _join) = controller.start(DownloadRequest::new(url, destination.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let checkpoint = store.load(&identity).expect("load child checkpoint");
+        if handle.snapshot().completed_bytes > 0
+            && checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.completed_bytes() > 0)
+        {
+            std::fs::write(&ready, b"checkpointed").expect("signal parent");
+            std::future::pending::<()>().await;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never reached durable checkpoint progress"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn real_process_crash_releases_lock_and_resumes_partial_output() {
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 77_031));
+    let server_content = content.clone();
+    let server = TestServer::new()
+        .serve_handler("/process-crash.bin", move |request| {
+            let total = server_content.len() as u64;
+            let etag = "\"process-crash-v1\"";
+            if request.method == "HEAD" {
+                return ScriptedResponse::ok((*server_content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .with_header("etag", etag);
+            }
+            let (status, body, content_range) = match request.range {
+                Some((start, end)) => {
+                    let end = end.min(total - 1);
+                    let body = server_content[start as usize..=end as usize].to_vec();
+                    (206, body, Some(format!("bytes {start}-{end}/{total}")))
+                }
+                None => (200, (*server_content).clone(), None),
+            };
+            let mut response = ScriptedResponse::new(status)
+                .with_body(body)
+                .with_header("accept-ranges", "bytes")
+                .with_header("etag", etag);
+            if let Some(content_range) = content_range {
+                response = response.with_header("content-range", &content_range);
+            }
+            response.chunked(Duration::from_millis(5))
+        })
+        .start()
+        .await
+        .expect("start server");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let destination = directory.path().join("process-crash.bin");
+    let url = server.url("/process-crash.bin");
+    let ready = directory.path().join("child-ready");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "real_process_crash_child", "--nocapture"])
+        .env("KDOWN_REAL_CRASH_URL", &url)
+        .env("KDOWN_REAL_CRASH_DESTINATION", &destination)
+        .env("KDOWN_REAL_CRASH_READY", &ready)
+        .spawn()
+        .expect("spawn download child process");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().expect("poll download child") {
+            panic!("download child exited before checkpointing: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("download child did not persist partial checkpoint state");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child.kill().expect("kill download process");
+    let _ = child.wait().expect("reap download process");
+
+    let identity = job_identity(&url, &destination);
+    let store = FileCheckpointStore::new(directory.path(), DurabilityMode::Performance)
+        .expect("checkpoint store");
+    let checkpoint = store
+        .load(&identity)
+        .expect("load checkpoint after process death")
+        .expect("partial checkpoint survives process death");
+    assert_eq!(
+        checkpoint.format_version,
+        kdown_engine::resume::CHECKPOINT_FORMAT_VERSION
+    );
+    assert!(checkpoint.completed_bytes() > 0);
+    assert!(checkpoint.completed_bytes() < content.len() as u64);
+    let part = directory.path().join("process-crash.bin.part");
+    let partial = std::fs::read(&part).expect("partial output survives process death");
+    assert_eq!(
+        &partial[..checkpoint.completed_bytes() as usize],
+        &content[..checkpoint.completed_bytes() as usize],
+        "checkpointed bytes agree with the partial file"
+    );
+    let lockfile_present = std::fs::read_dir(directory.path())
+        .expect("read directory")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".kdown-destination-") && name.ends_with(".lock")
+        });
+    assert!(
+        lockfile_present,
+        "crash leaves the persistent lockfile in place"
+    );
+
+    let controller = sequential_controller();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        controller.run(DownloadRequest::new(url, destination.clone())),
+    )
+    .await
+    .expect("resume completes without hanging")
+    .expect("terminal result");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert!(result.bytes_reused_from_checkpoint > 0, "{result:?}");
+    assert_bytes_exact(
+        &std::fs::read(&destination).expect("final output"),
+        &content,
+    );
+    assert!(
+        !part.exists(),
+        "successful resume consumes the partial output"
+    );
+    assert!(
+        lockfile_present,
+        "the unlocked lockfile remains reusable after resume"
+    );
 }
