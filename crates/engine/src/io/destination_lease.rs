@@ -135,7 +135,7 @@ impl DestinationLease {
         if let Err(error) = lock_file.try_lock_exclusive() {
             drop(lock_file);
             release_registration(&key);
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if error.kind() == fs2::lock_contended_error().kind() {
                 return Err(DownloadError::DestinationConflict(format!(
                     "destination is already owned by another process: {}",
                     key.describe()
@@ -277,10 +277,11 @@ mod tests {
         let release = directory.path().join("release");
         let mut child = spawn_lease_child(&destination, &ready, &release);
         wait_for_child_ready(&mut child, &ready);
-        assert!(matches!(
-            DestinationLease::acquire(&destination),
-            Err(DownloadError::DestinationConflict(_))
-        ));
+        let contention = DestinationLease::acquire(&destination);
+        assert!(
+            matches!(&contention, Err(DownloadError::DestinationConflict(_))),
+            "expected destination conflict while child owns lock, got {contention:?}"
+        );
         std::fs::write(&release, b"release").expect("release child");
         assert!(child.wait().expect("wait for clean child exit").success());
         let lock_path = DestinationKey::resolve(&destination)
@@ -295,10 +296,11 @@ mod tests {
         let release = directory.path().join("unused-release");
         let mut child = spawn_lease_child(&destination, &ready, &release);
         wait_for_child_ready(&mut child, &ready);
-        assert!(matches!(
-            DestinationLease::acquire(&destination),
-            Err(DownloadError::DestinationConflict(_))
-        ));
+        let contention = DestinationLease::acquire(&destination);
+        assert!(
+            matches!(&contention, Err(DownloadError::DestinationConflict(_))),
+            "expected destination conflict while child owns lock, got {contention:?}"
+        );
         child.kill().expect("kill lock owner");
         let _ = child.wait().expect("reap killed child");
         let _lease =
