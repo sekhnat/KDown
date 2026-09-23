@@ -8,8 +8,10 @@
 //!
 //! `criterion` provides the timing loop for the small end (throughput
 //! stability) and the harness also emits a §37.3 record per scenario run.
-//! Baselines land in `benches/results/baseline.md` (§37.4 thresholds are
-//! enforced from this record in CI).
+//! Local regression checks compare `benches/results/baseline.md` using
+//! `scripts/bench_check.sh` on matching hardware.
+//! GitHub-hosted runners execute these scenarios smoke-only because their hardware
+//! and load are not comparable to the recorded same-host baseline.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
-# §37.4 regression thresholds: compare current bench throughput against the
-# baseline recorded in crates/engine/benches/results/baseline.md.
-# Advisory: exits 1 when a threshold trips so CI can surface it.
+# Default mode compares against the recorded same-host baseline. --smoke executes
+# the benchmark scenarios without comparing shared CI hardware to that local baseline.
 set -euo pipefail
 
-BASELINE="crates/engine/benches/results/baseline.md"
-: "${BASELINE:?baseline missing}"
-
-# Extract baseline throughput medians (the "~X" column) per scenario.
-base_h1_w4=$(grep -oP 'h1/workers_4 \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
-base_h2_w4=$(grep -oP 'h2/workers_4 \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
-base_prealloc=$(grep -oP 'prealloc_true \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
+mode="${1:-check}"
+if [[ "$mode" != "check" && "$mode" != "--smoke" ]]; then
+  echo "usage: $0 [--smoke]" >&2
+  exit 2
+fi
 
 # Run the same scenarios with a tight budget.
 out=$(cargo bench --bench throughput -- --warm-up-time 0.5 --measurement-time 1.5 2>&1)
 echo "$out"
+
+if [[ "$mode" == "--smoke" ]]; then
+  echo "Smoke-only: throughput comparisons require matching host hardware."
+  exit 0
+fi
+
+BASELINE="crates/engine/benches/results/baseline.md"
+[[ -f "$BASELINE" ]] || { echo "baseline missing: $BASELINE" >&2; exit 2; }
+
+# Extract baseline throughput medians (the '~X' column) per scenario.
+base_h1_w4=$(grep -oP 'h1/workers_4 \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
+base_h2_w4=$(grep -oP 'h2/workers_4 \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
+base_prealloc=$(grep -oP 'prealloc_true \| ~\K[0-9.]+(?= GiB/s)' "$BASELINE")
 
 fail=0
 check() { # name got base

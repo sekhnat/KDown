@@ -40,19 +40,11 @@ Notes:
   1 Gbit/s-class rates the measured CPU% stays single-digit per §22.2
   (see CI bench logs for the recorded per-run values).
 
-## Regression thresholds (§37.4, enforced in CI as advisory failures)
+## Local regression thresholds (§37.4)
 
-CI (`ci.yml` `bench-check` job, nightly/manual) flags:
+The values below come from the AMD Ryzen 7 9700X workstation and are only comparable on matching hardware and environment. Run `./scripts/bench_check.sh` there; it checks for more than 10% throughput loss on the enforced scenarios. Repeat measurements when a result is near the threshold.
 
-1. >10% throughput loss on any scenario vs. this baseline.
-2. >15% CPU increase at equal throughput.
-3. Major memory increase: peak RSS growth >64 MiB vs. baseline.
-4. Retry amplification: `retransferred_bytes` > 0 on clean runs.
-
-Thresholds are tuned for benchmark noise (§37.4): the 10% band matches
-observed run-to-run variance on this host (single-worker scenarios vary
-more; the enforced scenarios are the 4-worker ones, whose ±3% band is
-stable).
+GitHub-hosted runners are variable shared VMs and can report different throughput units (for example, MiB/s instead of GiB/s). The `bench-check` CI job executes the benchmark scenarios but does not compare their absolute throughput to this workstation baseline. CI output is informational; use a same-host run for performance conclusions.
 
 ## How to regenerate
 
@@ -60,5 +52,4 @@ stable).
 cargo bench --bench throughput -- --warm-up-time 0.5 --measurement-time 1.5
 ```
 
-Update this file with the new table; CI compares against the table
-values via `scripts/bench_check.sh` (see §37.4 job).
+Update this file only from a controlled same-host baseline run. `./scripts/bench_check.sh` compares locally against this record; CI's `bench-check` job runs the scenarios without a cross-host comparison.
