@@ -16,7 +16,7 @@
 
 - [x] 3.1 Introduce a filesystem publication operation with atomic no-replace and safe replace variants on each supported OS, and remove the Windows delete-before-rename fallback; verify adapter tests cover success, existing/dangling destination entries, unsupported operations, and failed replacement preserving the old bytes.
 - [x] 3.2 Thread overwrite policy into final publication while retaining the early `FailIfExists` shortcut; verify a gate-driven test creates the destination immediately before publication and observes a structured conflict, unchanged destination, and no committed event.
-- [ ] 3.3 Exercise `Replace` and `FailIfExists` against real files on Linux, macOS, and Windows; verify successful replacement is atomic to observers and failed/unsupported publication neither deletes the previous destination nor returns `Completed`.
+- [x] 3.3 Exercise `Replace` and `FailIfExists` against real files on Linux, macOS, and Windows; verify successful replacement is atomic to observers and failed/unsupported publication neither deletes the previous destination nor returns `Completed`.
 
 ## 4. One Temporary-Output Owner
 
