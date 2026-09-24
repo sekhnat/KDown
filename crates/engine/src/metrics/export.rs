@@ -171,6 +171,8 @@ mod tests {
         m.job_started();
         m.retry(ErrorCategory::Connection);
         m.record_result(&DownloadResult {
+            segment_requests: 0,
+            live_splits: 0,
             status: ResultStatus::Failed,
             final_path: None,
             bytes_downloaded_from_network: 42,

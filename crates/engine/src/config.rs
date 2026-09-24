@@ -103,6 +103,13 @@ pub enum SegmentSizing {
     /// setup included in the measured service time). Allocations are
     /// clamped to the segment bounds, bounded to a 2× step change, and
     /// seeded from `initial_segment_size` until samples stabilize.
+    ///
+    /// Recorded tuning guidance (task 3.5 sweep,
+    /// `benches/results/report-duration-sweep.md`): `duration_ms = 1000`
+    /// with `auto_oversubscription = 3` (the ready-work factor) was at or
+    /// above the explicit/automatic baselines on every non-network-bound
+    /// axis with amplification ≤ 1.021 and zero retries. Opt-in only; the
+    /// `Explicit` default is unchanged.
     Duration { duration_ms: u64 },
 }
 

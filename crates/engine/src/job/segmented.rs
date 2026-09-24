@@ -91,6 +91,8 @@ pub struct SegmentedJob {
     /// Live-tail split events observed by this job (task 0.4 observability):
     /// every successful `split_tail` increments this counter.
     splits: AtomicU64,
+    /// Range requests issued by any worker (task 3.5 diagnostic).
+    segment_requests: AtomicU64,
     /// Per-worker provisioning state keyed by the stable worker index
     /// (task 1.2): `0` = not provisioned, `1` = parked/idle (no lease),
     /// `2` = actively holding a lease. Written only by the owning worker;
@@ -304,6 +306,16 @@ impl SegmentedJob {
             .unwrap_or(0)
     }
 
+    /// Range requests issued so far (task 3.5 diagnostic).
+    pub fn segment_requests(&self) -> u64 {
+        self.segment_requests.load(Ordering::Relaxed)
+    }
+
+    /// Live-tail splits performed so far (task 3.5 diagnostic).
+    pub fn live_splits(&self) -> u64 {
+        self.splits.load(Ordering::Relaxed)
+    }
+
     /// Set the desired worker count at runtime (task 5.8: handle API).
     /// Excess workers settle their leases and exit on the next loop.
     pub fn set_desired_workers(&self, n: u64) {
@@ -514,6 +526,10 @@ pub struct SegmentedOutcome {
     pub wasted_bytes: u64,
     /// Retry attempts charged (real counter, task 1.1).
     pub retries: u64,
+    /// Range requests issued (task 3.5 diagnostic).
+    pub segment_requests: u64,
+    /// Live-tail splits performed (task 3.5 diagnostic).
+    pub live_splits: u64,
     pub total_size: u64,
     pub elapsed: Duration,
     pub validators: crate::http::validators::ResourceValidators,
@@ -614,6 +630,8 @@ pub(crate) async fn run_segmented(
                 completed_bytes: snapshot.completed_bytes,
                 wasted_bytes: snapshot.wasted_bytes,
                 retries: snapshot.retries,
+                segment_requests: 0,
+                live_splits: 0,
                 total_size,
                 elapsed: started.elapsed(),
                 validators: meta.validators.clone(),
@@ -646,6 +664,7 @@ pub(crate) async fn run_segmented(
         throttle_events: AtomicU64::new(0),
         write_latency_us: AtomicU64::new(0),
         splits: AtomicU64::new(0),
+        segment_requests: AtomicU64::new(0),
         last_checkpoint_save_us: AtomicU64::new(0),
         worker_states: (0..config.transfer.max_workers.max(1) as usize)
             .map(|_| AtomicU8::new(0))
@@ -701,6 +720,8 @@ pub(crate) async fn run_segmented(
                 completed_bytes: snapshot.completed_bytes,
                 wasted_bytes: snapshot.wasted_bytes,
                 retries: snapshot.retries,
+                segment_requests: job.segment_requests(),
+                live_splits: job.live_splits(),
                 total_size,
                 elapsed: started.elapsed(),
                 validators: meta.validators.clone(),
@@ -886,6 +907,8 @@ pub(crate) async fn run_segmented(
             completed_bytes: snap.completed_bytes,
             wasted_bytes: snap.wasted_bytes,
             retries: snap.retries,
+            segment_requests: job.segment_requests(),
+            live_splits: job.live_splits(),
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -910,6 +933,8 @@ pub(crate) async fn run_segmented(
             completed_bytes: snap.completed_bytes,
             wasted_bytes: snap.wasted_bytes,
             retries: snap.retries,
+            segment_requests: job.segment_requests(),
+            live_splits: job.live_splits(),
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -930,6 +955,8 @@ pub(crate) async fn run_segmented(
             completed_bytes: snap.completed_bytes,
             wasted_bytes: snap.wasted_bytes,
             retries: snap.retries,
+            segment_requests: job.segment_requests(),
+            live_splits: job.live_splits(),
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -945,6 +972,8 @@ pub(crate) async fn run_segmented(
         completed_bytes: snap.completed_bytes,
         wasted_bytes: snap.wasted_bytes,
         retries: snap.retries,
+        segment_requests: job.segment_requests(),
+        live_splits: job.live_splits(),
         total_size,
         elapsed: started.elapsed(),
         validators: job.validators.clone(),
@@ -1444,6 +1473,9 @@ async fn transfer_lease(
         break;
     }
 
+    // Range-request diagnostic (task 3.5): one counter per issued request
+    // (attempts included; retries are visible separately).
+    job.segment_requests.fetch_add(1, Ordering::Relaxed);
     // Resume offset for tail retries (§17.3): the worker's own progress
     // cell holds the durable-through offset — read it lock-free (§13.3).
     // Fall back to the lease's scheduler-side next_offset when the cell is
@@ -2463,6 +2495,7 @@ mod durability_tests {
             throttle_events: AtomicU64::new(0),
             write_latency_us: AtomicU64::new(0),
             splits: AtomicU64::new(0),
+            segment_requests: AtomicU64::new(0),
             last_checkpoint_save_us: AtomicU64::new(0),
             worker_states: vec![AtomicU8::new(0)],
             worker_lane_live: vec![AtomicBool::new(false)],

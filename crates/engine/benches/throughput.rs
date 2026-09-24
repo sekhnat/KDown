@@ -1030,6 +1030,12 @@ fn main() {
         run_write_path_compare();
         return;
     }
+    // Task 3.5: duration-sizing + ready-work sweep on H1/H2 WAN-shaped
+    // fixtures against the explicit/automatic baselines.
+    if args.iter().any(|a| a == "--duration-sweep") {
+        run_duration_sweep();
+        return;
+    }
     // Target-sizing sweep (task 6.3): explicit initial sizes × automatic
     // oversubscription factors × H1/H2, recording useful goodput and
     // request/retry overhead to benches/results/sweep/records.md.
@@ -1373,17 +1379,73 @@ fn run_sweep() {
                     workers,
                     Some(target_mib * mib),
                     0,
+                    None,
+                    0,
+                    false,
                 ),
             ));
         }
         for &factor in &[2u64, 3, 4] {
             records.push((
                 format!("sweep/{protocol}/auto-x{factor}"),
-                sweep_run(&rt, protocol, fixture_size, workers, None, factor),
+                sweep_run(
+                    &rt,
+                    protocol,
+                    fixture_size,
+                    workers,
+                    None,
+                    factor,
+                    None,
+                    0,
+                    false,
+                ),
             ));
         }
     }
     emit_report("sweep", &records);
+}
+
+/// Duration-sizing sweep (task 3.5): target durations 0.5/1/1.5 s ×
+/// ready-work factors 2/3/4 on H1/H2 over {unshaped, shaped} in-process
+/// fixtures, against the explicit-8MiB and automatic baselines. Records
+/// segment/split counts, wire amplification, goodput and wall time.
+fn run_duration_sweep() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let reps = 2;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for shaped in [false, true] {
+            let shape_label = if shaped { "shaped" } else { "unshaped" };
+            let size = if shaped { 64 * mib } else { 256 * mib };
+            // Reference baselines: explicit 8 MiB and automatic x3.
+            records.push((
+                format!("duration-sweep/{protocol}/{shape_label}/explicit-8MiB"),
+                sweep_run(&rt, protocol, size, 4, Some(8 * mib), 0, None, 0, shaped),
+            ));
+            records.push((
+                format!("duration-sweep/{protocol}/{shape_label}/auto-x3"),
+                sweep_run(&rt, protocol, size, 4, None, 3, None, 0, shaped),
+            ));
+            for duration_ms in [500u64, 1_000, 1_500] {
+                for ready in [2u64, 3, 4] {
+                    for rep in 0..reps {
+                        records.push((
+                            format!(
+                                "duration-sweep/{protocol}/{shape_label}/dur{duration_ms}ms-ready{ready}/rep{rep}"
+                            ),
+                            sweep_run(&rt, protocol, size, 4, None, 0, Some(duration_ms), ready, shaped),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    emit_report("duration-sweep", &records);
 }
 
 /// Fixed vs opt-in adaptive concurrency (task 9.4): one measured run per
@@ -1619,6 +1681,9 @@ fn sweep_run(
     workers: u32,
     explicit_target_bytes: Option<u64>,
     oversubscription: u64,
+    duration_ms: Option<u64>,
+    ready_factor: u64,
+    shaped: bool,
 ) -> ResourceRecord {
     rt.block_on(async {
         let content = synthetic_fixture(size);
@@ -1627,7 +1692,13 @@ fn sweep_run(
         cfg.transfer.segmentation_threshold = 1;
         cfg.transfer.max_workers = workers;
         cfg.transfer.min_workers = workers.min(2);
-        if let Some(target) = explicit_target_bytes {
+        if let Some(duration_ms) = duration_ms {
+            cfg.transfer.segment_sizing =
+                kdown_engine::config::SegmentSizing::Duration { duration_ms };
+            // The ready-work divisor is auto_oversubscription x desired
+            // (task 3.3); the sweep axis varies the factor directly.
+            cfg.transfer.auto_oversubscription = ready_factor.max(1);
+        } else if let Some(target) = explicit_target_bytes {
             cfg.transfer.segment_sizing = kdown_engine::config::SegmentSizing::Explicit;
             cfg.transfer.initial_segment_size =
                 target.clamp(cfg.transfer.min_segment_size, cfg.transfer.max_segment_size);
@@ -1637,11 +1708,18 @@ fn sweep_run(
         }
         cfg.network.response_header_timeout = Duration::from_secs(30);
         cfg.network.read_idle_timeout = Duration::from_secs(30);
+        // WAN shape (task 3.5): per-connection pacing (~16 MiB/s) on the
+        // in-process fixture, matching the phase-1 shaped axis.
+        let pacing = if shaped {
+            Some(Duration::from_micros(4_000))
+        } else {
+            None
+        };
         let (url, _ca) = if protocol == "h1" {
-            let addr = start_h1_server(content.clone()).await;
+            let addr = start_h1_server_paced(content.clone(), pacing).await;
             (format!("http://{addr}/f.bin"), None)
         } else {
-            let (addr, ca_pem) = start_h2_tls_server(content.clone()).await;
+            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing).await;
             let dir = tempfile::tempdir().expect("ca tmpdir");
             let ca_path = dir.path().join("ca.pem");
             std::fs::write(&ca_path, &ca_pem).expect("write ca");
