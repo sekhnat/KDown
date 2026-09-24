@@ -1661,6 +1661,7 @@ async fn consume_legacy_body(
                 // the owned prefix is written and the remainder is split
                 // waste, so the overlap is bounded regardless of chunk size.
                 let abs_offset = validated_start + in_range_offset;
+                let original_len = data.len() as u64;
                 // inclusive end: abs_offset == effective_end is still owned.
                 let owned_len = if abs_offset > effective_end {
                     0
@@ -1688,6 +1689,7 @@ async fn consume_legacy_body(
                 // the worker publishes progress or completed counters (one
                 // outstanding payload per worker, task 2.3); no per-chunk
                 // flush.
+                let chunk_was_truncated = owned_len < original_len;
                 let owned = data.split_to(owned_len as usize);
                 job.acquire_rate(owned.len() as u64).await;
                 let write_started = Instant::now();
@@ -1700,15 +1702,12 @@ async fn consume_legacy_body(
                     Ordering::Relaxed,
                 );
                 in_range_offset += owned.len() as u64;
-                if owned_len < data.len() as u64 {
-                    // The chunk was truncated at the boundary: this worker
-                    // is done with the lease.
-                    break;
-                }
 
                 // Hot-path progress (§13.3, task 6.3): publish the
                 // acknowledged written-through offset as one coherent record
-                // (task 3.2) — no scheduler lock on the chunk path.
+                // (task 3.2) — no scheduler lock on the chunk path. The
+                // publication happens BEFORE the boundary break so the owned
+                // prefix of a truncated chunk is published and credited.
                 let durable_through = validated_start + in_range_offset;
                 job.worker_progress[worker_idx].publish(LeaseRecord {
                     lease_id: lease.id,
@@ -1717,6 +1716,11 @@ async fn consume_legacy_body(
                     written_through: durable_through,
                     received_through: durable_through,
                 });
+                if chunk_was_truncated {
+                    // The chunk was truncated at the inclusive lease end:
+                    // this worker is done with the lease.
+                    break;
+                }
             }
             Ok(BodyEvent::End) => break, // clean EOF
             Ok(BodyEvent::Paused) => {
@@ -1998,23 +2002,34 @@ async fn consume_pipelined_body(
             }
         };
         match event {
-            Ok(BodyEvent::Data(data)) => {
-                // Live-tail split boundary (task 3.2): stop consuming at the
-                // shrunken lease end — the response tail beyond it belongs
-                // to the split lease and is discarded as split waste.
-                if validated_start + in_range_offset > effective_end {
-                    // The lease end is INCLUSIVE: the byte at effective_end
-                    // still belongs to this worker; the stop boundary is
-                    // exclusive (beyond it).
-                    let wasted = validated_end.saturating_sub(effective_end);
-                    if wasted > 0 {
-                        if let Some(w) = job.counters.worker(worker_idx) {
-                            w.add_wasted(wasted);
-                        }
+            Ok(BodyEvent::Data(mut data)) => {
+                // Live-tail split boundary (task 3.2/3.6): stop consuming at
+                // the shrunken lease end — the response tail beyond it
+                // belongs to the split lease. The lease end is INCLUSIVE
+                // (the byte at effective_end is still owned), so a chunk
+                // that SPANS the boundary is truncated: the owned prefix is
+                // submitted and the remainder is split waste. This bounds
+                // overlap regardless of chunk size (a server delivering a
+                // whole body as one frame cannot overshoot the shrunken
+                // lease).
+                let abs_offset = validated_start + in_range_offset;
+                let chunk_len = data.len() as u64;
+                let owned_len = if abs_offset > effective_end {
+                    0
+                } else {
+                    (effective_end + 1 - abs_offset).min(chunk_len)
+                };
+                let wasted = chunk_len - owned_len;
+                if wasted > 0 {
+                    if let Some(w) = job.counters.worker(worker_idx) {
+                        w.add_wasted(wasted);
                     }
-                    // Settle outstanding writes, then complete at the
-                    // shrunk boundary (the drain keeps publications
-                    // coherent; the final check uses the shrunken end).
+                }
+                if owned_len == 0 {
+                    // Fully past the boundary: settle outstanding writes,
+                    // then complete at the shrunk boundary (the drain keeps
+                    // publications coherent; the final check uses the
+                    // shrunken end).
                     drop(reservation.take());
                     drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions)
                         .await?;
@@ -2027,12 +2042,14 @@ async fn consume_pipelined_body(
                 }
                 // Wire bytes count at RECEIPT (task 5.4, design D4): even if
                 // a later write fails, the payload crossed the network and
-                // must show in wire throughput.
+                // must show in wire throughput. The full received chunk is
+                // counted (the truncated remainder was received too).
                 if let Some(w) = job.counters.worker(worker_idx) {
-                    w.add_network(data.len() as u64);
+                    w.add_network(chunk_len);
                 }
-                let chunk_len = data.len() as u64;
-                let abs_offset = validated_start + in_range_offset;
+                let spanned_boundary = owned_len < chunk_len;
+                let data = data.split_to(owned_len as usize);
+                let chunk_len = owned_len;
                 // Rate tokens first: payload bytes only (§18.2).
                 job.acquire_rate(chunk_len).await;
                 let mut frame = reservation.take().expect("pre-read reservation held");
@@ -2066,6 +2083,19 @@ async fn consume_pipelined_body(
                     .reservations
                     .insert((lease.id, abs_offset), (frame, std::time::Instant::now()));
                 in_range_offset += chunk_len;
+                if spanned_boundary {
+                    // The chunk was truncated at the inclusive lease end:
+                    // this worker is done with the lease.
+                    drop(reservation.take());
+                    drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions)
+                        .await?;
+                    if frontier.acknowledged_through() != effective_end + 1 {
+                        return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                            "write pipeline settled below the validated range".into(),
+                        )));
+                    }
+                    break;
+                }
             }
             Ok(BodyEvent::End) => {
                 // Unused pre-read reservation: release it (no chunk came).

@@ -216,10 +216,24 @@ where
 /// one H2 connection (no additional sockets, streams validated as usual).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_tail_split_h2_never_doubles_wire_payload() {
+    run_h2_split_case(4243, false, "h2").await;
+}
+
+/// Task 3.6/4.1 follow-up: the same H2 fixture over the pipelined write
+/// path — a chunk that spans the split-shrunk lease boundary is truncated
+/// (owned prefix written, remainder counted as split waste) instead of
+/// failing the lease with "settled below the validated range".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_tail_split_h2_pipelined_never_doubles_wire_payload() {
+    run_h2_split_case(4245, true, "h2+pipelined").await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_h2_split_case(seed: u64, pipeline: bool, label: &str) {
     use tokio_rustls::rustls;
 
     let len = 8 * 1024 * 1024;
-    let content = deterministic_bytes(len, 4243);
+    let content = deterministic_bytes(len, seed);
     // H2 TLS server with the same delayed range handler.
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
@@ -309,7 +323,10 @@ async fn live_tail_split_h2_never_doubles_wire_payload() {
                                 let counted = CountingBody {
                                     inner: SlowBody::new(
                                         hyper::body::Bytes::from(body),
-                                        64 * 1024,
+                                        // A chunk size that does not divide
+                                        // the range evenly, so chunks can
+                                        // genuinely span a split boundary.
+                                        40 * 1024,
                                         Duration::from_millis(2),
                                     ),
                                     counter: counter.clone(),
@@ -337,6 +354,10 @@ async fn live_tail_split_h2_never_doubles_wire_payload() {
     let mut config = cfg(len);
     config.tls.custom_ca_bundle = Some(ca_path);
     config.h2_policy = H2ConnectionPolicy::Single;
+    if pipeline {
+        config.write_executor.pipeline_writes = true;
+        config.write_executor.writer_threads = 2;
+    }
     let c = SingleStreamController::new(
         HttpTransport::from_config(&config).expect("transport"),
         config,
@@ -356,15 +377,15 @@ async fn live_tail_split_h2_never_doubles_wire_payload() {
     assert!(emitted_bytes >= len, "server served at least the payload");
     let amplification = emitted_bytes as f64 / len as f64;
     eprintln!(
-        "[wire-amplification][h2] emitted={emitted_bytes} accepted={len} amplification={amplification:.3}x"
+        "[wire-amplification][{label}] emitted={emitted_bytes} accepted={len} amplification={amplification:.3}x"
     );
     assert!(
         amplification < 1.10,
-        "clean H2 split amplification {amplification:.3}x exceeded 1.10"
+        "clean {label} split amplification {amplification:.3}x exceeded 1.10"
     );
     assert!(
         amplification < 2.0,
-        "H2 amplification {amplification:.3}x reached the unconditional 2x bound"
+        "{label} amplification {amplification:.3}x reached the unconditional 2x bound"
     );
 }
 
