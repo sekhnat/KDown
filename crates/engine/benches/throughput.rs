@@ -1018,10 +1018,31 @@ fn main() {
         run_matrix(MatrixMode::Manual);
         return;
     }
+    // Phase-4 gate (task 4.4): focused storage-axis comparison with many
+    // repetitions (the full matrix on a rotational disk is noisy), H1/H2
+    // unshaped, fixed-4 vs adaptive-1-4:
+    //   throughput --storage-compare [--dest-dir /mnt/HDD/kdown-bench]
+    if args.iter().any(|a| a == "--storage-compare") {
+        let dest_root = args
+            .iter()
+            .position(|a| a == "--dest-dir")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
+        run_storage_compare(dest_root);
+        return;
+    }
     // Fixed vs opt-in adaptive comparison (task 9.4): shaped and
-    // unconstrained server cases on H1/H2.
+    // unconstrained server cases on H1/H2. Phase-4 gate (task 4.4) adds
+    // repetitions and an optional destination root so the storage axis can
+    // be a real constrained device:
+    //   throughput --adaptive-compare [--dest-dir /mnt/HDD/kdown-bench]
     if args.iter().any(|a| a == "--adaptive-compare") {
-        run_adaptive_compare();
+        let dest_root = args
+            .iter()
+            .position(|a| a == "--dest-dir")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
+        run_adaptive_compare(dest_root);
         return;
     }
     // Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
@@ -1474,7 +1495,7 @@ fn run_write_path_compare() {
                 for rep in 0..reps {
                     records.push((
                         format!("write-path/{protocol}/{shape_label}/{path_label}/rep{rep}"),
-                        compare_run(&rt, protocol, size, shaped, false, pipeline),
+                        compare_run(&rt, protocol, size, shaped, false, pipeline, None, rep),
                     ));
                 }
             }
@@ -1483,26 +1504,75 @@ fn run_write_path_compare() {
     emit_report("write-path-compare", &records);
 }
 
-fn run_adaptive_compare() {
+/// Focused storage-axis comparison (task 4.4): unshaped H1/H2 with many
+/// repetitions so a constrained destination (rotational disk) yields a
+/// distribution instead of one noisy pass.
+fn run_storage_compare(dest_root: Option<std::path::PathBuf>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .enable_all()
         .build()
         .expect("runtime");
     let mib = 1024u64 * 1024;
-    let size = 256 * mib;
+    let size = 128 * mib;
+    let reps = 8;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for (mode_label, adaptive) in [("fixed-4", false), ("adaptive-1-4", true)] {
+            for rep in 0..reps {
+                records.push((
+                    format!("storage/{protocol}/unshaped/{mode_label}/rep{rep}"),
+                    compare_run(
+                        &rt,
+                        protocol,
+                        size,
+                        false,
+                        adaptive,
+                        false,
+                        dest_root.as_deref(),
+                        rep,
+                    ),
+                ));
+            }
+        }
+    }
+    emit_report("storage-compare", &records);
+}
+
+/// Fixed vs opt-in adaptive (v2) comparison with repetitions (task 4.4):
+/// H1/H2 x shaped/unshaped x fixed-4/adaptive-1-4, optionally on a
+/// constrained destination root so the storage axis is a real device.
+fn run_adaptive_compare(dest_root: Option<std::path::PathBuf>) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let reps = 3;
     let mut records: Vec<(String, ResourceRecord)> = Vec::new();
     for protocol in ["h1", "h2"] {
         for shaped in [false, true] {
             let shape_label = if shaped { "shaped" } else { "unshaped" };
-            records.push((
-                format!("compare/{protocol}/{shape_label}/fixed-4"),
-                compare_run(&rt, protocol, size, shaped, false, false),
-            ));
-            records.push((
-                format!("compare/{protocol}/{shape_label}/adaptive-1-4"),
-                compare_run(&rt, protocol, size, shaped, true, false),
-            ));
+            // Shaped runs are paced; use a smaller fixture there.
+            let size = if shaped { 128 * mib } else { 256 * mib };
+            for (mode_label, adaptive) in [("fixed-4", false), ("adaptive-1-4", true)] {
+                for rep in 0..reps {
+                    records.push((
+                        format!("compare/{protocol}/{shape_label}/{mode_label}/rep{rep}"),
+                        compare_run(
+                            &rt,
+                            protocol,
+                            size,
+                            shaped,
+                            adaptive,
+                            false,
+                            dest_root.as_deref(),
+                            rep,
+                        ),
+                    ));
+                }
+            }
         }
     }
     emit_report("adaptive-compare", &records);
@@ -1517,6 +1587,8 @@ fn compare_run(
     shaped: bool,
     adaptive: bool,
     pipeline: bool,
+    dest_root: Option<&std::path::Path>,
+    rep: usize,
 ) -> ResourceRecord {
     let threads_before = process_thread_count();
     let record = rt.block_on(async {
@@ -1555,9 +1627,27 @@ fn compare_run(
                 Some(dir),
             )
         };
-        let dir = tempfile::tempdir().expect("dest tmpdir");
+        // Destination: a fresh tempdir, or a wiped unique subdirectory of the
+        // configured root (constrained-storage axis).
+        let owned_dir = dest_root
+            .is_none()
+            .then(|| tempfile::tempdir().expect("dest tmpdir"));
+        let dir_path = match (dest_root, &owned_dir) {
+            (Some(root), _) => {
+                let path = root.join(format!(
+                    "kdown-{protocol}-{}-{}-{rep}",
+                    if shaped { "shaped" } else { "unshaped" },
+                    if adaptive { "adaptive" } else { "fixed" }
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("dest dir");
+                path
+            }
+            (None, Some(temp)) => temp.path().to_path_buf(),
+            (None, None) => unreachable!("tempdir or root"),
+        };
         let (result, record) =
-            measure_download("compare", &cfg, url, dir.path(), size, &expected_hash, None).await;
+            measure_download("compare", &cfg, url, &dir_path, size, &expected_hash, None).await;
         assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
