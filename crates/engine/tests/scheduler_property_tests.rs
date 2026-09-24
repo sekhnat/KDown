@@ -137,6 +137,168 @@ proptest! {
         prop_assert_eq!(rs, vec![(0u64, total - 1)] as Vec<ByteRange>, "exact single coverage");
     }
 
+    /// Resumed intervals (task 3.1): any completed prefix admitted at
+    /// initialization leaves a scheduler whose union of completed, active
+    /// remainders and pending is exactly the target domain, and draining it
+    /// completes every remaining byte exactly once.
+    #[test]
+    fn resumed_intervals_complete_exactly(
+        total in 2u64..2_000,
+        prefix in 0u64..2_000,
+        ops in proptest::collection::vec(0u8..4, 5..120),
+    ) {
+        let prefix_end = prefix.min(total - 1); // inclusive end of resumed coverage
+        let mut s = SegmentScheduler::initialize(
+            total,
+            &[(0, prefix_end)],
+            SchedulerPolicy::new(1, total / 3 + 1),
+        );
+        prop_assert!(s.invariants_hold());
+        // The union of pending + active remainders + completed is exactly
+        // the domain — no gaps, no overlaps (task 3.1 normalized union).
+        prop_assert_eq!(
+            s.completed_set().len() + s.pending_bytes() + s.active_bytes(),
+            total
+        );
+        for op in ops {
+            let act = s.active_leases();
+            match op {
+                0 => {
+                    let _ = s.acquire();
+                }
+                1 => {
+                    if let Some(l) = act.first().copied() {
+                        let step = 1 + (l.end - l.next_offset) / 3;
+                        let _ = s.report_progress(l.id, l.generation, l.next_offset + step);
+                    }
+                }
+                2 => {
+                    if let Some(l) = act.last().copied() {
+                        prop_assert!(s.complete(l.id, l.generation));
+                    }
+                }
+                _ => {
+                    if let Some(l) = act.first().copied() {
+                        prop_assert!(s.fail(l.id, l.generation));
+                    }
+                }
+            }
+            prop_assert!(s.invariants_hold());
+        }
+        // Drain: complete everything exactly once.
+        loop {
+            let live = s.active_leases();
+            if let Some(l) = live.first().copied() {
+                prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+                prop_assert!(s.complete(l.id, l.generation));
+                continue;
+            }
+            match s.acquire() {
+                Some(l) => {
+                    prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+                    prop_assert!(s.complete(l.id, l.generation));
+                }
+                None => break,
+            }
+        }
+        prop_assert!(s.is_complete());
+        let rs = s.completed_ranges();
+        prop_assert_eq!(rs, vec![(0u64, total - 1)] as Vec<ByteRange>, "resumed drain exact");
+    }
+
+    /// Stale generations (§31, task 3.1): after a generation bump, every
+    /// old-generation operation is rejected and mutates nothing.
+    #[test]
+    fn stale_generation_operations_are_rejected(
+        total in 2u64..1_000,
+        step in 1u64..64,
+    ) {
+        let mut s = SegmentScheduler::initialize(
+            total,
+            &[],
+            SchedulerPolicy::new(1, total / 2 + 1),
+        );
+        let lease = s.acquire().expect("initial lease");
+        prop_assert!(s.report_progress(lease.id, lease.generation, lease.start + step.min(lease.end - lease.start)));
+        let old_generation = lease.generation;
+        // A snapshot of the live state before the bump.
+        let _before_active = s.active_leases();
+        let before_completed_size = s.completed_set().len();
+        let _before_pending = s.pending_bytes();
+
+        prop_assert_eq!(s.bump_generation(), old_generation + 1);
+        // Every operation with the STALE generation must be rejected.
+        prop_assert!(!s.report_progress(lease.id, old_generation, lease.end + 1));
+        prop_assert!(!s.complete(lease.id, old_generation));
+        prop_assert!(!s.fail(lease.id, old_generation));
+        prop_assert!(s.split_tail(lease.id, old_generation, 1).is_none());
+        prop_assert!(!s.release(lease.id, old_generation));
+
+        // The generation change invalidates the whole job (§26): the
+        // acknowledged prefix is promoted to completed, the unconsumed
+        // remainder returns to pending, and nothing stays active.
+        prop_assert!(s.active_leases().is_empty());
+        prop_assert!(s.completed_set().len() > before_completed_size);
+        // The union stays exactly the domain (no gaps, no overlaps).
+        prop_assert_eq!(
+            s.completed_set().len() + s.pending_bytes() + s.active_bytes(),
+            total
+        );
+        prop_assert!(s.invariants_hold());
+
+        // The new generation re-leases and completes the domain exactly.
+        loop {
+            match s.acquire() {
+                Some(l) => {
+                    prop_assert_eq!(l.generation, old_generation + 1);
+                    prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+                    prop_assert!(s.complete(l.id, l.generation));
+                }
+                None => break,
+            }
+        }
+        prop_assert!(s.is_complete());
+        prop_assert_eq!(
+            s.completed_ranges(),
+            vec![(0u64, total - 1)] as Vec<ByteRange>,
+            "post-invalidation drain covers every byte exactly once"
+        );
+    }
+
+    /// Inclusive/exclusive boundary math (§31, task 3.1): lease endpoints
+    /// are inclusive `[start, end]`, the write frontier `next_offset` is
+    /// exclusive, and `remaining()` counts `end - next_offset + 1`.
+    #[test]
+    fn lease_boundary_math_is_inclusive_end_exclusive_frontier(
+        total in 1u64..4_000,
+        target in 1u64..1_000,
+    ) {
+        let mut s = SegmentScheduler::initialize(
+            total,
+            &[],
+            SchedulerPolicy::with_target(1, target.max(1), kdown_engine::scheduler::core::TargetSelector::None, 256 * 1024),
+        );
+        let mut covered: u64 = 0;
+        while let Some(lease) = s.acquire() {
+            prop_assert_eq!(lease.next_offset, lease.start, "frontier starts at the inclusive start");
+            prop_assert_eq!(lease.remaining(), lease.end - lease.next_offset + 1);
+            prop_assert!(lease.end >= lease.start);
+            // Report full progress: next_offset lands exactly at end + 1.
+            prop_assert!(s.report_progress(lease.id, lease.generation, lease.end + 1));
+            let after = s.lease_next_offset(lease.id).expect("active lease");
+            prop_assert_eq!(after, lease.end + 1, "exclusive frontier is end + 1");
+            prop_assert!(s.complete(lease.id, lease.generation));
+            covered += lease.end - lease.start + 1;
+            prop_assert!(covered <= total, "leases must not exceed the domain");
+        }
+        prop_assert_eq!(covered, total, "the union of leases is exactly the domain");
+        prop_assert!(s.is_complete());
+        // The final lease was the exact partial remainder: the last
+        // completed range ends at total - 1 (inclusive).
+        let rs = s.completed_ranges();
+        prop_assert_eq!(rs.last().copied(), Some((0u64, total - 1)));
+    }
+
     /// Split never includes consumed bytes and no two live leases ever
     /// overlap (no-double-lease property, §12.3).
     #[test]
