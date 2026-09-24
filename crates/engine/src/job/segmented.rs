@@ -131,6 +131,11 @@ pub struct LeaseRecord {
     /// Written means OS-acknowledged page-cache writes; this is NOT a
     /// durability claim (checkpoint saves synchronize separately, task 3.3).
     pub written_through: u64,
+    /// Receipt high-watermark (exclusive; task 3.2): how far the worker has
+    /// pulled payload for this lease from the network, regardless of write
+    /// acknowledgement. The live-tail split uses it as the boundary so the
+    /// split lease never re-requests received/queued bytes.
+    pub received_through: u64,
 }
 
 /// One worker's in-flight lease progress (§13.3, task 5.1, design D3).
@@ -151,6 +156,7 @@ pub struct LeaseProgress {
     generation: AtomicU64,
     lease_start: AtomicU64,
     written_through: AtomicU64,
+    received_through: AtomicU64,
 }
 
 impl LeaseProgress {
@@ -164,6 +170,8 @@ impl LeaseProgress {
         self.lease_start.store(record.lease_start, Ordering::SeqCst);
         self.written_through
             .store(record.written_through, Ordering::SeqCst);
+        self.received_through
+            .store(record.received_through, Ordering::SeqCst);
         self.sequence.store((seq | 1) + 1, Ordering::SeqCst);
     }
 
@@ -182,6 +190,7 @@ impl LeaseProgress {
             generation,
             lease_start,
             written_through,
+            received_through: written_through,
         });
     }
 
@@ -191,6 +200,7 @@ impl LeaseProgress {
             generation: 0,
             lease_start: 0,
             written_through: 0,
+            received_through: 0,
         });
     }
 
@@ -209,6 +219,7 @@ impl LeaseProgress {
                 generation: self.generation.load(Ordering::SeqCst),
                 lease_start: self.lease_start.load(Ordering::SeqCst),
                 written_through: self.written_through.load(Ordering::SeqCst),
+                received_through: self.received_through.load(Ordering::SeqCst),
             };
             let seq2 = self.sequence.load(Ordering::SeqCst);
             if seq1 == seq2 {
@@ -268,6 +279,20 @@ impl SegmentedJob {
     /// direct, allocation-free scheduler query (task 6.2).
     async fn active_leases_empty(&self) -> bool {
         !self.scheduler.lock().await.has_active()
+    }
+
+    /// The receipt high-watermark published for `lease_id` by any worker
+    /// cell (task 3.2): the live-tail split boundary must not re-request
+    /// bytes the original request already pulled. `0` when no cell tracks
+    /// the lease (the split then falls back to the acknowledged frontier).
+    fn cell_received_through(&self, lease_id: u64) -> u64 {
+        self.worker_progress
+            .iter()
+            .filter_map(|cell| cell.snapshot())
+            .filter(|record| record.lease_id == lease_id)
+            .map(|record| record.received_through)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Set the desired worker count at runtime (task 5.8: handle API).
@@ -1114,7 +1139,10 @@ async fn worker_cycle(
                     let mut sched = job.scheduler.lock().await;
                     let threshold = sched.policy().split_threshold;
                     let split = match sched.largest_splittable(threshold) {
-                        Some(b) => sched.split_tail(b.id, b.generation, threshold),
+                        Some(b) => {
+                            let received = job.cell_received_through(b.id);
+                            sched.split_tail(b.id, b.generation, threshold, received)
+                        }
                         None => None,
                     };
                     if split.is_some() {
@@ -1481,11 +1509,23 @@ async fn consume_legacy_body(
     worker_idx: usize,
     revisions: &mut tokio::sync::watch::Receiver<u64>,
     validated_start: u64,
-    _validated_end: u64,
+    validated_end: u64,
     classifier: &RetryClassifier,
 ) -> Result<(), WorkerError> {
     let cell = &job.worker_progress[worker_idx];
     let mut in_range_offset: u64 = 0;
+    // Live-tail split safety (task 3.2): the lease end may SHRINK when an
+    // idle worker splits this request's tail. The worker refreshes the end
+    // on revision wakes and stops consuming at the shrunken boundary — the
+    // discarded response tail is accounted as split waste, never written or
+    // credited to the split lease.
+    let mut effective_end = validated_end;
+    {
+        let sched = job.scheduler.lock().await;
+        if let Some(end) = sched.lease_end(lease.id, lease.generation) {
+            effective_end = effective_end.min(end);
+        }
+    }
     // Bounded body (§32): the configured read-idle policy and overrun
     // rejection live inside the body; the worker consumes one chunk at a
     // time and never sees frame types.
@@ -1508,16 +1548,37 @@ async fn consume_legacy_body(
             changed = revisions.changed() => {
                 // A transition while parked: fatal must converge this
                 // worker; other transitions (progress reconciliation,
-                // saves) just re-poll the body.
+                // saves, live-tail splits) just re-poll the body. A split
+                // may have shrunk this lease: refresh the stop boundary.
                 if changed.is_err() || job.fatal.is_fatal() {
                     return Err(WorkerError::Fatal(DownloadError::Cancelled));
                 }
+                let sched = job.scheduler.lock().await;
+                if let Some(end) = sched.lease_end(lease.id, lease.generation) {
+                    effective_end = effective_end.min(end);
+                }
+                drop(sched);
                 let _ = _seen_revision;
                 continue;
             }
         };
         match event {
             Ok(BodyEvent::Data(data)) => {
+                // Live-tail split boundary (task 3.2): stop consuming at the
+                // shrunken lease end — the response tail beyond it belongs
+                // to the split lease and is discarded as split waste.
+                if validated_start + in_range_offset > effective_end {
+                    // The lease end is INCLUSIVE: the byte at effective_end
+                    // still belongs to this worker; the stop boundary is
+                    // exclusive (beyond it).
+                    let wasted = validated_end.saturating_sub(effective_end);
+                    if wasted > 0 {
+                        if let Some(w) = job.counters.worker(worker_idx) {
+                            w.add_wasted(wasted);
+                        }
+                    }
+                    break;
+                }
                 // Wire bytes count at RECEIPT (task 5.4, design D4): even if
                 // a later write fails, the payload crossed the network and
                 // must show in wire throughput.
@@ -1552,6 +1613,7 @@ async fn consume_legacy_body(
                     generation: lease.generation,
                     lease_start: lease.start,
                     written_through: durable_through,
+                    received_through: durable_through,
                 });
             }
             Ok(BodyEvent::End) => break, // clean EOF
@@ -1650,6 +1712,7 @@ async fn settle_completion(
                 generation: frontier.generation(),
                 lease_start: frontier.start(),
                 written_through: through,
+                received_through: frontier.received_high_water(),
             });
             Ok(())
         }
@@ -1725,10 +1788,19 @@ async fn consume_pipelined_body(
     validated_end: u64,
     classifier: &RetryClassifier,
 ) -> Result<(), WorkerError> {
-    let accepted_len = validated_end - validated_start + 1;
     let mut frontier =
         LeaseFrontier::new(lease.id, lease.generation, validated_start, validated_end);
     let mut in_range_offset: u64 = 0;
+    // Live-tail split safety (task 3.2): refresh the stop boundary on
+    // revision wakes; chunks at/after the shrunken lease end are discarded
+    // as split waste (never written or credited to the split lease).
+    let mut effective_end = validated_end;
+    {
+        let sched = job.scheduler.lock().await;
+        if let Some(end) = sched.lease_end(lease.id, lease.generation) {
+            effective_end = effective_end.min(end);
+        }
+    }
     // The pre-read reservation (design D2): held across the body poll and
     // reconciled to the actual frame size after receipt.
     let mut reservation: Option<ByteReservation> = None;
@@ -1809,16 +1881,48 @@ async fn consume_pipelined_body(
             changed = revisions.changed() => {
                 // A transition while parked: fatal must converge this
                 // worker; other transitions (progress reconciliation,
-                // saves) just re-poll the body.
+                // saves, live-tail splits) just re-poll the body. A split
+                // may have shrunk this lease: refresh the stop boundary.
                 if changed.is_err() || job.fatal.is_fatal() {
                     return Err(WorkerError::Fatal(DownloadError::Cancelled));
                 }
+                let sched = job.scheduler.lock().await;
+                if let Some(end) = sched.lease_end(lease.id, lease.generation) {
+                    effective_end = effective_end.min(end);
+                }
+                drop(sched);
                 let _ = _seen_revision;
                 continue;
             }
         };
         match event {
             Ok(BodyEvent::Data(data)) => {
+                // Live-tail split boundary (task 3.2): stop consuming at the
+                // shrunken lease end — the response tail beyond it belongs
+                // to the split lease and is discarded as split waste.
+                if validated_start + in_range_offset > effective_end {
+                    // The lease end is INCLUSIVE: the byte at effective_end
+                    // still belongs to this worker; the stop boundary is
+                    // exclusive (beyond it).
+                    let wasted = validated_end.saturating_sub(effective_end);
+                    if wasted > 0 {
+                        if let Some(w) = job.counters.worker(worker_idx) {
+                            w.add_wasted(wasted);
+                        }
+                    }
+                    // Settle outstanding writes, then complete at the
+                    // shrunk boundary (the drain keeps publications
+                    // coherent; the final check uses the shrunken end).
+                    drop(reservation.take());
+                    drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions)
+                        .await?;
+                    if frontier.acknowledged_through() != effective_end + 1 {
+                        return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                            "write pipeline settled below the validated range".into(),
+                        )));
+                    }
+                    break;
+                }
                 // Wire bytes count at RECEIPT (task 5.4, design D4): even if
                 // a later write fails, the payload crossed the network and
                 // must show in wire throughput.
@@ -1869,7 +1973,7 @@ async fn consume_pipelined_body(
                 // frontier publishes only the contiguous acknowledged
                 // prefix (design D3).
                 drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions).await?;
-                if frontier.acknowledged_through() != validated_start + accepted_len {
+                if frontier.acknowledged_through() != effective_end + 1 {
                     return Err(WorkerError::Fatal(DownloadError::SinkWrite(
                         "write pipeline settled below the validated range".into(),
                     )));
@@ -2499,6 +2603,7 @@ mod sync_tests {
                         lease_start: lease_id * 1000,
                         // Derivable invariant: start < written_through <= start + 1000.
                         written_through: lease_id * 1000 + (lease_id % 1000),
+                        received_through: lease_id * 1000 + (lease_id % 1000),
                     });
                 }
             }

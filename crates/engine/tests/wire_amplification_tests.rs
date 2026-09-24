@@ -66,12 +66,13 @@ fn delayed_static(
     }
 }
 
-// Ignored until the phase-3 split-eligibility fix (task 3.6) removes the
-// overlap re-delivery: the current engine measures exactly 2.000x on this
-// scenario (2026-09-24 baseline), which is the documented gap this change
-// closes. Unignore and tighten to <1.10 in task 3.6.
+// Task 3.2 closed the overlap re-delivery: the split boundary respects the
+// original request's receipt high-watermark and the original worker stops
+// consuming at its split-shrunk lease end (discard accounted as split
+// waste). Measured 1.016-1.023x on this fixture across three runs
+// (2026-09-24 baseline: 2.000x). The tolerance below is the phase-3 gate
+// bound (<1.10); 2.0x remains an unconditional failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known baseline gap: live-tail split re-delivers overlap (2.000x measured); task 3.6 unignores and tightens to <1.10"]
 async fn live_tail_split_never_doubles_wire_payload() {
     let len = 8 * 1024 * 1024;
     let content = deterministic_bytes(len, 4242);
@@ -109,6 +110,14 @@ async fn live_tail_split_never_doubles_wire_payload() {
         "server must serve at least the full payload: {emitted}"
     );
     let amplification = emitted as f64 / len as f64;
+    eprintln!(
+        "[wire-amplification] emitted={emitted} accepted={len} amplification={amplification:.3}x"
+    );
+    assert!(
+        amplification < 1.10,
+        "clean split amplification {amplification:.3}x exceeded the 1.10 \
+         tolerance (emitted {emitted} bytes for {len} accepted)"
+    );
     assert!(
         amplification < 2.0,
         "wire amplification {amplification:.3}x reached the unconditional 2x \

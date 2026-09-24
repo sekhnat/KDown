@@ -486,7 +486,7 @@ mod tests {
         assert_eq!((lease.start, lease.end), (500, 999));
         let mut original = LeaseFrontier::new(lease.id, lease.generation, lease.start, lease.end);
         let split = scheduler
-            .split_tail(lease.id, lease.generation, 1)
+            .split_tail(lease.id, lease.generation, 1, 0)
             .expect("split");
         assert_eq!(
             (split.start, split.end),

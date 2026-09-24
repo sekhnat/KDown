@@ -109,7 +109,7 @@ fn property_sequences_pause_and_resume_cover_exactly() {
                         if let Some(biggest) =
                             live.iter().copied().max_by_key(SegmentLease::remaining)
                         {
-                            if s.split_tail(biggest.id, biggest.generation, 1).is_some() {
+                            if s.split_tail(biggest.id, biggest.generation, 1, 0).is_some() {
                                 any = true;
                             }
                         }

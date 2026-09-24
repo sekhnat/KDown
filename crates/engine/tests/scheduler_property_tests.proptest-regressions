@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ea2f5d0adeabc585df4f64268a4dc3634afae2825ba46c313e28a44353bc05a9 # shrinks to total = 24, ops = [0, 3, 1, 1, 0, 3, 0, 1, 3, 1, 0, 3, 0, 3, 1, 1, 0, 0, 0, 0, 0, 0, 3, 0, 3, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0]
+cc 8b1df01e20877ecef67ccd00f83351731b2980298db2e5806799225ba8fd3584 # shrinks to total = 617, prefix = 337, ops = [0, 1, 3, 0, 2, 0, 1, 1, 1, 1]

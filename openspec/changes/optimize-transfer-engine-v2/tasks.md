@@ -35,8 +35,8 @@ Every phase is independently verifiable. Before a behavior change, record its ba
 
 ## 3. Segment duration and duplicate-payload control
 
-- [ ] 3.1 Add deterministic scheduler property tests for normalized pending/active/completed union, stale generations, inclusive `[S,E]`/exclusive frontier math, exact final partial range, retry/split/concurrency cycles and resumed intervals; run randomized seeds and record reproducible failures.
-- [ ] 3.2 Measure requested/received/submitted high-watermarks separately from `lease.next_offset`; change `split_tail` eligibility to avoid bytes received/queued for an original request (or stop/drain it safely) and verify split timing with server-emitted-byte fixture.
+- [x] 3.1 Add deterministic scheduler property tests for normalized pending/active/completed union, stale generations, inclusive `[S,E]`/exclusive frontier math, exact final partial range, retry/split/concurrency cycles and resumed intervals; run randomized seeds and record reproducible failures.
+- [x] 3.2 Measure requested/received/submitted high-watermarks separately from `lease.next_offset`; change `split_tail` eligibility to avoid bytes received/queued for an original request (or stop/drain it safely) and verify split timing with server-emitted-byte fixture.
 - [ ] 3.3 Prefer pending unclaimed ranges and add measured ready-work target (~2–3× desired candidate) with straggler-only live split; verify no lease leak, starvation or overlapping logical ownership under 1→4→1 worker changes.
 - [ ] 3.4 Implement opt-in duration-informed `TargetSelector` using smoothed per-worker *unique* goodput, RTT/request-cost guard and bounded size-step changes; verify fast/slow scripted samples, short job fallback to explicit size, min/max bounds and checkpoint resume gaps.
 - [ ] 3.5 Sweep target duration 0.5/1/1.5 s and ready-work factors on H1/H2 WAN-shaped fixtures; record segment/split counts, amplification, completion latency and variance before choosing a documented opt-in default. Keep existing Explicit/Automatic behavior unchanged.

@@ -331,21 +331,26 @@ impl SegmentScheduler {
     }
 
     /// Split: take the unconsumed tail of an active lease for an idle
-    /// worker (§12.3). Only bytes at/after the lease's live `next_offset`
-    /// may move — bytes read or queued for write are excluded. Returns the
-    /// new lease covering the tail. Stale generations are rejected.
+    /// worker (§12.3). Only bytes at/after `max(next_offset,
+    /// received_through)` may move — bytes read, queued or already received
+    /// for write by the original worker are excluded (task 3.2): the split
+    /// boundary is the original request's receipt high-watermark, so the
+    /// new lease never re-requests payload the original already pulled.
+    /// Returns the new lease covering the tail. Stale generations are
+    /// rejected.
     pub fn split_tail(
         &mut self,
         lease_id: LeaseId,
         generation: u64,
         min_tail: u64,
+        received_through: u64,
     ) -> Option<SegmentLease> {
         let min_tail = min_tail.max(1);
         let lease = *self.active.get(&lease_id)?;
         if lease.generation != generation {
             return None;
         }
-        let tail_start = lease.next_offset;
+        let tail_start = lease.next_offset.max(received_through);
         let tail_len = lease.end.saturating_sub(tail_start).saturating_add(1);
         if tail_len <= min_tail {
             return None; // nothing worth splitting (§12.3)
@@ -391,6 +396,19 @@ impl SegmentScheduler {
     #[must_use]
     pub fn lease_next_offset(&self, lease_id: LeaseId) -> Option<u64> {
         self.active.get(&lease_id).map(|l| l.next_offset)
+    }
+
+    /// The live (possibly split-shrunk) inclusive end of an active lease
+    /// (task 3.2): the owning worker stops consuming its body at this
+    /// boundary so a shrunken request never streams past its shrunken
+    /// ownership. `None` for unknown/expired leases.
+    #[must_use]
+    pub fn lease_end(&self, lease_id: LeaseId, generation: u64) -> Option<u64> {
+        let lease = self.active.get(&lease_id)?;
+        if lease.generation != generation {
+            return None;
+        }
+        Some(lease.end)
     }
 
     /// Whether any lease is active — a direct state query that allocates
@@ -681,7 +699,7 @@ mod tests {
         let l = s.acquire().expect("lease");
         // Worker consumed 2,000 bytes.
         assert!(s.report_progress(l.id, l.generation, 2_000));
-        let tail = s.split_tail(l.id, l.generation, 100).expect("split");
+        let tail = s.split_tail(l.id, l.generation, 100, 0).expect("split");
         assert!(
             tail.start >= 2_000,
             "split must exclude consumed bytes (§12.3)"
@@ -698,16 +716,61 @@ mod tests {
     }
 
     #[test]
+    fn split_respects_received_high_watermark() {
+        let mut s = sched(10_000);
+        let l = s.acquire().expect("lease");
+        // The worker acknowledged 2,000 bytes but has RECEIVED up to 5,000
+        // (queued/in-flight writes, task 3.2).
+        assert!(s.report_progress(l.id, l.generation, 2_000));
+        let tail = s
+            .split_tail(l.id, l.generation, 100, 5_000)
+            .expect("split beyond the received watermark");
+        assert!(
+            tail.start >= 5_000,
+            "the split lease must start at/after the received watermark              (never re-request received/queued bytes): start={}",
+            tail.start
+        );
+        let orig = s
+            .active_leases()
+            .into_iter()
+            .find(|x| x.id == l.id)
+            .expect("original stays active");
+        assert_eq!(
+            orig.end,
+            tail.start - 1,
+            "the original keeps ownership up to the split boundary"
+        );
+        assert!(
+            orig.end >= 5_000 - 1,
+            "the original retains its received window"
+        );
+        assert_eq!(orig.next_offset, 2_000, "acknowledged frontier untouched");
+        assert!(s.invariants_hold());
+
+        // No in-flight bytes on the split lease (watermark == its fresh
+        // next_offset): the split falls back to the acknowledged frontier
+        // geometry (tail starts within the tail, beyond next_offset).
+        let tail2 = s
+            .split_tail(tail.id, tail.generation, 100, tail.next_offset)
+            .expect("fallback split");
+        assert!(
+            tail2.start >= tail.next_offset,
+            "fallback boundary respects the acknowledged frontier"
+        );
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
     fn split_refuses_small_tail_and_stale() {
         let mut s = sched(200);
         let l = s.acquire().expect("lease");
         assert!(
-            s.split_tail(l.id, l.generation, 10_000).is_none(),
+            s.split_tail(l.id, l.generation, 10_000, 0).is_none(),
             "tail too small"
         );
         let stale = l.generation.wrapping_add(1);
         assert!(
-            s.split_tail(l.id, stale, 1).is_none(),
+            s.split_tail(l.id, stale, 1, 0).is_none(),
             "stale split rejected"
         );
     }

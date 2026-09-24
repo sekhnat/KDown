@@ -106,7 +106,7 @@ proptest! {
                         if counter % 2 == 0 {
                             prop_assert!(s.release(l.id, l.generation));
                         } else {
-                            let _ = s.split_tail(l.id, l.generation, 1);
+                            let _ = s.split_tail(l.id, l.generation, 1, 0);
                         }
                     }
                 }
@@ -168,7 +168,7 @@ proptest! {
                 }
                 1 => {
                     if let Some(l) = act.first().copied() {
-                        let step = 1 + (l.end - l.next_offset) / 3;
+                        let step = 1 + l.end.saturating_sub(l.next_offset) / 3;
                         let _ = s.report_progress(l.id, l.generation, l.next_offset + step);
                     }
                 }
@@ -231,7 +231,7 @@ proptest! {
         prop_assert!(!s.report_progress(lease.id, old_generation, lease.end + 1));
         prop_assert!(!s.complete(lease.id, old_generation));
         prop_assert!(!s.fail(lease.id, old_generation));
-        prop_assert!(s.split_tail(lease.id, old_generation, 1).is_none());
+        prop_assert!(s.split_tail(lease.id, old_generation, 1, 0).is_none());
         prop_assert!(!s.release(lease.id, old_generation));
 
         // The generation change invalidates the whole job (§26): the
@@ -247,15 +247,10 @@ proptest! {
         prop_assert!(s.invariants_hold());
 
         // The new generation re-leases and completes the domain exactly.
-        loop {
-            match s.acquire() {
-                Some(l) => {
-                    prop_assert_eq!(l.generation, old_generation + 1);
-                    prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
-                    prop_assert!(s.complete(l.id, l.generation));
-                }
-                None => break,
-            }
+        while let Some(l) = s.acquire() {
+            prop_assert_eq!(l.generation, old_generation + 1);
+            prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+            prop_assert!(s.complete(l.id, l.generation));
         }
         prop_assert!(s.is_complete());
         prop_assert_eq!(
@@ -328,7 +323,7 @@ proptest! {
                 2 => {
                     // Split the lease with the largest tail.
                     if let Some(src) = act.iter().copied().max_by_key(SegmentLease::remaining) {
-                        if let Some(tail) = s.split_tail(src.id, src.generation, 1) {
+                        if let Some(tail) = s.split_tail(src.id, src.generation, 1, 0) {
                             prop_assert!(tail.start >= src.next_offset, "split excludes consumed bytes");
                         }
                     }
