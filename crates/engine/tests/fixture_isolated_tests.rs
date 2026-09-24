@@ -291,3 +291,293 @@ async fn isolated_client_fail_if_exists_unchanged() {
     assert!(result.bytes_downloaded_from_network == 0);
     assert_eq!(std::fs::read(&dest).expect("read"), b"existing");
 }
+
+// ---- TLS / H2 isolated coverage (optimize-transfer-engine-v2 task 0.2) ----
+
+/// Spawn the fixture server in TLS mode with a fresh self-signed certificate
+/// (rcgen in the test process; the server binary only needs rustls). Returns
+/// the server, the CA PEM path (trust bundle for the client) and the cert
+/// tempdir that must outlive the server.
+fn spawn_tls_server(args: &[&str]) -> (IsolatedServer, std::path::PathBuf, tempfile::TempDir) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let dir = tempfile::tempdir().expect("cert tmpdir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert pem");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key pem");
+    let mut all: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    all.push("--tls-cert".into());
+    all.push(cert_path.to_string_lossy().into_owned());
+    all.push("--tls-key".into());
+    all.push(key_path.to_string_lossy().into_owned());
+    let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+    (spawn_server(&refs), cert_path, dir)
+}
+
+/// HTTPS URL for the TLS server (cert SAN is `localhost`; the listener is on
+/// 127.0.0.1, matching the h2_tests pattern).
+fn tls_url(server: &IsolatedServer, path: &str) -> String {
+    let port = server.addr.rsplit(':').next().expect("port");
+    format!("https://localhost:{port}{path}")
+}
+
+fn configure_tls(cfg: &mut EngineConfig, ca: &std::path::Path) {
+    cfg.tls.custom_ca_bundle = Some(ca.to_path_buf());
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+}
+
+/// Read the fixture server's `/__stats` counters through the engine with the
+/// same TLS trust configuration as the job under test.
+async fn read_tls_stats(
+    cfg: &EngineConfig,
+    server: &IsolatedServer,
+) -> (u64, u64, u64) {
+    let dir = tempfile::tempdir().expect("stats tmpdir");
+    let transport = HttpTransport::from_config(cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let result = controller
+        .run(DownloadRequest::new(
+            tls_url(server, "/__stats"),
+            dir.path().join("stats.txt"),
+        ))
+        .await
+        .expect("stats download");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let text = std::fs::read_to_string(dir.path().join("stats.txt")).expect("stats text");
+    let parse = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|v| v.trim().parse::<u64>().ok()))
+            .expect(key)
+    };
+    (parse("emitted="), parse("connections="), parse("requests="))
+}
+
+/// Segmented HTTP/2 download over TLS from the isolated server: byte-exact
+/// parity, multiple streams multiplexed on the connections the engine chose,
+/// and server-emitted payload exactly the file size (no H2 duplication).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_tls_h2_segmented_parity() {
+    let (server, ca, _cert_dir) = spawn_tls_server(&["--size", "1MiB", "--seed", "4242"]);
+    let url = tls_url(&server, "/f.bin");
+    let mut cfg = EngineConfig::default();
+    configure_tls(&mut cfg, &ca);
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.initial_segment_size = 256 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 256 * 1024;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url.clone(), dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256, "H2 TLS parity");
+    assert_eq!(result.bytes_reused_from_checkpoint, 0);
+
+    let (emitted, _conns, requests) = read_tls_stats(&cfg, &server).await;
+    assert!(requests > 1, "segmented H2 must issue multiple requests: {requests}");
+    // The validating bytes=0-0 probe contributes <= a few payload bytes;
+    // anything approaching 2x would be split-overlap re-delivery.
+    assert!(
+        emitted >= server.size && emitted <= server.size + 64,
+        "H2 segmented coverage must not duplicate payload on the wire \
+         (emitted {emitted} for {} bytes)", server.size
+    );
+}
+
+/// Single-stream download over TLS (HTTP/1.1 via ALPN or H2): byte-exact.
+#[tokio::test]
+async fn isolated_tls_single_stream_parity() {
+    let (server, ca, _cert_dir) = spawn_tls_server(&["--size", "512KiB", "--seed", "17"]);
+    let url = tls_url(&server, "/f.bin");
+    let mut cfg = EngineConfig::default();
+    configure_tls(&mut cfg, &ca);
+    cfg.transfer.segmentation_threshold = u64::MAX;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url, dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+}
+
+/// A range-ignoring server over TLS still triggers the safe single-stream
+/// fallback with byte-exact output (fallback semantics preserved on the TLS
+/// path, task 0.2).
+#[tokio::test]
+async fn isolated_tls_ignore_ranges_falls_back() {
+    let (server, ca, _cert_dir) =
+        spawn_tls_server(&["--size", "256KiB", "--seed", "21", "--ignore-ranges"]);
+    let url = tls_url(&server, "/f.bin");
+    let mut cfg = EngineConfig::default();
+    configure_tls(&mut cfg, &ca);
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url, dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+
+    // Fallback proof: at most one full transfer plus the aborted validating
+    // probe's partial body — no per-segment range re-downloads happened.
+    let (emitted, _conns, requests) = read_tls_stats(&cfg, &server).await;
+    assert!(
+        emitted <= 2 * server.size + 64 * 1024,
+        "range-ignoring server must downgrade to a single transfer \
+         (emitted {emitted} for {} bytes)", server.size
+    );
+    assert!(
+        requests <= 8,
+        "range-ignoring server must not see per-segment requests: {requests}"
+    );
+}
+
+/// A mid-response reset over TLS recovers through the retry path (hyper
+/// transport semantics, not just the raw-H1 path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_tls_mid_transfer_reset_recovers() {
+    let (server, ca, _cert_dir) = spawn_tls_server(&[
+        "--size",
+        "128KiB",
+        "--seed",
+        "9",
+        "--reset-after-bytes",
+        "32768",
+    ]);
+    let url = tls_url(&server, "/f.bin");
+    let mut cfg = EngineConfig::default();
+    configure_tls(&mut cfg, &ca);
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 1;
+    cfg.retry.base_delay = Duration::from_millis(10);
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url, dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    assert!(result.retries >= 1, "expected reset retries: {}", result.retries);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+}
+
+
+
+
+// ---- Controlled shaping modes (optimize-transfer-engine-v2 task 0.3) ----
+
+/// `--rtt-ms` adds one RTT before each response's headers: a three-request
+/// segmented transfer must take at least three RTTs (calibration smoke).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_rtt_shapes_per_request_latency() {
+    let server = spawn_server(&["--size", "96KiB", "--seed", "11", "--rtt-ms", "40"]);
+    let url = format!("http://{}/f.bin", server.addr);
+    let started = Instant::now();
+    let (result, _dir) = download(&url, |cfg| {
+        cfg.transfer.segmentation_threshold = 1;
+        cfg.transfer.max_workers = 1;
+        cfg.transfer.initial_segment_size = 32 * 1024;
+        cfg.transfer.min_segment_size = 32 * 1024;
+        cfg.transfer.max_segment_size = 32 * 1024;
+    })
+    .await;
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+    // 96 KiB / 32 KiB = 3 segments (+probe) — at least 3 full RTTs.
+    assert!(
+        started.elapsed() >= Duration::from_millis(120),
+        "rtt shaping must add >= 3 RTTs: {:?}",
+        started.elapsed()
+    );
+}
+
+/// `--loss-percent` truncates responses deterministically; the engine
+/// recovers through retries with byte-exact output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolated_connection_loss_recovers_via_retry() {
+    let server = spawn_server(&[
+        "--size",
+        "256KiB",
+        "--seed",
+        "31",
+        "--loss-percent",
+        "40",
+    ]);
+    let url = format!("http://{}/f.bin", server.addr);
+    let (result, _dir) = download(&url, |cfg| {
+        cfg.transfer.segmentation_threshold = 1;
+        cfg.transfer.max_workers = 2;
+        cfg.transfer.initial_segment_size = 64 * 1024;
+        cfg.transfer.min_segment_size = 64 * 1024;
+        cfg.transfer.max_segment_size = 64 * 1024;
+        cfg.retry.base_delay = Duration::from_millis(10);
+    })
+    .await;
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    assert!(result.retries >= 1, "expected loss retries: {}", result.retries);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+}
+
+/// `--retry-after` controls the transient-fail `Retry-After` header value
+/// (task 0.3): observable over raw HTTP, still recovering through retry.
+#[tokio::test]
+async fn isolated_transient_fail_carries_configured_retry_after() {
+    let server = spawn_server(&[
+        "--size",
+        "64KiB",
+        "--seed",
+        "3",
+        "--transient-fail",
+        "1:503",
+        "--retry-after",
+        "1",
+    ]);
+    use std::io::Write as _;
+    let mut conn = std::net::TcpStream::connect(server.addr.clone()).expect("connect");
+    conn.write_all(b"GET /f.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("req");
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut conn, &mut response).expect("resp");
+    let head = String::from_utf8_lossy(&response);
+    assert!(
+        head.contains("HTTP/1.1 503"),
+        "transient status expected: {head}"
+    );
+    assert!(
+        head.contains("retry-after: 1\r\n"),
+        "configured Retry-After expected: {head}"
+    );
+
+    // The engine still recovers (1s Retry-After is honored/capped by policy).
+    let url = format!("http://{}/f.bin", server.addr);
+    let (result, _dir) = download(&url, |cfg| {
+        cfg.retry.base_delay = Duration::from_millis(10);
+    })
+    .await;
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+}

@@ -125,6 +125,25 @@ pub struct DownloadResult {
     pub error: Option<DownloadError>,
 }
 
+impl DownloadResult {
+    /// Wire amplification (task 0.4 observability): total received payload
+    /// divided by uniquely completed bytes. Received payload is the network
+    /// counter plus re-received waste (this engine counts each wire byte
+    /// once in `bytes_downloaded_from_network` and charges duplicates to
+    /// `wasted_bytes`, so their sum is what crossed the wire).
+    /// `None` when the denominator is zero (nothing uniquely completed) —
+    /// the metric is undefined there, never fabricated.
+    #[must_use]
+    pub fn wire_amplification(&self) -> Option<f64> {
+        if self.completed_bytes == 0 {
+            None
+        } else {
+            let received = self.bytes_downloaded_from_network + self.wasted_bytes;
+            Some(received as f64 / self.completed_bytes as f64)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResultStatus {

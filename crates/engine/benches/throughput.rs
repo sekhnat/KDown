@@ -422,6 +422,12 @@ struct ResourceRecord {
     /// Context switches during the run (voluntary + nonvoluntary delta).
     context_switches: u64,
     connections: Option<u64>,
+    /// Server-side wire accounting from the isolated fixture's `/__stats`
+    /// (task 0.2): payload emitted, connections accepted, requests served.
+    /// `None` when the scenario has no isolated fixture endpoint.
+    server_emitted: Option<u64>,
+    server_connections: Option<u64>,
+    server_requests: Option<u64>,
     /// Verification (task 1.2): atomic publication happened.
     published: bool,
     /// Verification: final size matches the fixture.
@@ -568,6 +574,9 @@ async fn measure_download(
         peak_rss_kib: peak_rss_kib(),
         context_switches: context_switches().saturating_sub(ctx0),
         connections: conn_probe.map(|c| c.load(Ordering::SeqCst) as u64),
+        server_emitted: None,
+        server_connections: None,
+        server_requests: None,
         published,
         size_ok,
         hash_ok,
@@ -577,7 +586,7 @@ async fn measure_download(
 
 fn fmt_record(name: &str, r: &ResourceRecord) -> String {
     format!(
-        "| {name} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {name} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         r.useful_goodput_mib_s(),
         r.wire_throughput_mib_s(),
         r.completed_bytes,
@@ -590,11 +599,15 @@ fn fmt_record(name: &str, r: &ResourceRecord) -> String {
         r.peak_rss_kib,
         r.context_switches,
         r.connections.map_or_else(|| "n/r".into(), |c| c.to_string()),
-        r.verification()
+        r.verification(),
+        r.server_emitted.map_or_else(
+            || "n/r".into(),
+            |e| format!("{e}/{} /{}", r.server_connections.unwrap_or(0), r.server_requests.unwrap_or(0)),
+        )
     )
 }
 
-const RECORD_HEADER: &str = "| Scenario | Goodput (MiB/s) | Wire (MiB/s) | Completed | Network | Reused | Retransferred | Retries | Wall | CPU | Peak RSS | Ctx Switches | Connections | Verify |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
+const RECORD_HEADER: &str = "| Scenario | Goodput (MiB/s) | Wire (MiB/s) | Completed | Network | Reused | Retransferred | Retries | Wall | CPU | Peak RSS | Ctx Switches | Connections | Verify | Server E/C/R |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
 
 /// Emit the scenario report to stderr (criterion captures stdout) and the
 /// results file so before/after comparisons (task 2.4) have an artifact.
@@ -994,6 +1007,12 @@ fn main() {
         run_sweep();
         return;
     }
+    // Multi-job contention harness (task 0.3): one-job baseline,
+    // same-origin contention and multi-origin isolation, in-process.
+    if args.iter().any(|a| a == "--jobs-smoke") {
+        run_jobs_matrix();
+        return;
+    }
     // Client-only mode against a process-isolated fixture server (task 1.4):
     // the server runs as a separate process, so CPU/RSS/connections recorded
     // here are the client's alone. Usage:
@@ -1004,13 +1023,15 @@ fn main() {
             addr,
             arg_value(&args, "--isolated-size"),
             arg_value(&args, "--isolated-seed")
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| parse_u64_arg(&v))
                 .unwrap_or(0),
             arg_value(&args, "--isolated-workers")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
             arg_value(&args, "--isolated-label")
                 .unwrap_or_else(|| "isolated".to_string()),
+            arg_value(&args, "--isolated-ca"),
+            arg_value(&args, "--isolated-dest"),
         );
         return;
     }
@@ -1021,13 +1042,32 @@ fn main() {
     criterion.final_summary();
 }
 
+/// Parse a u64 argument with optional `0x`/`0X` hex prefix (matches the
+/// fixture server's `--seed` parsing so `0xBEEF`-style seeds round-trip).
+fn parse_u64_arg(v: &str) -> Option<u64> {
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    v.parse().ok()
+}
+
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
 
 /// Run one client download against a running isolated fixture server and
-/// record client-only resources (task 1.4).
-fn run_isolated_client(addr: String, size: Option<String>, seed: u64, workers: u32, label: String) {
+/// record client-only resources (task 1.4). With `ca` (PEM path) the URL
+/// becomes https and the CA bundle is trusted — the isolated fixture then
+/// speaks TLS/H2 via `--tls-cert`/`--tls-key` (task 0.2).
+fn run_isolated_client(
+    addr: String,
+    size: Option<String>,
+    seed: u64,
+    workers: u32,
+    label: String,
+    ca: Option<String>,
+    dest_dir: Option<String>,
+) {
     let Some(size_str) = size else {
         eprintln!("--isolated requires --isolated-size (e.g. 1GiB)");
         std::process::exit(2);
@@ -1055,12 +1095,32 @@ fn run_isolated_client(addr: String, size: Option<String>, seed: u64, workers: u
         cfg.transfer.min_workers = workers.min(2);
         cfg.network.response_header_timeout = Duration::from_secs(30);
         cfg.network.read_idle_timeout = Duration::from_secs(30);
-        let dir = tempfile::tempdir().expect("dest tmpdir");
-        let (result, record) = measure_download(
+        let scheme = if let Some(ca) = &ca {
+            cfg.tls.custom_ca_bundle = Some(std::path::PathBuf::from(ca));
+            "https"
+        } else {
+            "http"
+        };
+        // Destination override (task 0.3): point the output at a real
+        // storage target (tmpfs/NVMe/HDD) instead of the default tmpdir.
+        let dir = if let Some(dest) = &dest_dir {
+            std::fs::create_dir_all(dest).expect("create dest dir");
+            None
+        } else {
+            Some(tempfile::tempdir().expect("dest tmpdir"))
+        };
+        let dest_root: std::path::PathBuf = dest_dir
+            .as_ref()
+            .map_or_else(|| dir.as_ref().expect("tmpdir").path().to_path_buf(), std::path::PathBuf::from);
+        let _scratch = match dir {
+            Some(d) => d,
+            None => tempfile::tempdir().expect("scratch tmpdir"),
+        };
+        let (result, mut record) = measure_download(
             "isolated",
             &cfg,
-            format!("http://{addr}/f.bin"),
-            dir.path(),
+            format!("{scheme}://{addr}/f.bin"),
+            &dest_root,
             size,
             &expected_hash,
             None,
@@ -1072,9 +1132,157 @@ fn run_isolated_client(addr: String, size: Option<String>, seed: u64, workers: u
             "isolated client verification failed: {}",
             record.verification()
         );
+        // Server-side wire accounting (task 0.2): download the /__stats
+        // document through the same engine stack (works for h1 and h2/TLS).
+        if let Some(stats) = fetch_isolated_stats(&cfg, &format!("{scheme}://{addr}")).await {
+            eprintln!(
+                "[isolated] server emitted={} connections={} requests={}",
+                stats.0, stats.1, stats.2
+            );
+            record.server_emitted = Some(stats.0);
+            record.server_connections = Some(stats.1);
+            record.server_requests = Some(stats.2);
+        }
         record
     });
     emit_report(&format!("isolated/{label}"), &[(format!("isolated/{label}"), record)]);
+}
+
+/// Multi-job contention harness (task 0.3): a one-job baseline, same-origin
+/// contention (N jobs on one server) and multi-origin isolation (N jobs on N
+/// servers), on H1 and H2. One measured run per configuration; per-job rows
+/// plus an aggregate row (total bytes / batch wall). CPU/RSS are process-wide
+/// and therefore shared across concurrent jobs (noted in the report).
+fn run_jobs_matrix() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(16)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 64 * mib;
+    let workers = 4u32;
+    let jobs = 4u32;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for (mode, servers, concurrent) in [
+            ("one-job", 1u32, 1u32),
+            ("same-origin", 1, jobs),
+            ("multi-origin", jobs, jobs),
+        ] {
+            let label = format!("jobs/{protocol}/{mode}");
+            let (batch_wall, aggregate_bytes, per_job) = rt.block_on(async {
+                // Start `servers` fixture servers; jobs are distributed
+                // round-robin across them (1 server for one-job/same-origin).
+                let mut contents = Vec::new();
+                let mut urls = Vec::new();
+                let mut _ca_dirs = Vec::new();
+                let mut cfgs = Vec::new();
+                for i in 0..servers {
+                    let content = synthetic_fixture(size);
+                    let expected = content.sha256();
+                    let mut cfg = EngineConfig::default();
+                    cfg.transfer.segmentation_threshold = 1;
+                    cfg.transfer.max_workers = workers;
+                    cfg.transfer.min_workers = workers.min(2);
+                    cfg.network.response_header_timeout = Duration::from_secs(30);
+                    cfg.network.read_idle_timeout = Duration::from_secs(30);
+                    let url = if protocol == "h1" {
+                        let addr = start_h1_server(content.clone()).await;
+                        format!("http://{addr}/f{i}.bin")
+                    } else {
+                        let (addr, ca_pem) = start_h2_tls_server(content.clone()).await;
+                        let dir = tempfile::tempdir().expect("ca tmpdir");
+                        let ca_path = dir.path().join("ca.pem");
+                        std::fs::write(&ca_path, &ca_pem).expect("write ca");
+                        cfg.tls.custom_ca_bundle = Some(ca_path);
+                        cfg.h2_policy = H2ConnectionPolicy::Single;
+                        _ca_dirs.push(dir);
+                        format!("https://localhost:{}/f{i}.bin", addr.port())
+                    };
+                    contents.push((content, expected));
+                    urls.push(url);
+                    cfgs.push(cfg);
+                }
+                let started = std::time::Instant::now();
+                let mut set = tokio::task::JoinSet::new();
+                for j in 0..concurrent {
+                    let cfg = cfgs[j as usize % cfgs.len()].clone();
+                    let url = urls[j as usize % urls.len()].clone();
+                    let expected = contents[j as usize % contents.len()].1.clone();
+                    set.spawn(async move {
+                        measure_download(
+                            &format!("job{j}"),
+                            &cfg,
+                            url,
+                            tempfile::tempdir().expect("dest tmpdir").path(),
+                            size,
+                            &expected,
+                            None,
+                        )
+                        .await
+                    });
+                }
+                let mut per_job = Vec::new();
+                let mut total_bytes = 0u64;
+                let mut all_ok = true;
+                while let Some(joined) = set.join_next().await {
+                    let (result, record) = joined.expect("job join");
+                    all_ok &= result.status == ResultStatus::Completed
+                        && record.published
+                        && record.size_ok
+                        && record.hash_ok;
+                    total_bytes += result.completed_bytes;
+                    per_job.push(record);
+                }
+                let wall = started.elapsed();
+                assert!(all_ok, "{label}: a concurrent job failed verification");
+                (wall, total_bytes, per_job)
+            });
+            for (idx, record) in per_job.iter().enumerate() {
+                records.push((format!("{label}/job{idx}"), record.clone()));
+            }
+            // Aggregate row: batch wall and total completed bytes; the
+            // aggregate goodput is the honest contention metric.
+            let mut aggregate = per_job.first().cloned().expect("jobs present");
+            aggregate.wall = batch_wall;
+            aggregate.completed_bytes = aggregate_bytes;
+            aggregate.network_bytes = per_job.iter().map(|r| r.network_bytes).sum();
+            aggregate.cpu_percent = per_job.iter().map(|r| r.cpu_percent).sum::<f64>()
+                / per_job.len().max(1) as f64;
+            aggregate.peak_rss_kib = per_job.iter().map(|r| r.peak_rss_kib).max().expect("jobs present");
+            records.push((format!("{label}/AGGREGATE"), aggregate));
+        }
+    }
+    emit_report("jobs-smoke", &records);
+}
+
+/// Fetch the isolated fixture's `/__stats` counters by downloading the
+/// tiny document through the engine (same TLS/CA semantics as the job).
+async fn fetch_isolated_stats(
+    cfg: &EngineConfig,
+    base: &str,
+) -> Option<(u64, u64, u64)> {
+    let dir = tempfile::tempdir().ok()?;
+    let transport = HttpTransport::from_config(cfg).ok()?;
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let result = controller
+        .run(DownloadRequest::new(
+            format!("{base}/__stats"),
+            dir.path().join("stats.txt"),
+        ))
+        .await
+        .ok()?;
+    if result.status != ResultStatus::Completed {
+        return None;
+    }
+    let text = std::fs::read_to_string(dir.path().join("stats.txt")).ok()?;
+    let parse = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().parse::<u64>().ok()))
+            .flatten()
+    };
+    Some((parse("emitted=")?, parse("connections=")?, parse("requests=")?))
 }
 
 /// Target-sizing sweep (task 6.3): one measured run per configuration over

@@ -208,3 +208,119 @@ and records the comparison in `benches/results/comparison-milestone-2.md`.
   workers_1 → workers_8 peak RSS went 9.7 → 20.1 MiB after the per-worker
   pool removal (was 9.4 → 29 MiB before) — roughly +1.3 MiB per extra
   worker (task + lane + buffers), scaling linearly with the worker count.
+
+## Optimize-transfer-engine-v2 phase-0 baseline record
+
+Recorded 2026-09-24 at commit `cc6b4b6` (HEAD when the change started), before
+any behavior change from this second optimization change. All comparisons for
+`optimize-transfer-engine-v2` phases run against this record on the same host.
+
+### Configuration defaults in force (verified against `config.rs`)
+
+| Field | Default |
+|---|---|
+| `transfer.max_workers` / `min_workers` | 8 / 1 |
+| `transfer.initial_segment_size` | 8 MiB (`SegmentSizing::Explicit` honors it) |
+| `transfer.min_segment_size` / `max_segment_size` | 1 MiB / 64 MiB |
+| `transfer.segment_sizing` | `Explicit` |
+| `transfer.auto_oversubscription` | 3 |
+| `transfer.concurrency_mode` | `Fixed` (adaptive is opt-in, starts at `min_workers`) |
+| `transfer.segmentation_threshold` | 16 MiB |
+| `transfer.preallocate_output` / `preallocate_physical` | true / false |
+| `transfer.durability` | `Performance` |
+| `transfer.verify_range_support` | true |
+| `retry.max_attempts_per_segment` | 8 (base 250 ms, ×2, honor `Retry-After` capped 120 s) |
+| `buffer_pool_max_bytes` | bounds the pool only (see memory-path scope above) |
+
+### Invariants this change must preserve (authoritative today)
+
+- Scheduler interval ownership: normalized, non-overlapping
+  pending/active/completed coverage; stale generations rejected
+  (`scheduler/core.rs`).
+- Write acknowledgement boundary: progress/counters advance only after a
+  positional write acks (`WriterLane` per worker, `OutputWriteHandle`).
+- Checkpoint coordinator owns all saves; durable mode syncs data before
+  `store.save_atomic`; failed sync prevents any save; generation-fence recheck.
+- Output lifecycle: exclusive reclaim before verify/publish; atomic
+  publication; owner-only integrity verification.
+- Accounting: `completed` = scheduler-accepted unique deltas; `network`
+  counted at receipt; `wasted` = received-but-unacked gap on retry.
+- HTTP validation: `Content-Range`/length/generation/identity checks,
+  retry classification, redirect/credential rules unchanged.
+
+### Reconciliation: split exclusion claim vs `split_tail` reality
+
+The historical `download-engine-v1` `transfer-core` delta requires a dynamic
+split to exclude "bytes already read or queued for write by the original
+worker". The implemented `SegmentScheduler::split_tail` splits at the lease's
+acknowledged **write** frontier (`next_offset`, advanced only by lane write
+acks). Bytes the original worker has **received but not yet written**, and
+everything it continues to stream toward its stale lease end, are not
+excluded: the split lease re-requests them while the original request keeps
+downloading them. Writes stay positionally correct (the file is exact), but
+the wire payload is duplicated.
+
+Measured by the focused reproducer
+(`crates/engine/tests/wire_amplification_tests.rs`, whole-file lease +
+4 workers + paced server, 8 MiB): server-emitted payload 16,777,217 bytes for
+8,388,608 accepted bytes — **2.000× wire amplification**. The reproducer is
+`#[ignore]`d while this is the current behavior; task 3.6 (split-eligibility
+fix) unignores it and tightens the bound to <1.10× with 2× remaining an
+unconditional failure. Default-size leases (8 MiB target) keep live-tail
+duplication under ~1% on loopback; the pathological case above is the guard
+for the scheduler rework.
+
+### Controlled shaping modes (task 0.3) and axis availability
+
+The isolated fixture server now supports `--rtt-ms F` (one RTT before each
+response's headers — a lower bound on real RTT), `--loss-percent P`
+(deterministic, seed-derived per-response connection truncation), and
+`--retry-after SECS` for transient-fail responses. Calibration is verified by
+`fixture_isolated_tests` (3 RTTs ≥ 3×40 ms across a three-segment transfer;
+loss recovers through retries; Retry-After value observed on the wire).
+
+The bench `--jobs-smoke` mode measures one-job / same-origin / multi-origin
+contention in-process (H1+H2, per-job and aggregate rows). The isolated
+client accepts `--isolated-dest <dir>` to point the output at real storage
+(tmpfs, NVMe, HDD) — storage axes are exercised by choosing destinations, not
+simulated.
+
+Explicitly unavailable on this host: kernel-level netem (no `tc`/root netem
+configuration), so RTT/loss emulation is server-side approximation only;
+`perf`/`pidstat`/`strace` remain unavailable (see limitations above). WAN
+numbers from the shaping approximation are comparative (same-host, same
+approximation on both sides of an A/B), not absolute network truth.
+
+### Engine-side gauges (task 0.4)
+
+- `DownloadResult::wire_amplification()` — received payload (network +
+  re-received waste) / unique completed bytes; `None` when nothing uniquely
+  completed (undefined, never fabricated). This engine counts each wire byte
+  once in `bytes_downloaded_from_network` and charges duplicates to
+  `wasted_bytes`, so their sum is what crossed the wire.
+- `SegmentedJob::split_count()` — live-tail split events.
+- `SegmentedJob::active_workers()` — workers actually holding a lease
+  (distinct from `desired_workers`).
+- `SegmentedJob::last_checkpoint_save_us()` — last coordinator save latency.
+- Bench harness records CPU%/CPU-per-GiB, peak RSS, context switches and the
+  isolated server's emitted/connections/requests via `/__stats`.
+
+Explicitly unavailable (labeled, not fabricated): H2 per-stream counts and
+flow-control stall timing (phase 5), writer queue depth/ack-wait percentiles
+(phase 2's executor), scheduler lock-wait timing, syscall counts and
+allocation profiles (no `perf`/`strace` on this host). Single-stream
+checkpoints do not yet record save latency (segmented coordinator only).
+
+### Phase-0 gate (optimize-transfer-engine-v2, recorded 2026-09-24)
+
+- `cargo test -p kdown-engine`: 30 suites, all `test result: ok`, 0 failures
+  (includes the new wire-amplification reproducer (ignored, task 3.6),
+  12 fixture-isolated tests, 4 shaping tests, 11 runtime-control tests).
+- `cargo clippy -p kdown-engine --all-targets`: clean.
+- `scripts/bench_check.sh --smoke`: exit 0; all scenario verifications ok.
+- Baseline variance: recorded in `benches/results/baseline-v2-core.md`
+  (1 GiB rows 1–11% spread; 32 MiB rows noise-dominated) and
+  `benches/results/baseline-v2-wan.md`. The criterion prealloc group still
+  shows 1.6–1.7× wire amplification (whole-file-lease split pattern) — the
+  phase-3 gate (<1.10 on the clean split fixture, 2× unconditional failure)
+  applies to both the reproducer and these groups.

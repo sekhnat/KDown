@@ -170,6 +170,10 @@ struct ServerState {
     /// Path -> extra response headers.
     default_headers: Mutex<HashMap<String, ExtraHeaders>>,
     requests: Mutex<Vec<RequestInfo>>,
+    /// Payload bytes actually written to sockets (phase-0 wire
+    /// amplification accounting): counts body bytes served, including
+    /// duplicated re-delivery from overlapping/split requests.
+    emitted: std::sync::atomic::AtomicU64,
 }
 
 /// Builder for a deterministic scripted HTTP server.
@@ -271,6 +275,7 @@ impl TestServer {
             fallbacks: Mutex::new(HashMap::new()),
             default_headers: Mutex::new(self.default_headers),
             requests: Mutex::new(Vec::new()),
+            emitted: std::sync::atomic::AtomicU64::new(0),
         });
         let loop_state = state.clone();
         tokio::spawn(async move {
@@ -331,6 +336,13 @@ impl RunningServer {
     /// All requests seen so far, in order.
     pub async fn requests(&self) -> Vec<RequestInfo> {
         self.state.requests.lock().expect("requests lock").clone()
+    }
+
+    /// Payload bytes actually written to client sockets so far.
+    pub async fn payload_emitted(&self) -> u64 {
+        self.state
+            .emitted
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of requests seen for `path`.
@@ -449,7 +461,7 @@ async fn serve_conn(socket: tokio::net::TcpStream, state: Arc<ServerState>) -> s
         if let Some(delay) = resp.header_delay {
             tokio::time::sleep(delay).await;
         }
-        write_response(&mut writer, &resp, &method).await?;
+        write_response(&mut writer, &resp, &method, &state.emitted).await?;
         if resp.reset_after.is_some() {
             // Abrupt reset: close without clean shutdown.
             return Ok(());
@@ -461,6 +473,7 @@ async fn write_response(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     resp: &ScriptedResponse,
     method: &str,
+    emitted: &std::sync::atomic::AtomicU64,
 ) -> std::io::Result<()> {
     let reason = match resp.status {
         200 => "OK",
@@ -502,6 +515,7 @@ async fn write_response(
                 let chunk: Vec<u8> = (off..off + n).map(|i| fill(i)).collect();
                 writer.write_all(format!("{n:x}\r\n").as_bytes()).await?;
                 writer.write_all(&chunk).await?;
+                emitted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 writer.write_all(b"\r\n").await?;
                 off += n;
             }
@@ -515,6 +529,7 @@ async fn write_response(
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
                     .await?;
                 writer.write_all(chunk).await?;
+                emitted.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 writer.write_all(b"\r\n").await?;
             }
         }
@@ -543,6 +558,7 @@ async fn write_response(
             let n = 64 * 1024u64.min(limit - off);
             let chunk: Vec<u8> = (off..off + n).map(|i| fill(i)).collect();
             writer.write_all(&chunk).await?;
+            emitted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             if let Some(delay) = resp.chunk_delay {
                 writer.flush().await?;
                 tokio::time::sleep(delay).await;
@@ -561,11 +577,15 @@ async fn write_response(
         Some(delay) if !bytes.is_empty() => {
             for chunk in bytes.chunks(64 * 1024) {
                 writer.write_all(chunk).await?;
+                emitted.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 writer.flush().await?;
                 tokio::time::sleep(delay).await;
             }
         }
-        _ => writer.write_all(bytes).await?,
+        _ => {
+            writer.write_all(bytes).await?;
+            emitted.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     writer.flush().await
 }

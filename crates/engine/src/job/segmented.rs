@@ -7,7 +7,7 @@
 //! (§17.4). Runtime concurrency reduction settles excess workers (task
 //! 5.8).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,6 @@ use crate::http::{
     TransferIntent, TransferRequest,
 };
 use crate::io::output_session::OutputSession;
-use crate::io::writer_lane::WriterLane;
 use crate::job::controller::{DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
@@ -84,6 +83,22 @@ pub struct SegmentedJob {
     /// Last positional-write acknowledgment latency, in microseconds
     /// (task 9.2's controller sampling).
     write_latency_us: AtomicU64,
+    /// Live-tail split events observed by this job (task 0.4 observability):
+    /// every successful `split_tail` increments this counter.
+    splits: AtomicU64,
+    /// Per-worker provisioning state keyed by the stable worker index
+    /// (task 1.2): `0` = not provisioned, `1` = parked/idle (no lease),
+    /// `2` = actively holding a lease. Written only by the owning worker;
+    /// read by the gauges below. Sized to `max_workers`.
+    worker_states: Vec<AtomicU8>,
+    /// Per-worker live writer-lane flag (task 1.4): the owning worker sets
+    /// it when it spawns its blocking lane and clears it after the lane's
+    /// shutdown join returns, so `writer_lanes_alive` tracks real blocking
+    /// writer threads.
+    worker_lane_live: Vec<AtomicBool>,
+    /// Duration of the last coordinator checkpoint save, in microseconds
+    /// (task 0.4 observability). `0` means no save has completed yet.
+    last_checkpoint_save_us: AtomicU64,
     /// Configured bounds for manual concurrency control (task 8.2).
     min_workers: u64,
     max_workers: u64,
@@ -344,6 +359,86 @@ impl SegmentedJob {
         self.desired_workers.load(Ordering::Relaxed)
     }
 
+    /// Split events observed so far (task 0.4 observability).
+    #[must_use]
+    pub fn split_count(&self) -> u64 {
+        self.splits.load(Ordering::Relaxed)
+    }
+
+    /// Configured worker capacity (task 1.3): the number of provisioned
+    /// async tasks; the desired count floats within `[min_workers, this]`.
+    #[must_use]
+    pub fn max_workers(&self) -> u64 {
+        self.max_workers
+    }
+
+    /// Workers currently holding a lease (task 0.4: the *actual* active
+    /// gauge, distinct from `desired_workers`). Dormant or parked workers
+    /// publish no lease record and are not counted.
+    #[must_use]
+    pub fn active_workers(&self) -> u64 {
+        self.worker_progress
+            .iter()
+            .filter(|cell| cell.snapshot().is_some())
+            .count() as u64
+    }
+
+    /// Duration of the last completed checkpoint save in microseconds, or
+    /// `None` before the first save (task 0.4 observability). Values below
+    /// one microsecond report as one microsecond.
+    #[must_use]
+    pub fn last_checkpoint_save_us(&self) -> Option<u64> {
+        match self.last_checkpoint_save_us.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// Workers with a provisioned task (task 1.2): the *actual* capacity,
+    /// which may trail `desired_workers` until provisioning matches it.
+    #[must_use]
+    pub fn provisioned_workers(&self) -> u64 {
+        self.worker_states
+            .iter()
+            .filter(|st| st.load(Ordering::Relaxed) != 0)
+            .count() as u64
+    }
+
+    /// Workers parked/idle without a lease (task 1.2): provisioned minus
+    /// active — includes dormant workers above the desired count.
+    #[must_use]
+    pub fn parked_workers(&self) -> u64 {
+        self.worker_states
+            .iter()
+            .filter(|st| st.load(Ordering::Relaxed) == 1)
+            .count() as u64
+    }
+
+    /// Per-worker state setter used by `worker_loop` (task 1.2): `0` not
+    /// provisioned, `1` parked/idle, `2` active lease. Index-stable: the
+    /// state array position is the worker index.
+    pub(crate) fn set_worker_state(&self, worker_idx: usize, state: u8) {
+        if let Some(st) = self.worker_states.get(worker_idx) {
+            st.store(state, Ordering::Relaxed);
+        }
+    }
+
+    /// Live blocking writer lanes (task 1.4): threads actually serving
+    /// positional writes right now.
+    #[must_use]
+    pub fn writer_lanes_alive(&self) -> u64 {
+        self.worker_lane_live
+            .iter()
+            .filter(|f| f.load(Ordering::Relaxed))
+            .count() as u64
+    }
+
+    pub(crate) fn set_worker_lane_live(&self, worker_idx: usize, live: bool) {
+        if let Some(f) = self.worker_lane_live.get(worker_idx) {
+            f.store(live, Ordering::Relaxed);
+        }
+    }
+
     fn take_fatal(&self) -> Option<DownloadError> {
         self.fatal.take()
     }
@@ -438,9 +533,12 @@ pub(crate) async fn run_segmented(
     } else {
         u64::from(config.transfer.max_workers.max(1))
     };
-    let worker_progress: Vec<Arc<LeaseProgress>> = (0..desired.max(16))
-        .map(|_| Arc::new(LeaseProgress::default()))
-        .collect();
+    // Task 1.3: cells cover the full capacity (all provisioned workers),
+    // not just the initial desired count.
+    let worker_progress: Vec<Arc<LeaseProgress>> =
+        (0..u64::from(config.transfer.max_workers.max(1)).max(16))
+            .map(|_| Arc::new(LeaseProgress::default()))
+            .collect();
     let sync_capability = match session.sync_capability() {
         Ok(cap) => Some(cap),
         Err(error) => {
@@ -484,6 +582,14 @@ pub(crate) async fn run_segmented(
         manual_override: AtomicBool::new(false),
         throttle_events: AtomicU64::new(0),
         write_latency_us: AtomicU64::new(0),
+        splits: AtomicU64::new(0),
+        last_checkpoint_save_us: AtomicU64::new(0),
+        worker_states: (0..config.transfer.max_workers.max(1) as usize)
+            .map(|_| AtomicU8::new(0))
+            .collect(),
+        worker_lane_live: (0..config.transfer.max_workers.max(1) as usize)
+            .map(|_| AtomicBool::new(false))
+            .collect(),
         min_workers: u64::from(config.transfer.min_workers.max(1)),
         max_workers: u64::from(config.transfer.max_workers.max(1)),
         worker_progress,
@@ -506,9 +612,13 @@ pub(crate) async fn run_segmented(
         let _ = cell.set(job.clone());
     }
 
-    // Fixed configured workers for v1 (D6); mutable at runtime via the
-    // job (task 5.8).
-    let worker_count = job.desired_workers() as usize;
+    // Task 1.3: provision the FULL capacity (`max_workers`) of lightweight
+    // async tasks up front; workers above the desired count park dormant on
+    // the revision signal and reactivate without rebuilding when the
+    // desired count rises (task 8.2 dormancy, now backed by real tasks).
+    // Fixed mode starts with desired == max, so its visible behavior is
+    // unchanged; adaptive mode can now actually grow.
+    let worker_count = job.max_workers() as usize;
     let mut handles = Vec::with_capacity(worker_count);
     let mut writers = match session.share_write_handles(worker_count) {
         Ok(writers) => writers,
@@ -530,21 +640,15 @@ pub(crate) async fn run_segmented(
             };
         }
     };
-    // One long-lived blocking writer lane per worker (task 2.3): writes are
-    // positional and concurrent; the lane owns the write-only capability
-    // until shutdown, keeping reclaim fail-closed.
-    let mut lanes = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        let handle = writers.pop().expect("one output handle per worker");
-        lanes.push(WriterLane::spawn(handle));
-    }
-    // `lanes` stay owned here so shutdown can join every blocking task; the
-    // workers receive only cloneable submit handles.
-    for (lane_idx, worker_idx) in (0..worker_count).enumerate() {
+    // Task 1.4: workers own their writer-lane lifecycle — each receives one
+    // write-only capability and spawns its blocking lane on first activation,
+    // releasing it on dormancy or exit. `worker join` therefore implies every
+    // lane is shut down and every capability clone dropped before reclaim.
+    for worker_idx in 0..worker_count {
         let execution = execution.clone();
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
-        let lane = lanes[lane_idx].handle();
+        let output = writers.pop().expect("one output handle per worker");
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
             headers: request.headers.clone(),
@@ -557,7 +661,7 @@ pub(crate) async fn run_segmented(
                 execution,
                 classifier,
                 job,
-                lane,
+                output,
                 identity_owned,
                 req_spec,
                 counters_w,
@@ -571,12 +675,23 @@ pub(crate) async fn run_segmented(
     // Adaptive controller task (task 9.1, design D6): evaluates windowed
     // useful-goodput deltas and probes +1 conservatively. Manual overrides
     // (handle `set_concurrency`) suspend it for the job's remainder.
+    // Adaptive controller (task 9.1, design D6). Task 1.5: the join handle
+    // is kept and awaited after the workers exit — no late decision can
+    // race the terminal outcome, and the task never leaks.
+    let mut controller_join: Option<tokio::task::JoinHandle<()>> = None;
+    let controller_stop_tx;
     if adaptive {
         let controller_job = job.clone();
         let controller_counters = counters.clone();
-        tokio::spawn(async move {
-            adaptive_controller_loop(controller_job, controller_counters).await;
-        });
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        controller_stop_tx = Some(stop_tx);
+        controller_join = Some(tokio::spawn(adaptive_controller_loop(
+            controller_job,
+            controller_counters,
+            stop_rx,
+        )));
+    } else {
+        controller_stop_tx = None;
     }
 
     let mut outcome_error: Option<DownloadError> = None;
@@ -598,13 +713,18 @@ pub(crate) async fn run_segmented(
         }
     }
     drop(writers);
-    // Join every writer lane before reclaim: no write is in flight and each
-    // capability has been released (design D1, task 2.3).
-    for lane in lanes {
-        if let Err(error) = lane.shutdown().await {
-            outcome_error.get_or_insert(error.0);
-        }
+    // Task 1.5: stop and join the adaptive controller before the outcome is
+    // computed — no decision can fire after the workers settled.
+    if let Some(tx) = controller_stop_tx {
+        let _ = tx.send(true);
     }
+    if let Some(join) = controller_join {
+        let _ = join.await;
+    }
+    // Task 1.4: no separate lane join is needed — every worker shut its lane
+    // down (and dropped its capability clone) before returning, so the joins
+    // above already drained all blocking writer threads (design D1, task 2.3
+    // semantics preserved at the same boundary).
     // Stop the checkpoint coordinator before reclaim/verify/publish/cleanup
     // (task 4.3, design D2): no save can race post-commit cleanup or a
     // stale checkpoint. All workers have joined, so no boundary save can
@@ -773,11 +893,57 @@ fn worker_error_from_failure(
 
 /// The worker loop (§13 steps 1-10).
 #[allow(clippy::too_many_arguments)]
+/// One provisioned worker (task 1.4): owns the lazy writer lane lifecycle —
+/// the blocking lane is created on first activation and released on dormancy
+/// or exit, so blocking writer threads track the desired count, not the
+/// configured maximum.
 async fn worker_loop(
     execution: HttpExecution,
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
-    lane: crate::io::writer_lane::LaneHandle,
+    output: crate::io::output_session::OutputWriteHandle,
+    identity: String,
+    req_spec: WorkerRequestSpec,
+    counters: Arc<JobCounters>,
+    worker_idx: usize,
+    started: Instant,
+) -> Result<(), DownloadError> {
+    job.set_worker_state(worker_idx, 1);
+    let mut lane: Option<crate::io::writer_lane::WriterLane> = None;
+    let result = worker_cycle(
+        execution,
+        classifier,
+        &job,
+        &mut lane,
+        &output,
+        identity,
+        req_spec,
+        counters,
+        worker_idx,
+        started,
+    )
+    .await;
+    // Release the lane on exit (task 1.4): the blocking thread ends and the
+    // handle clone drops before this worker joins, so run_segmented's
+    // reclaim observes no live writers. A shutdown failure means the
+    // blocking task panicked — surfaced via the first-wins fatal state,
+    // matching the old outcome_error path.
+    if let Some(l) = lane.take() {
+        job.set_worker_lane_live(worker_idx, false);
+        if let Err(error) = l.shutdown().await {
+            job.fatal.install(error.0);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn worker_cycle(
+    execution: HttpExecution,
+    classifier: RetryClassifier,
+    job: &Arc<SegmentedJob>,
+    lane: &mut Option<crate::io::writer_lane::WriterLane>,
+    output: &crate::io::output_session::OutputWriteHandle,
     identity: String,
     req_spec: WorkerRequestSpec,
     counters: Arc<JobCounters>,
@@ -785,6 +951,9 @@ async fn worker_loop(
     started: Instant,
 ) -> Result<(), DownloadError> {
     let _ = started;
+    // Provisioning gauge (task 1.2): this task exists — mark it parked/idle
+    // until it holds a lease. Index-stable per worker.
+    job.set_worker_state(worker_idx, 1);
     let mut attempt: u32 = 0;
     // Versioned scheduler-state signal (task 7.1/7.2): parked workers wake
     // on transitions instead of polling on a fixed timer.
@@ -818,6 +987,14 @@ async fn worker_loop(
         // parks DORMANT instead of exiting (task 8.2: a later increase
         // reactivates it via the revision signal, without rebuilding).
         if job.desired_workers() <= u64::from(u32::try_from(worker_idx).unwrap_or(u32::MAX)) {
+            // Dormant (task 1.4): release the blocking writer lane while
+            // parked so writer threads track the desired count.
+            if let Some(l) = lane.take() {
+                job.set_worker_lane_live(worker_idx, false);
+                if let Err(error) = l.shutdown().await {
+                    job.fatal.install(error.0);
+                }
+            }
             tokio::select! {
                 changed = revisions.changed() => {
                     if changed.is_err() {
@@ -858,6 +1035,7 @@ async fn worker_loop(
                     };
                     if split.is_some() {
                         // New lease available for parked workers (task 7.1).
+                        job.splits.fetch_add(1, Ordering::Relaxed);
                         job.notify_transition();
                     }
                     split
@@ -895,12 +1073,27 @@ async fn worker_loop(
             })
             .await;
 
+        // Holding a lease (acquired or split): mark this worker active
+        // (task 1.2) right before the transfer so both acquisition paths
+        // report identically.
+        job.set_worker_state(worker_idx, 2);
+        // Lazy writer lane (task 1.4): created on this worker's first
+        // activation; the blocking thread lives until dormancy or exit.
+        let lane_handle = match lane {
+            Some(l) => l.handle(),
+            None => {
+                let created = crate::io::writer_lane::WriterLane::spawn(output.clone_capability());
+                lane.replace(created);
+                job.set_worker_lane_live(worker_idx, true);
+                lane.as_ref().expect("just inserted").handle()
+            }
+        };
         let result = transfer_lease(
             &execution,
             &classifier,
             &job,
             &lease,
-            &lane,
+            &lane_handle,
             &identity,
             &req_spec,
             worker_idx,
@@ -917,6 +1110,9 @@ async fn worker_loop(
                 let mut sched = job.scheduler.lock().await;
                 let _ = sched.complete(lease.id, lease.generation);
                 job.worker_progress[worker_idx].clear();
+                // The worker is idle again (task 1.2): state flips exactly
+                // where the lease cell clears so the gauges never disagree.
+                job.set_worker_state(worker_idx, 1);
                 // Completion frees bytes / finishes the job (task 7.1).
                 job.notify_transition();
             }
@@ -945,6 +1141,8 @@ async fn worker_loop(
                     job.notify_transition();
                 }
                 job.worker_progress[worker_idx].clear();
+                // Idle again after the retry requeue (task 1.2).
+                job.set_worker_state(worker_idx, 1);
                 if let Some(w) = counters.worker(worker_idx) {
                     w.add_retries(1);
                 }
@@ -1358,7 +1556,11 @@ async fn coordinator_loop(
 /// throttle events, worker idle ratio and write latency), decide, and apply
 /// within strict bounds. Manual override suspends the loop for the job's
 /// remainder.
-async fn adaptive_controller_loop(job: Arc<SegmentedJob>, counters: Arc<JobCounters>) {
+async fn adaptive_controller_loop(
+    job: Arc<SegmentedJob>,
+    counters: Arc<JobCounters>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
     let config = crate::control::adaptive::AdaptiveConfig::default();
     let mut controller = crate::control::adaptive::AdaptiveController::new(
         config,
@@ -1369,7 +1571,19 @@ async fn adaptive_controller_loop(job: Arc<SegmentedJob>, counters: Arc<JobCount
     let mut previous_throttled = job.throttle_events();
     let mut last = Instant::now();
     loop {
-        tokio::time::sleep(config.window).await;
+        // Task 1.5: the controller exits promptly on the job shutdown
+        // signal as well as its own cancel/fatal/manual-override checks —
+        // run_segmented joins it before computing the outcome, so no late
+        // decision can race the terminal record.
+        tokio::select! {
+            _ = tokio::time::sleep(config.window) => {}
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+                continue;
+            }
+        }
         if job.cancel.is_cancelled() || job.fatal.is_fatal() {
             return;
         }
@@ -1430,6 +1644,9 @@ async fn attempt_coordinator_save(
     identity: &str,
     last_saved: &mut Option<SavedRevision>,
 ) -> Result<(), DownloadError> {
+    // Task 0.4 observability: the save latency covers snapshot through the
+    // store write (the whole coordinator save), recorded only on success.
+    let save_started = std::time::Instant::now();
     // 1. Coherent snapshot under the scheduler lock (reconcile + credit the
     // accepted deltas — task 5.4 — then settle).
     let (ranges, generation) = {
@@ -1515,6 +1732,10 @@ async fn attempt_coordinator_save(
         Ok(()) => {
             // Revision advances only on a successful save.
             *last_saved = Some(candidates);
+            job.last_checkpoint_save_us.store(
+                save_started.elapsed().as_micros().max(1) as u64,
+                Ordering::Relaxed,
+            );
             Ok(())
         }
         Err(error) => Err(error),
@@ -1611,6 +1832,10 @@ mod durability_tests {
             manual_override: AtomicBool::new(false),
             throttle_events: AtomicU64::new(0),
             write_latency_us: AtomicU64::new(0),
+            splits: AtomicU64::new(0),
+            last_checkpoint_save_us: AtomicU64::new(0),
+            worker_states: vec![AtomicU8::new(0)],
+            worker_lane_live: vec![AtomicBool::new(false)],
             min_workers: 1,
             max_workers: 1,
             worker_progress: vec![Arc::new(LeaseProgress::default())],
@@ -1725,6 +1950,11 @@ mod durability_tests {
         assert!(
             last_saved.is_some(),
             "a successful save advances the revision"
+        );
+        // Task 0.4 observability: a completed save records its latency.
+        assert!(
+            job.last_checkpoint_save_us().is_some(),
+            "save latency must be recorded after a successful save"
         );
         // The Flush op was never fired by the save path.
         assert!(!script

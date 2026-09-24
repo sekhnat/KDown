@@ -78,7 +78,7 @@ async fn concurrency_reduction_mid_transfer_no_data_loss() {
                     .with_body(body)
                     .with_header("content-range", &format!("bytes {s}-{e}/{total}"))
                     .with_header("accept-ranges", "bytes")
-                    .chunked(Duration::from_millis(5))
+                    .chunked(Duration::from_millis(20))
             } else {
                 ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
             }
@@ -305,6 +305,13 @@ async fn retried_ranges_count_wasted_bytes_with_exact_coverage() {
     assert_eq!(result.bytes_downloaded_from_network, content.len() as u64);
     assert!(result.retries >= 1, "the resets must have been retried");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    // Wire amplification (task 0.4): segmented tail-only retry re-delivers
+    // nothing, so the clean-transfer amplification is exactly 1.
+    assert_eq!(
+        result.wire_amplification(),
+        Some(1.0),
+        "clean segmented amplification: {result:?}"
+    );
 }
 
 /// Single-stream restarts after mid-body failure charge the discarded
@@ -363,6 +370,10 @@ async fn single_stream_restart_counts_wasted_bytes() {
         "unique coverage is exact: {result:?}"
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    // Wire amplification (task 0.4): the restart's re-received prefix
+    // inflates network payload above unique completion.
+    let amp = result.wire_amplification().expect("nonzero denominator");
+    assert!(amp > 1.0, "single-stream restart amplification {amp}");
 }
 
 /// Increase → decrease → increase (task 8.2): dormant workers reactivate on
@@ -503,4 +514,526 @@ async fn fixed_mode_starts_at_configured_max() {
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+// ---- Observability gauges (optimize-transfer-engine-v2 task 0.4) ----
+
+/// Split events and the actual-active gauge (task 0.4): a whole-file lease
+/// plus idle workers forces live-tail splits; the job reports them, the
+/// active gauge never exceeds desired, and after completion no worker holds
+/// a lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_events_and_active_worker_gauge_are_reported() {
+    let content = Arc::new(deterministic_bytes(1024 * 1024, 4001));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/gauges", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            let body = content[s as usize..=(end as usize)].to_vec();
+            let mut resp = ScriptedResponse::new(206)
+                .with_body(body)
+                .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                .with_header("accept-ranges", "bytes");
+            if req.range.is_none() {
+                resp = ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            // Pace the first worker so idle workers observe the live tail
+            // and split it while it streams.
+            resp.chunked(Duration::from_millis(2))
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("gauges.bin");
+    let mut c_cfg = segmented_cfg();
+    // One whole-file lease: idle workers must split the live tail.
+    c_cfg.transfer.initial_segment_size = content.len() as u64;
+    c_cfg.transfer.max_segment_size = content.len() as u64;
+    c_cfg.transfer.max_workers = 4;
+    c_cfg.transfer.min_workers = 1;
+    let c = controller(c_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/gauges"), dest.clone()));
+    let mut saw_active = 0u64;
+    let mut splits = 0u64;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if let Some(job) = handle.segmented_job() {
+            saw_active = saw_active.max(job.active_workers());
+            splits = splits.max(job.split_count());
+            assert!(
+                job.active_workers() <= job.desired_workers(),
+                "active gauge must not exceed desired"
+            );
+        }
+    }
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    assert!(splits >= 1, "live-tail splits must be counted: {splits}");
+    assert!(
+        saw_active >= 1,
+        "the active gauge must observe in-flight workers: {saw_active}"
+    );
+    if let Some(job) = handle.segmented_job() {
+        assert_eq!(
+            job.active_workers(),
+            0,
+            "no worker holds a lease after completion"
+        );
+    }
+}
+
+/// Adaptive growth must ACTIVATE additional workers, not only raise the
+/// desired count (optimize-transfer-engine-v2 task 1.1): a min=1/max=4
+/// adaptive job with one held large range probes up within ~2 controller
+/// windows; a second worker must then hold a lease simultaneously. The
+/// current desired-only provisioning cannot spawn workers beyond the initial
+/// count, so this test fails until task 1.3 provisions real capacity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_probe_activates_additional_workers() {
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 5001));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/growth", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            if req.range.is_some() {
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("growth.bin");
+
+    let mut adaptive_cfg = segmented_cfg();
+    adaptive_cfg.transfer.max_workers = 4;
+    adaptive_cfg.transfer.min_workers = 1;
+    adaptive_cfg.transfer.concurrency_mode =
+        kdown_engine::config::ConcurrencyMode::Adaptive;
+    // One whole-file lease: growth requires a live-tail split by the new
+    // worker, exactly the activation path the fix must exercise.
+    adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
+    adaptive_cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(adaptive_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/growth"), dest.clone()));
+
+    // Wait for the first worker to hold the (only) lease.
+    let mut first_worker = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.active_workers() >= 1 {
+                first_worker = true;
+                break;
+            }
+        }
+    }
+    assert!(first_worker, "the first adaptive worker must hold the lease");
+
+    // The controller probes up within ~2 windows (500 ms each). A second
+    // worker must then be observed holding a lease simultaneously.
+    let mut max_active = 0u64;
+    let mut desired = 0u64;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            max_active = max_active.max(job.active_workers());
+            desired = job.desired_workers();
+            if max_active >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(
+        max_active >= 2,
+        "an adaptive probe (desired={desired}) must activate a second worker; \
+         observed max active={max_active} — provisioning is desired-only"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// Gauges keyed by stable worker index (task 1.2): a fixed-mode job with
+/// desired=4 and one whole-file lease reports provisioned=4, active=1,
+/// parked=3 — the gauges are distinct values, so a low active count is never
+/// misreported as growth (and growth is never inferred from desired alone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_gauges_distinguish_desired_provisioned_active() {
+    // 256 KiB = the split threshold: a whole-file lease cannot be split
+    // (tail_len <= min_tail), so three workers stay parked while one
+    // transfers — the exact desired/active/parked separation under test.
+    let content = Arc::new(deterministic_bytes(256 * 1024, 5002));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/gauges2", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            if req.range.is_some() {
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(50))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(50))
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("gauges2.bin");
+    let mut c_cfg = segmented_cfg();
+    c_cfg.transfer.segmentation_threshold = 1; // 256 KiB must go segmented
+    c_cfg.transfer.max_workers = 4;
+    c_cfg.transfer.min_workers = 1;
+    // Fixed mode starts all 4 workers; one whole-file lease keeps three idle.
+    c_cfg.transfer.initial_segment_size = content.len() as u64;
+    c_cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(c_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/gauges2"), dest.clone()));
+
+    // Observe the gauges mid-transfer.
+    let mut saw = None;
+    let mut last_observed = (0u64, 0u64, 0u64, 0u64);
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            let (desired, provisioned, active, parked) = (
+                job.desired_workers(),
+                job.provisioned_workers(),
+                job.active_workers(),
+                job.parked_workers(),
+            );
+            last_observed = (desired, provisioned, active, parked);
+            if provisioned == 4 && active >= 1 {
+                saw = Some((desired, provisioned, active, parked));
+                break;
+            }
+        }
+    }
+    let (desired, provisioned, active, parked) = match saw {
+        Some(v) => v,
+        None => {
+            let early = tokio::time::timeout(Duration::from_secs(10), join).await;
+            match early {
+                Ok(Ok(Ok(result))) => panic!(
+                    "fixed mode must provision all four workers; last={last_observed:?}                      early_result={:?} elapsed={:?}",
+                    result.status, result.elapsed
+                ),
+                other => panic!(
+                    "fixed mode must provision all four workers; last={last_observed:?}                      early={other:?}"
+                ),
+            }
+        }
+    };
+    assert_eq!(desired, 4, "fixed desired = max_workers");
+    assert_eq!(provisioned, 4, "four worker tasks exist");
+    assert_eq!(
+        provisioned, active + parked,
+        "provisioned splits exactly into active + parked"
+    );
+    assert!(
+        active < desired,
+        "one whole-file lease: active ({active}) < desired ({desired}) — the \
+         gauges must not conflate this with growth"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// Writer-lane lifecycle tracks the desired count (task 1.4): an adaptive
+/// job starts with one blocking writer lane, grows to two when the probe
+/// activates a second worker, and returns to one after a manual decrease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writer_lanes_track_desired_concurrency() {
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 5003));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/lanes", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            if req.range.is_some() {
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("lanes.bin");
+    let mut adaptive_cfg = segmented_cfg();
+    adaptive_cfg.transfer.segmentation_threshold = 1;
+    adaptive_cfg.transfer.max_workers = 4;
+    adaptive_cfg.transfer.min_workers = 1;
+    adaptive_cfg.transfer.concurrency_mode =
+        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
+    adaptive_cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(adaptive_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/lanes"), dest.clone()));
+
+    // One active worker: exactly one blocking writer lane.
+    let mut lanes_at_one = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.active_workers() >= 1 {
+                lanes_at_one = job.writer_lanes_alive() == 1;
+                break;
+            }
+        }
+    }
+    assert!(
+        lanes_at_one,
+        "one active worker must hold exactly one writer lane"
+    );
+
+    // Growth: the probe activates a second worker and a second lane.
+    let mut grew = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.active_workers() >= 2 && job.writer_lanes_alive() >= 2 {
+                grew = true;
+                break;
+            }
+        }
+    }
+    assert!(grew, "growth must add a second writer lane");
+
+    // Manual decrease: the extra worker parks dormant and releases its lane.
+    handle.set_concurrency(1);
+    let mut shrank = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.writer_lanes_alive() <= 1 && job.desired_workers() == 1 {
+                shrank = true;
+                break;
+            }
+        }
+    }
+    assert!(shrank, "decrease must release the extra writer lane");
+
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+// ---- Adaptive controller lifecycle (optimize-transfer-engine-v2 task 1.5) ----
+
+/// Pause → resume on an adaptive job with a worker holding a lease and
+/// dormant workers parked: no stranded range, no lost revision wakeup, and
+/// the job completes byte-exact after resume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_pause_resume_with_parked_and_active_workers() {
+    let content = Arc::new(deterministic_bytes(4 * 1024 * 1024, 5004));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/apause", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            if req.range.is_some() {
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("apause.bin");
+    let mut adaptive_cfg = segmented_cfg();
+    adaptive_cfg.transfer.segmentation_threshold = 1;
+    adaptive_cfg.transfer.max_workers = 4;
+    adaptive_cfg.transfer.min_workers = 1;
+    adaptive_cfg.transfer.concurrency_mode =
+        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
+    adaptive_cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(adaptive_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/apause"), dest.clone()));
+
+    // Wait until a worker holds the lease, then pause mid-body.
+    let mut started = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.active_workers() >= 1 {
+                started = true;
+                break;
+            }
+        }
+    }
+    assert!(started, "transfer must be running before the pause");
+    handle.pause();
+    let frozen = handle.snapshot().network_bytes;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_pause = handle.snapshot().network_bytes;
+    assert_eq!(
+        frozen, after_pause,
+        "network activity must freeze while paused"
+    );
+
+    handle.resume_now();
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang after resume (no stranded range, no lost wakeup)")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// Keep-partial cancellation while a worker holds a lease and others are
+/// parked dormant: the job settles as Cancelled with the acknowledged
+/// coverage preserved in the checkpoint, and no task hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adaptive_cancel_keep_partial_with_parked_workers() {
+    use kdown_engine::job::controller::CancelMode;
+    let content = Arc::new(deterministic_bytes(4 * 1024 * 1024, 5005));
+    let server = {
+        let content = content.clone();
+        TestServer::new().serve_handler("/acancel", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            let (s, e) = req.range.unwrap_or((0, total - 1));
+            let end = e.min(total - 1);
+            if req.range.is_some() {
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            } else {
+                ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes")
+                    .chunked(Duration::from_millis(20))
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("acancel.bin");
+    let mut adaptive_cfg = segmented_cfg();
+    adaptive_cfg.transfer.segmentation_threshold = 1;
+    adaptive_cfg.transfer.max_workers = 4;
+    adaptive_cfg.transfer.min_workers = 1;
+    adaptive_cfg.transfer.concurrency_mode =
+        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
+    adaptive_cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(adaptive_cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/acancel"), dest.clone()));
+
+    // Let the transfer make progress, then cancel keep-partial.
+    let mut progressed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if handle.snapshot().network_bytes > 0 {
+            progressed = true;
+            break;
+        }
+    }
+    assert!(progressed, "transfer must start before cancellation");
+    handle.cancel_with(CancelMode::KeepPartial);
+
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang on cancel with parked workers")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+    // Acknowledged coverage survived (checkpoint + partial file), and the
+    // accounting stays truthful.
+    assert_eq!(
+        result.completed_bytes, result.bytes_downloaded_from_network,
+        "no duplicated coverage on the cancelled path: {result:?}"
+    );
 }

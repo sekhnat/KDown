@@ -76,6 +76,20 @@ impl Drop for OutputWriteHandle {
 }
 
 impl OutputWriteHandle {
+    /// Explicit counted clone (task 1.4): the dynamic writer-lane lifecycle
+    /// lends the capability to a lane on activation and gets it back on
+    /// shutdown, so `writers_alive` tracks every live clone.
+    #[must_use]
+    pub(crate) fn clone_capability(&self) -> Self {
+        self.writers_alive.fetch_add(1, Ordering::SeqCst);
+        OutputWriteHandle {
+            file: self.file.clone(),
+            writers_alive: self.writers_alive.clone(),
+            #[cfg(test)]
+            script: self.script.clone(),
+        }
+    }
+
     /// Synchronous positional write used by blocking writer lanes (task 2.3).
     /// Scripted output faults apply at this capability boundary.
     ///
