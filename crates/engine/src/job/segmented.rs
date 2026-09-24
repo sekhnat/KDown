@@ -1651,20 +1651,29 @@ async fn consume_legacy_body(
             }
         };
         match event {
-            Ok(BodyEvent::Data(data)) => {
+            Ok(BodyEvent::Data(mut data)) => {
                 // Live-tail split boundary (task 3.2): stop consuming at the
                 // shrunken lease end — the response tail beyond it belongs
                 // to the split lease and is discarded as split waste.
-                if validated_start + in_range_offset > effective_end {
-                    // The lease end is INCLUSIVE: the byte at effective_end
-                    // still belongs to this worker; the stop boundary is
-                    // exclusive (beyond it).
-                    let wasted = validated_end.saturating_sub(effective_end);
-                    if wasted > 0 {
-                        if let Some(w) = job.counters.worker(worker_idx) {
-                            w.add_wasted(wasted);
-                        }
+                // The lease end is INCLUSIVE: bytes up to and including
+                // effective_end belong to this worker. A chunk may SPAN the
+                // boundary (a server delivering a whole body as one frame):
+                // the owned prefix is written and the remainder is split
+                // waste, so the overlap is bounded regardless of chunk size.
+                let abs_offset = validated_start + in_range_offset;
+                // inclusive end: abs_offset == effective_end is still owned.
+                let owned_len = if abs_offset > effective_end {
+                    0
+                } else {
+                    (effective_end + 1 - abs_offset).min(data.len() as u64)
+                };
+                let wasted = data.len() as u64 - owned_len;
+                if wasted > 0 {
+                    if let Some(w) = job.counters.worker(worker_idx) {
+                        w.add_wasted(wasted);
                     }
+                }
+                if owned_len == 0 {
                     break;
                 }
                 // Wire bytes count at RECEIPT (task 5.4, design D4): even if
@@ -1679,10 +1688,10 @@ async fn consume_legacy_body(
                 // the worker publishes progress or completed counters (one
                 // outstanding payload per worker, task 2.3); no per-chunk
                 // flush.
-                let abs_offset = validated_start + in_range_offset;
-                job.acquire_rate(data.len() as u64).await;
+                let owned = data.split_to(owned_len as usize);
+                job.acquire_rate(owned.len() as u64).await;
                 let write_started = Instant::now();
-                lane.write(abs_offset, data.clone())
+                lane.write(abs_offset, owned.clone())
                     .await
                     .map_err(|se| WorkerError::Fatal(se.0))?;
                 // Write-ack latency for the controller's sampling (task 9.2).
@@ -1690,7 +1699,12 @@ async fn consume_legacy_body(
                     u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                in_range_offset += data.len() as u64;
+                in_range_offset += owned.len() as u64;
+                if owned_len < data.len() as u64 {
+                    // The chunk was truncated at the boundary: this worker
+                    // is done with the lease.
+                    break;
+                }
 
                 // Hot-path progress (§13.3, task 6.3): publish the
                 // acknowledged written-through offset as one coherent record

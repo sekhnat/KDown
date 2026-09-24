@@ -40,7 +40,7 @@ Every phase is independently verifiable. Before a behavior change, record its ba
 - [x] 3.3 Prefer pending unclaimed ranges and add measured ready-work target (~2–3× desired candidate) with straggler-only live split; verify no lease leak, starvation or overlapping logical ownership under 1→4→1 worker changes.
 - [x] 3.4 Implement opt-in duration-informed `TargetSelector` using smoothed per-worker *unique* goodput, RTT/request-cost guard and bounded size-step changes; verify fast/slow scripted samples, short job fallback to explicit size, min/max bounds and checkpoint resume gaps.
 - [x] 3.5 Sweep target duration 0.5/1/1.5 s and ready-work factors on H1/H2 WAN-shaped fixtures; record segment/split counts, amplification, completion latency and variance before choosing a documented opt-in default. Keep existing Explicit/Automatic behavior unchanged.
-- [ ] 3.6 Gate phase 3: deterministic clean H1 partial-range/split test checks server-emitted and client payload, exact hash, unique coverage, amplification <1.10 and unconditional 2× regression failure; run H2 and baseline comparisons; record any exception with evidence, not a relaxed silent threshold.
+- [x] 3.6 Gate phase 3: deterministic clean H1 partial-range/split test checks server-emitted and client payload, exact hash, unique coverage, amplification <1.10 and unconditional 2× regression failure; run H2 and baseline comparisons; record any exception with evidence, not a relaxed silent threshold.
 
 ## 4. Adaptive controller v2 and storage pressure
 

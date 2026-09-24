@@ -15,10 +15,12 @@
 #[path = "support/mod.rs"]
 mod support;
 
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kdown_engine::config::{EngineConfig, TransferPolicy};
+use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, SegmentSizing, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
@@ -122,5 +124,298 @@ async fn live_tail_split_never_doubles_wire_payload() {
         amplification < 2.0,
         "wire amplification {amplification:.3}x reached the unconditional 2x \
          failure bound (emitted {emitted} bytes for {len} accepted)"
+    );
+}
+
+/// Slow-streaming body: yields the payload in small frames with a delay
+/// between frames (mirroring the H1 chunked fixture), so the server's
+/// emission tracks the client's actual consumption instead of racing ahead
+/// through HTTP/2 flow-control windows that a stream reset later discards.
+struct SlowBody {
+    data: hyper::body::Bytes,
+    pos: usize,
+    chunk: usize,
+    delay: Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl SlowBody {
+    fn new(data: hyper::body::Bytes, chunk: usize, delay: Duration) -> Self {
+        Self {
+            data,
+            pos: 0,
+            chunk,
+            delay,
+            sleep: None,
+        }
+    }
+}
+
+impl hyper::body::Body for SlowBody {
+    type Data = hyper::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if self.pos >= self.data.len() {
+            return std::task::Poll::Ready(None);
+        }
+        if let Some(sleep) = self.sleep.as_mut() {
+            match sleep.as_mut().poll(cx) {
+                std::task::Poll::Ready(()) => {
+                    self.sleep = None;
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        let end = (self.pos + self.chunk).min(self.data.len());
+        let frame = self.data.slice(self.pos..end);
+        self.pos = end;
+        self.sleep = Some(Box::pin(tokio::time::sleep(self.delay)));
+        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(frame))))
+    }
+}
+
+/// Payload body that counts bytes as the server actually emits them
+/// (polled frames), so a client-side stream reset stops the count —
+/// requested bytes are not emitted bytes.
+struct CountingBody<B> {
+    inner: B,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<B> hyper::body::Body for CountingBody<B>
+where
+    B: hyper::body::Body<Data = hyper::body::Bytes> + Unpin,
+    B::Error: std::fmt::Debug,
+{
+    type Data = hyper::body::Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.counter
+                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::SeqCst);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Phase-3 gate over HTTPS/2: the same clean live-tail split fixture must
+/// hold the <1.10 amplification bound when the range streams multiplex over
+/// one H2 connection (no additional sockets, streams validated as usual).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_tail_split_h2_never_doubles_wire_payload() {
+    use tokio_rustls::rustls;
+
+    let len = 8 * 1024 * 1024;
+    let content = deterministic_bytes(len, 4243);
+    // H2 TLS server with the same delayed range handler.
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+    let ca_pem = cert.cert.pem().into_bytes();
+    let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+    );
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server cert");
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_config = Arc::new(tls);
+
+    let payload = Arc::new(content.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let emit_counter = emitted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let tls = tls_config.clone();
+            let payload = payload.clone();
+            let counter = emit_counter.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
+                else {
+                    return;
+                };
+                let served = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(
+                    hyper_util::rt::TokioIo::new(tls_stream),
+                    hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let counter = counter.clone();
+                            let payload = payload.clone();
+                            async move {
+                                let range = req
+                                    .headers()
+                                    .get("range")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| {
+                                        let rest = v.strip_prefix("bytes=")?;
+                                        let (s, e) = rest.split_once('-')?;
+                                        Some((s.parse::<u64>().ok()?, e.parse::<u64>().ok()?))
+                                    });
+                                let len = payload.len() as u64;
+                                let (status, body, content_range) = match range {
+                                    Some((s, e)) => {
+                                        let end = e.min(len - 1);
+                                        eprintln!("[h2-req] bytes={s}-{end}");
+                                        // Slow the stream so the first worker
+                                        // stays on the wire for idle workers
+                                        // to split the live tail.
+                                        tokio::time::sleep(Duration::from_millis(2)).await;
+                                        (
+                                            206,
+                                            payload[s as usize..=(end as usize)].to_vec(),
+                                            Some(format!("bytes {s}-{end}/{len}")),
+                                        )
+                                    }
+                                    None => {
+                                        tokio::time::sleep(Duration::from_millis(2)).await;
+                                        (200, payload.as_ref().clone(), None)
+                                    }
+                                };
+                                let mut resp = hyper::Response::builder()
+                                    .status(status)
+                                    .header("content-length", body.len())
+                                    .header("accept-ranges", "bytes");
+                                if let Some(cr) = content_range {
+                                    resp = resp.header("content-range", cr);
+                                }
+                                // Count bytes as hyper actually polls them
+                                // onto the socket: a client that stops
+                                // reading (split stop) resets the stream and
+                                // the count stops with it — requested bytes
+                                // are not emitted bytes.
+                                let counted = CountingBody {
+                                    inner: SlowBody::new(
+                                        hyper::body::Bytes::from(body),
+                                        64 * 1024,
+                                        Duration::from_millis(2),
+                                    ),
+                                    counter: counter.clone(),
+                                };
+                                resp.body(counted)
+                                    .map(Ok::<_, std::convert::Infallible>)
+                                    .expect("response body")
+                            }
+                        },
+                    ),
+                )
+                .await;
+                if let Err(error) = served {
+                    eprintln!("h2 amp server connection error: {error}");
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+    let dest = dir.path().join("amp-h2.bin");
+
+    let mut config = cfg(len);
+    config.tls.custom_ca_bundle = Some(ca_path);
+    config.h2_policy = H2ConnectionPolicy::Single;
+    let c = SingleStreamController::new(
+        HttpTransport::from_config(&config).expect("transport"),
+        config,
+    );
+    let result = c
+        .run(DownloadRequest::new(
+            format!("https://localhost:{}/amp-h2.bin", addr.port()),
+            dest.clone(),
+        ))
+        .await
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    assert_eq!(result.completed_bytes, len, "unique coverage exact");
+
+    let emitted_bytes = emitted.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(emitted_bytes >= len, "server served at least the payload");
+    let amplification = emitted_bytes as f64 / len as f64;
+    eprintln!(
+        "[wire-amplification][h2] emitted={emitted_bytes} accepted={len} amplification={amplification:.3}x"
+    );
+    assert!(
+        amplification < 1.10,
+        "clean H2 split amplification {amplification:.3}x exceeded 1.10"
+    );
+    assert!(
+        amplification < 2.0,
+        "H2 amplification {amplification:.3}x reached the unconditional 2x bound"
+    );
+}
+
+/// Phase-3 gate over the pipelined write path with duration sizing: the
+/// shared executor + ready-work + duration allocation must hold the same
+/// clean-split amplification bound (internal switch enabled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_tail_split_pipelined_duration_holds_amplification_bound() {
+    let len = 8 * 1024 * 1024;
+    let content = deterministic_bytes(len, 4244);
+    let server = TestServer::new()
+        .serve_handler(
+            "/amp-pipelined.bin",
+            delayed_static(Arc::new(content.clone()), Duration::from_millis(2)),
+        )
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("amp-pipelined.bin");
+
+    let mut config = cfg(len);
+    config.write_executor.pipeline_writes = true;
+    config.write_executor.writer_threads = 2;
+    config.transfer.segment_sizing = SegmentSizing::Duration { duration_ms: 1_000 };
+    let c = SingleStreamController::new(
+        HttpTransport::from_config(&config).expect("transport"),
+        config,
+    );
+    let result = c
+        .run(DownloadRequest::new(
+            server.url("/amp-pipelined.bin"),
+            dest.clone(),
+        ))
+        .await
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+    assert_eq!(result.completed_bytes, len, "unique coverage exact");
+
+    let emitted = server.payload_emitted().await;
+    let amplification = emitted as f64 / len as f64;
+    eprintln!(
+        "[wire-amplification][pipelined+duration] emitted={emitted} accepted={len} amplification={amplification:.3}x"
+    );
+    assert!(
+        amplification < 1.10,
+        "pipelined clean-split amplification {amplification:.3}x exceeded 1.10"
+    );
+    assert!(
+        amplification < 2.0,
+        "pipelined amplification {amplification:.3}x reached the unconditional 2x bound"
     );
 }
