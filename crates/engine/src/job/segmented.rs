@@ -107,6 +107,15 @@ pub struct SegmentedJob {
     /// Configured bounds for manual concurrency control (task 8.2).
     min_workers: u64,
     max_workers: u64,
+    /// Ready-work sizing (task 3.3): the opt-in Automatic selector keeps
+    /// `ready_work_factor × desired` unclaimed leases pending; disabled for
+    /// Explicit sizing (which keeps its configured meaning).
+    ready_work_sizing: bool,
+    ready_work_factor: u64,
+    /// The divisor last applied to the scheduler policy (avoids re-locking
+    /// writes on every acquire; workers apply changes under their existing
+    /// scheduler lock).
+    applied_ready_divisor: AtomicU64,
     /// Hot-path lease progress (§13.3, task 6.3): one atomic cell per
     /// worker. A worker publishing durable-through offsets for its current
     /// lease writes `(lease_id, generation, durable_through)` into its own
@@ -315,6 +324,16 @@ impl SegmentedJob {
         let clamped = n.clamp(self.min_workers, self.max_workers);
         self.desired_workers.store(clamped, Ordering::Relaxed);
         self.notify_transition();
+    }
+
+    /// The ready-work divisor for a desired count (task 3.3):
+    /// `ready_work_factor × desired`; `0` when the opt-in Automatic sizing
+    /// is not active (Explicit keeps its configured meaning).
+    fn ready_work_divisor_for(&self, desired: u64) -> u64 {
+        if !self.ready_work_sizing {
+            return 0;
+        }
+        self.ready_work_factor.max(1).saturating_mul(desired.max(1))
     }
 
     /// Worker idle ratio over the currently desired workers (task 9.2):
@@ -542,13 +561,12 @@ pub(crate) async fn run_segmented(
             oversubscription: config.transfer.auto_oversubscription,
         },
     };
-    let policy = SchedulerPolicy::with_target(
+    let mut policy = SchedulerPolicy::with_target(
         config.transfer.min_segment_size,
         config.transfer.max_segment_size,
         target,
         256 * 1024,
     );
-    let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
     // Adaptive mode (task 9.1, design D6) starts at `min_workers` and probes
     // upward; fixed mode keeps the configured fixed concurrency.
     let adaptive = config.transfer.concurrency_mode == crate::config::ConcurrencyMode::Adaptive;
@@ -557,6 +575,20 @@ pub(crate) async fn run_segmented(
     } else {
         u64::from(config.transfer.max_workers.max(1))
     };
+    // Ready-work target (task 3.3, design D4): with the opt-in Automatic
+    // sizing, keep roughly `oversubscription × desired` unclaimed leases
+    // pending so workers acquire unclaimed ranges instead of splitting live
+    // tails. Explicit sizing keeps its configured meaning (no ready-work
+    // cap). The initial divisor seeds the policy; workers refresh it under
+    // their acquire lock as the desired count changes.
+    if config.transfer.segment_sizing == crate::config::SegmentSizing::Automatic {
+        policy.ready_work_divisor = config
+            .transfer
+            .auto_oversubscription
+            .max(1)
+            .saturating_mul(desired.max(1));
+    }
+    let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
     // Task 1.3: cells cover the full capacity (all provisioned workers),
     // not just the initial desired count.
     let worker_progress: Vec<Arc<LeaseProgress>> =
@@ -616,6 +648,10 @@ pub(crate) async fn run_segmented(
             .collect(),
         min_workers: u64::from(config.transfer.min_workers.max(1)),
         max_workers: u64::from(config.transfer.max_workers.max(1)),
+        ready_work_sizing: config.transfer.segment_sizing
+            == crate::config::SegmentSizing::Automatic,
+        ready_work_factor: config.transfer.auto_oversubscription.max(1),
+        applied_ready_divisor: AtomicU64::new(u64::MAX),
         worker_progress,
     });
     // One job-level checkpoint coordinator (task 4.1): owns interval timing,
@@ -1118,6 +1154,17 @@ async fn worker_cycle(
         // Acquire a lease (short lock, §13.3).
         let lease = {
             let mut sched = job.scheduler.lock().await;
+            // Ready-work divisor (task 3.3): track desired-count changes
+            // under the lock the worker already holds for the acquire.
+            let desired_now = job.desired_workers.load(Ordering::Relaxed);
+            let want_divisor = job.ready_work_divisor_for(desired_now);
+            if job
+                .applied_ready_divisor
+                .swap(want_divisor, Ordering::Relaxed)
+                != want_divisor
+            {
+                sched.set_ready_work_divisor(want_divisor);
+            }
             // No pending work: wait for tails/failures of live leases
             // instead of manufacturing splits every tick (§12.3 splits
             // serve a worker that would otherwise idle; a single split
@@ -2412,6 +2459,9 @@ mod durability_tests {
             worker_lane_live: vec![AtomicBool::new(false)],
             min_workers: 1,
             max_workers: 1,
+            ready_work_sizing: false,
+            ready_work_factor: 1,
+            applied_ready_divisor: AtomicU64::new(u64::MAX),
             worker_progress: vec![Arc::new(LeaseProgress::default())],
         };
         let job = Arc::new(job);

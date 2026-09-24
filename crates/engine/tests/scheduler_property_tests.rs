@@ -294,6 +294,75 @@ proptest! {
         prop_assert_eq!(rs.last().copied(), Some((0u64, total - 1)));
     }
 
+    /// Ready-work target (task 3.3, design D4): with the divisor enabled,
+    /// consecutive acquires leave roughly `divisor` unclaimed leases of
+    /// pending work behind (where the gap permits), and the union invariant
+    /// plus exact drain coverage still hold under 1→4→1 desired changes.
+    #[test]
+    fn ready_work_carving_keeps_pending_and_stays_exact(
+        total in 4_000u64..400_000,
+        desired_seq in proptest::collection::vec(1u64..5, 1..12),
+    ) {
+        let mut s = SegmentScheduler::initialize(
+            total,
+            &[],
+            SchedulerPolicy::with_target(1, total, kdown_engine::scheduler::core::TargetSelector::None, 1),
+        );
+        // The job's ready factor candidate: ~3x desired (design D4).
+        let ready_factor = 3u64;
+        let mut acquired: Vec<SegmentLease> = Vec::new();
+        for &desired in &desired_seq {
+            s.set_ready_work_divisor(ready_factor * desired.max(1));
+            // Acquire up to `desired` leases at this concurrency.
+            for _ in 0..desired {
+                if let Some(lease) = s.acquire() {
+                    prop_assert!(s.invariants_hold());
+                    acquired.push(lease);
+                }
+            }
+            prop_assert_eq!(
+                s.completed_set().len() + s.pending_bytes() + s.active_bytes(),
+                total,
+                "union stays exact under concurrency changes"
+            );
+        }
+        // No overlapping logical ownership: live leases stay disjoint and
+        // every recorded lease is still owned (no leak — the drain below
+        // must complete every one of them).
+        let live = s.active_leases();
+        for (a, b) in live.iter().zip(live.iter().skip(1)) {
+            prop_assert!(a.end < b.start, "leases overlap: {a:?} {b:?}");
+        }
+        // Drain: every lease (and every pending byte) completes exactly once.
+        for lease in &acquired {
+            let live_now = s.lease_next_offset(lease.id);
+            if live_now.is_some() {
+                prop_assert!(s.report_progress(lease.id, lease.generation, lease.end + 1));
+                prop_assert!(s.complete(lease.id, lease.generation));
+            }
+        }
+        loop {
+            let live = s.active_leases();
+            if let Some(l) = live.first().copied() {
+                prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+                prop_assert!(s.complete(l.id, l.generation));
+                continue;
+            }
+            match s.acquire() {
+                Some(l) => {
+                    prop_assert!(s.report_progress(l.id, l.generation, l.end + 1));
+                    prop_assert!(s.complete(l.id, l.generation));
+                }
+                None => break,
+            }
+        }
+        prop_assert!(s.is_complete(), "no lease leak: the domain drains exactly");
+        prop_assert_eq!(
+            s.completed_ranges(),
+            vec![(0u64, total - 1)] as Vec<ByteRange>
+        );
+    }
+
     /// Split never includes consumed bytes and no two live leases ever
     /// overlap (no-double-lease property, §12.3).
     #[test]
@@ -345,4 +414,80 @@ proptest! {
             prop_assert!(s.invariants_hold());
         }
     }
+}
+
+/// Ready-work shaping (deterministic, task 3.3): with the divisor set,
+/// the first carve leaves roughly `divisor - 1` further acquires of
+/// pending work instead of consuming the whole gap.
+#[test]
+fn ready_work_leaves_unclaimed_pending() {
+    let total: u64 = 64 * 1024 * 1024;
+    let min_segment: u64 = 1024 * 1024;
+    let mut s = SegmentScheduler::initialize(
+        total,
+        &[],
+        SchedulerPolicy::with_target(
+            min_segment,
+            8 * 1024 * 1024,
+            kdown_engine::scheduler::core::TargetSelector::Explicit(8 * 1024 * 1024),
+            256 * 1024,
+        ),
+    );
+    // divisor 12 reserves 11 min-sized unclaimed leases behind each carve;
+    // with a 64 MiB gap the target (8 MiB) fits inside the reserve cap, so
+    // every carve keeps the reserve pending until the tail.
+    s.set_ready_work_divisor(12);
+    let reserve: u64 = 11 * min_segment;
+    let mut leases = 0;
+    while let Some(lease) = s.acquire() {
+        leases += 1;
+        let span = lease.end - lease.start + 1;
+        assert!(
+            span <= 8 * 1024 * 1024,
+            "carve bounded by the target: {span}"
+        );
+        let pending = s.pending_bytes();
+        if pending > 0 {
+            assert!(
+                pending >= reserve.min(pending),
+                "ready work maintained while bytes permit: pending={pending}"
+            );
+        }
+        assert!(s.invariants_hold());
+    }
+    // The union of all carved leases is exactly the domain (no gaps, no
+    // overlaps, no lease leak) and near the tail the reserve shrinks carves
+    // (5 MiB at gap 16 MiB with an 11 MiB reserve) instead of letting
+    // pending run dry.
+    let carved: u64 = s.active_leases().iter().map(|l| l.end - l.start + 1).sum();
+    assert_eq!(carved, total, "all leases from pending, domain fully owned");
+    assert!(leases >= 8, "at least the target-sized leases: {leases}");
+    assert!(s.invariants_hold());
+
+    // Where the gap does NOT leave room beyond the reserve (12 MiB gap,
+    // 11 MiB reserve), the carve shrinks to keep the ready-work promise:
+    // the first lease is 1 MiB with 11 MiB left pending for other workers.
+    let mut small = SegmentScheduler::initialize(
+        12 * 1024 * 1024,
+        &[],
+        SchedulerPolicy::with_target(
+            min_segment,
+            8 * 1024 * 1024,
+            kdown_engine::scheduler::core::TargetSelector::Explicit(8 * 1024 * 1024),
+            256 * 1024,
+        ),
+    );
+    small.set_ready_work_divisor(12);
+    let lease = small.acquire().expect("small-gap lease");
+    assert_eq!(
+        lease.end - lease.start + 1,
+        min_segment,
+        "carve shrinks to keep the ready-work reserve pending"
+    );
+    assert_eq!(
+        small.pending_bytes(),
+        11 * min_segment,
+        "11 unclaimed min-sized leases remain pending"
+    );
+    assert!(small.invariants_hold());
 }

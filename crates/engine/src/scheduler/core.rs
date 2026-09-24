@@ -43,6 +43,15 @@ pub struct SchedulerPolicy {
     /// Minimum tail worth splitting (task 6.2): scheduler-owned split
     /// policy replaces the worker's hard-coded 256 KiB constant.
     pub split_threshold: u64,
+    /// Ready-work divisor (task 3.3, design D4): when nonzero, each carve
+    /// is capped at `gap_len / divisor` (bounded below by the minimum
+    /// segment within the gap) so roughly `divisor` unclaimed leases stay
+    /// pending behind the active ones — workers acquire pending work
+    /// instead of splitting live tails. The job sets it to
+    /// `ready_factor × desired_workers` and refreshes it when the desired
+    /// count changes. `0` disables the cap (carve-to-target, prior
+    /// behavior; Explicit sizing keeps its meaning).
+    pub ready_work_divisor: u64,
 }
 
 impl SchedulerPolicy {
@@ -56,6 +65,7 @@ impl SchedulerPolicy {
             max_segment_size: max_segment_size.max(min),
             target: TargetSelector::None,
             split_threshold: 256 * 1024,
+            ready_work_divisor: 0,
         }
     }
 
@@ -103,13 +113,32 @@ impl SchedulerPolicy {
     }
 
     /// The target lease length for the next carve from a gap of `gap_len`
-    /// bytes (task 6.1): the resolved target clamped to the gap.
+    /// bytes (task 6.1): the resolved target clamped to the gap, further
+    /// capped by the ready-work divisor when enabled (task 3.3) — where the
+    /// remaining gap permits (≥ divisor × minimum segment), the carve
+    /// leaves roughly `divisor` unclaimed leases of pending work behind.
     #[must_use]
     fn target_len(&self, gap_len: u64, resolved_target: Option<u64>) -> u64 {
         let raw = resolved_target.unwrap_or(self.max_segment_size);
-        raw.clamp(self.min_segment_size.min(gap_len), self.max_segment_size)
+        let mut want = raw
+            .clamp(self.min_segment_size.min(gap_len), self.max_segment_size)
             .min(gap_len)
-            .max(self.min_segment_size.min(gap_len))
+            .max(self.min_segment_size.min(gap_len));
+        if self.ready_work_divisor > 0 {
+            // Reserve roughly (divisor - 1) minimum-sized unclaimed leases
+            // behind this carve while the gap permits (design D4): workers
+            // acquire pending ranges instead of splitting live tails.
+            let min_in_gap = self.min_segment_size.min(gap_len).max(1);
+            let reserve = self
+                .ready_work_divisor
+                .saturating_sub(1)
+                .saturating_mul(min_in_gap);
+            if gap_len > reserve {
+                let ready_cap = gap_len.saturating_sub(reserve).max(min_in_gap);
+                want = want.min(ready_cap);
+            }
+        }
+        want
     }
 }
 
@@ -389,6 +418,13 @@ impl SegmentScheduler {
             }
         }
         self.generation
+    }
+
+    /// Refresh the ready-work divisor (task 3.3): the job recomputes
+    /// `ready_factor × desired_workers` when the desired count changes.
+    /// Zero disables the ready-work cap.
+    pub fn set_ready_work_divisor(&mut self, divisor: u64) {
+        self.policy.ready_work_divisor = divisor;
     }
 
     /// The live acknowledged frontier of an active lease (task 5.4: the
