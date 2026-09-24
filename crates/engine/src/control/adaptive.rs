@@ -865,6 +865,86 @@ mod tests {
         assert_eq!(controller.last_reason(), DecisionReason::RetryPressure);
     }
 
+    /// Noisy windows must not oscillate the level (task 4.3): near-band
+    /// alternating windows move the level at most one worker per window and
+    /// oscillate at most one step around the floor instead of running away.
+    #[test]
+    fn noisy_windows_do_not_oscillate_the_level() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        let mut level = 1u64;
+        let decision = controller.decide(instrumented_sample(1_000_000, 500), level);
+        level = controller.apply(decision, level);
+        let mut levels = vec![level];
+        for index in 0..24 {
+            // Cooldown expiry between windows: the worst case for thrash.
+            controller.cooldown_until = None;
+            // +/- 6% around the baseline: a probe is either marginally kept or
+            // reverted, never a sustained climb.
+            let completed = if index % 2 == 0 { 1_060_000 } else { 940_000 };
+            let decision = controller.decide(instrumented_sample(completed, 500), level);
+            let next = controller.apply(decision, level);
+            assert!(
+                next.abs_diff(level) <= 1,
+                "at most one worker per window: {level} -> {next}"
+            );
+            level = next;
+            levels.push(level);
+        }
+        let max = *levels.iter().max().expect("levels");
+        let min = *levels.iter().min().expect("levels");
+        assert!(
+            max - min <= 1,
+            "near-band noise oscillates at most one step: {levels:?}"
+        );
+        assert!(max <= 2, "near-band noise cannot climb: {levels:?}");
+        assert!(levels.iter().all(|l| (1..=8).contains(l)));
+    }
+
+    /// Even strong alternating windows move the level at most one worker per
+    /// window (task 4.3): no jump-to-max reaction to a single spike.
+    #[test]
+    fn strong_swings_move_at_most_one_worker_per_window() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        let mut level = 1u64;
+        let decision = controller.decide(instrumented_sample(500_000, 500), level);
+        level = controller.apply(decision, level);
+        for index in 0..16 {
+            controller.cooldown_until = None;
+            let completed = if index % 2 == 0 { 4_000_000 } else { 50_000 };
+            let decision = controller.decide(instrumented_sample(completed, 500), level);
+            let next = controller.apply(decision, level);
+            assert!(
+                next.abs_diff(level) <= 1,
+                "spikes move at most one worker: {level} -> {next}"
+            );
+            level = next;
+        }
+        assert!((1..=8).contains(&level), "bounds hold: {level}");
+    }
+
+    /// Sub-band noise never climbs: at the floor the smoothed gain never
+    /// reaches the hysteresis band, so the level stays within one probe
+    /// (task 4.3 no-oscillation).
+    #[test]
+    fn sub_band_noise_never_climbs_above_the_floor() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        let mut level = 1u64;
+        let decision = controller.decide(instrumented_sample(1_000_000, 500), level);
+        level = controller.apply(decision, level);
+        for index in 0..20 {
+            controller.cooldown_until = None;
+            // +/- 3%: inside the 5% material-gain band.
+            let completed = if index % 2 == 0 { 1_030_000 } else { 970_000 };
+            let decision = controller.decide(instrumented_sample(completed, 500), level);
+            level = controller.apply(decision, level);
+            assert!(level <= 2, "sub-band noise cannot climb: {level}");
+        }
+        assert_eq!(level, 1, "the level settles back to the floor");
+    }
+
     /// Strict bounds (task 9.3): apply never leaves [min, max].
     #[test]
     fn apply_respects_strict_bounds() {

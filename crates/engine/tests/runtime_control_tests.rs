@@ -55,6 +55,194 @@ fn rate_limit_server(content: Arc<Vec<u8>>) -> crate::support::test_server::Test
     })
 }
 
+/// Paced range server (task 4.3): 64 KiB chunks with a per-chunk delay keep
+/// the first worker on the wire long enough for adaptive probes and
+/// reductions to be observed as *actual* active leases.
+fn paced_range_server(content: Arc<Vec<u8>>, path: &'static str, delay: Duration) -> TestServer {
+    TestServer::new().serve_handler(path, move |req| {
+        let total = content.len() as u64;
+        if req.method == "HEAD" {
+            return ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes");
+        }
+        if let Some((s, e)) = req.range {
+            let end = e.min(total - 1);
+            ScriptedResponse::new(206)
+                .with_body(content[s as usize..=(end as usize)].to_vec())
+                .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                .with_header("accept-ranges", "bytes")
+                .chunked(delay)
+        } else {
+            ScriptedResponse::ok((*content).clone())
+                .with_header("accept-ranges", "bytes")
+                .chunked(delay)
+        }
+    })
+}
+
+/// Manual override during an adaptive job (task 4.3, engine-api scenario):
+/// the desired count AND the actual active workers converge to the manual
+/// value, the controller stays suspended afterwards, and a later pause/resume
+/// completes byte-exactly — growth and reduction are proven on real leases,
+/// not on the desired number alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn adaptive_manual_override_converges_desired_and_active_workers() {
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 5002));
+    let server = paced_range_server(content.clone(), "/override", Duration::from_millis(50))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("override.bin");
+
+    let mut cfg = segmented_cfg();
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    // One whole-file lease: growth requires a live-tail split activation.
+    cfg.transfer.initial_segment_size = content.len() as u64;
+    cfg.transfer.max_segment_size = content.len() as u64;
+    let c = controller(cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/override"), dest.clone()));
+
+    // Actual growth: more than one worker must hold a lease simultaneously.
+    let mut grew = false;
+    for _ in 0..500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if handle
+            .segmented_job()
+            .is_some_and(|job| job.active_workers() >= 2)
+        {
+            grew = true;
+            break;
+        }
+    }
+    assert!(
+        grew,
+        "the adaptive controller must activate a second worker (actual active leases)"
+    );
+
+    // Manual override to the minimum: desired and active both converge.
+    handle.set_concurrency(1);
+    let mut converged = false;
+    for _ in 0..800 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            if job.desired_workers() == 1 && job.active_workers() <= 1 {
+                converged = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        converged,
+        "manual override must converge desired and actual active workers to 1"
+    );
+
+    // The controller stays suspended: across several 500 ms windows the
+    // manual value never drifts, and no extra worker holds a lease.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(job) = handle.segmented_job() {
+            assert_eq!(job.desired_workers(), 1, "manual override pins the count");
+            assert!(
+                job.active_workers() <= 1,
+                "no worker above the manual count may hold a lease"
+            );
+        }
+    }
+
+    // Pause and resume: in-flight work settles and the job completes exactly.
+    handle.pause();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.resume_now();
+    let result = tokio::time::timeout(Duration::from_secs(180), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// Retry interaction with adaptive decisions (task 4.3): a resetting origin
+/// forces tail-only retries while the controller runs; the level stays inside
+/// the configured bounds and the retried transfer still completes byte-exactly
+/// with exact unique coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn adaptive_retry_pressure_keeps_bounds_without_losing_work() {
+    let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 5003));
+    let server = {
+        let content = content.clone();
+        // One range response resets mid-body: exactly one retryable failure
+        // while the adaptive controller is running, then a healthy origin.
+        let fault_spent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        TestServer::new().serve_handler("/adaptive-retry", move |req| {
+            let total = content.len() as u64;
+            if req.method == "HEAD" {
+                return ScriptedResponse::ok((*content).clone())
+                    .with_header("accept-ranges", "bytes");
+            }
+            if let Some((s, e)) = req.range {
+                let end = e.min(total - 1);
+                let resp = ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes");
+                // Only a real lease-sized range takes the fault: the
+                // range-verification probe must not consume it.
+                if end.saturating_sub(s) >= 64 * 1024
+                    && !fault_spent.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    resp.reset_after(64 * 1024)
+                } else {
+                    resp
+                }
+            } else {
+                ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
+            }
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("adaptive-retry.bin");
+
+    let mut cfg = segmented_cfg();
+    cfg.transfer.max_workers = 3;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    cfg.transfer.max_segment_size = 512 * 1024;
+    cfg.retry.base_delay = Duration::from_millis(10);
+    cfg.retry.max_delay = Duration::from_millis(50);
+    let c = controller(cfg);
+    let (handle, join) = c.start(DownloadRequest::new(
+        server.url("/adaptive-retry"),
+        dest.clone(),
+    ));
+    let mut observed = Vec::new();
+    for _ in 0..60 {
+        if let Some(job) = handle.segmented_job() {
+            let desired = job.desired_workers();
+            assert!(
+                (1..=3).contains(&desired),
+                "adaptive retry pressure must respect the bounds: {desired}"
+            );
+            observed.push(desired);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert!(result.retries >= 1, "the resets must have been retried");
+    assert_eq!(result.completed_bytes, content.len() as u64, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrency_reduction_mid_transfer_no_data_loss() {
     // Slow-drip server so the transfer is in flight when the reduction

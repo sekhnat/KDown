@@ -46,7 +46,7 @@ Every phase is independently verifiable. Before a behavior change, record its ba
 
 - [x] 4.1 Replace instantaneous worker-idle/last-write-latency inputs with interval-weighted actual active/idle counts, writer queue/ack p50-p95, byte-budget wait and useful-goodput deltas in `WindowSample`; test no resumed-byte or duplicate-wire inflation.
 - [x] 4.2 Add storage-pressure veto and marginal-gain/cost probes to `AdaptiveController`; use deterministic synthetic windows for benefit, no-gain, high RSS/CPU, writer saturation, retries and 429/503; test cooldown, bound clamping and re-probe after recovery.
-- [ ] 4.3 Integrate decisions into active workers while preserving manual `DownloadHandle::set_concurrency` override; test actual growth/reduction (not only desired value), pause/retry/checkpoint interactions and no oscillation on noisy samples.
+- [x] 4.3 Integrate decisions into active workers while preserving manual `DownloadHandle::set_concurrency` override; test actual growth/reduction (not only desired value), pause/retry/checkpoint interactions and no oscillation on noisy samples.
 - [ ] 4.4 Gate phase 4: H1/H2 shaped WAN and constrained disk fixed-vs-v1-vs-v2 runs with median/dispersion; document chosen thresholds and reason codes; keep legacy adaptive selector switch until beneficial outside noise and no fixed-mode regressions.
 
 ## 5. Protocol-aware concurrency
