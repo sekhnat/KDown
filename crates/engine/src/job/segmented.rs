@@ -7,13 +7,13 @@
 //! (§17.4). Runtime concurrency reduction settles excess workers (task
 //! 5.8).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{DurabilityMode, EngineConfig};
 use crate::control::retry::{RetryClassifier, RetryDecision};
@@ -25,6 +25,11 @@ use crate::http::{
     TransferIntent, TransferRequest,
 };
 use crate::io::output_session::OutputSession;
+use crate::io::write_budget::{ByteReservation, JobWriteBudget, WriteBudgets};
+use crate::io::write_executor::{
+    SessionDisposition, WriteCompletion, WriteExecutor, WriteOutcome, WriteSession, WriteSubmission,
+};
+use crate::io::write_frontier::{CompletionStatus, LeaseFrontier};
 use crate::job::controller::{DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
@@ -254,10 +259,7 @@ impl FatalState {
 
     /// The authoritative terminal error (read once, after joins).
     fn take(&self) -> Option<DownloadError> {
-        self.error
-            .lock()
-            .expect("fatal error lock")
-            .take()
+        self.error.lock().expect("fatal error lock").take()
     }
 }
 
@@ -267,8 +269,6 @@ impl SegmentedJob {
     async fn active_leases_empty(&self) -> bool {
         !self.scheduler.lock().await.has_active()
     }
-
-
 
     /// Set the desired worker count at runtime (task 5.8: handle API).
     /// Excess workers settle their leases and exit on the next loop.
@@ -526,8 +526,7 @@ pub(crate) async fn run_segmented(
     let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
     // Adaptive mode (task 9.1, design D6) starts at `min_workers` and probes
     // upward; fixed mode keeps the configured fixed concurrency.
-    let adaptive = config.transfer.concurrency_mode
-        == crate::config::ConcurrencyMode::Adaptive;
+    let adaptive = config.transfer.concurrency_mode == crate::config::ConcurrencyMode::Adaptive;
     let desired = if adaptive {
         u64::from(config.transfer.min_workers.max(1))
     } else {
@@ -640,15 +639,44 @@ pub(crate) async fn run_segmented(
             };
         }
     };
+    // Task 2.5: internal legacy/new write-path switch (design D2). The
+    // pipelined path routes worker writes through the shared bounded
+    // executor with byte budgets and per-lease acknowledged frontiers; the
+    // default remains the legacy writer lanes until the phase 2 gate
+    // proves parity (task 2.8).
+    let pipelined = config.write_executor.pipeline_writes;
+    let write_executor = pipelined.then(|| WriteExecutor::new(&config.write_executor));
+    let write_budgets = pipelined.then(|| {
+        WriteBudgets::new(
+            config.write_budget.global_max_bytes,
+            config.write_budget.job_max_bytes,
+            config.write_budget.worker_read_ahead_bytes,
+        )
+    });
     // Task 1.4: workers own their writer-lane lifecycle — each receives one
     // write-only capability and spawns its blocking lane on first activation,
     // releasing it on dormancy or exit. `worker join` therefore implies every
     // lane is shut down and every capability clone dropped before reclaim.
+    // (Pipelined workers lend the same capability to their executor session
+    // instead; the pool bounds blocking threads, so no lazy-lane dance.)
     for worker_idx in 0..worker_count {
         let execution = execution.clone();
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
         let output = writers.pop().expect("one output handle per worker");
+        let writer = match (&write_executor, &write_budgets) {
+            (Some(executor), Some(budgets)) => {
+                let (session, completions) = executor.session(0, Arc::new(output));
+                WorkerWriter::Pipelined(Box::new(PipelinedWriter {
+                    session,
+                    completions,
+                    budget: budgets.job(0),
+                    frame_quantum: u64::from(config.read_buffer_size),
+                    reservations: std::collections::HashMap::new(),
+                }))
+            }
+            _ => WorkerWriter::Legacy { lane: None, output },
+        };
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
             headers: request.headers.clone(),
@@ -661,7 +689,7 @@ pub(crate) async fn run_segmented(
                 execution,
                 classifier,
                 job,
-                output,
+                writer,
                 identity_owned,
                 req_spec,
                 counters_w,
@@ -713,6 +741,14 @@ pub(crate) async fn run_segmented(
         }
     }
     drop(writers);
+    // Task 2.5: shut the pipelined executor down after every worker
+    // detached its session (each worker exit drains and releases its
+    // capability), so pool threads are gone before the output is reclaimed.
+    if let Some(executor) = write_executor {
+        if let Err(error) = executor.shutdown().await {
+            outcome_error.get_or_insert(error.0);
+        }
+    }
     // Task 1.5: stop and join the adaptive controller before the outcome is
     // computed — no decision can fire after the workers settled.
     if let Some(tx) = controller_stop_tx {
@@ -732,9 +768,7 @@ pub(crate) async fn run_segmented(
     let (stop_ack_tx, stop_ack_rx) = oneshot::channel();
     if job
         .save_now_tx
-        .send(CoordinatorCmd::Stop {
-            ack: stop_ack_tx,
-        })
+        .send(CoordinatorCmd::Stop { ack: stop_ack_tx })
         .await
         .is_ok()
     {
@@ -857,6 +891,34 @@ struct WorkerRequestSpec {
     identity_encoding: bool,
 }
 
+/// The per-worker write path (design D2, task 2.5). The legacy path keeps
+/// one blocking lane per worker and awaits every write before reading the
+/// next chunk; the pipelined path submits writes through the shared
+/// bounded executor and keeps receiving under the byte budgets, with
+/// per-lease acknowledged frontiers driving progress publication.
+enum WorkerWriter {
+    Legacy {
+        lane: Option<crate::io::writer_lane::WriterLane>,
+        output: crate::io::output_session::OutputWriteHandle,
+    },
+    Pipelined(Box<PipelinedWriter>),
+}
+
+/// One worker's pipelined write path (task 2.5): an executor session (its
+/// own completion stream), the job write budget, the pre-read frame
+/// quantum and the reservations for submitted-but-unsettled writes.
+struct PipelinedWriter {
+    session: WriteSession,
+    completions: mpsc::UnboundedReceiver<WriteCompletion>,
+    budget: JobWriteBudget,
+    /// Bytes to reserve before polling the next body chunk (one frame
+    /// quantum, design D2).
+    frame_quantum: u64,
+    /// Reservations covering queued+executing payload, keyed by
+    /// (lease id, offset); released when the write settles.
+    reservations: std::collections::HashMap<(u64, u64), (ByteReservation, std::time::Instant)>,
+}
+
 /// Errors inside one lease attempt.
 enum WorkerError {
     Retryable {
@@ -901,7 +963,7 @@ async fn worker_loop(
     execution: HttpExecution,
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
-    output: crate::io::output_session::OutputWriteHandle,
+    mut writer: WorkerWriter,
     identity: String,
     req_spec: WorkerRequestSpec,
     counters: Arc<JobCounters>,
@@ -909,13 +971,11 @@ async fn worker_loop(
     started: Instant,
 ) -> Result<(), DownloadError> {
     job.set_worker_state(worker_idx, 1);
-    let mut lane: Option<crate::io::writer_lane::WriterLane> = None;
     let result = worker_cycle(
         execution,
         classifier,
         &job,
-        &mut lane,
-        &output,
+        &mut writer,
         identity,
         req_spec,
         counters,
@@ -923,15 +983,38 @@ async fn worker_loop(
         started,
     )
     .await;
-    // Release the lane on exit (task 1.4): the blocking thread ends and the
-    // handle clone drops before this worker joins, so run_segmented's
-    // reclaim observes no live writers. A shutdown failure means the
-    // blocking task panicked — surfaced via the first-wins fatal state,
-    // matching the old outcome_error path.
-    if let Some(l) = lane.take() {
-        job.set_worker_lane_live(worker_idx, false);
-        if let Err(error) = l.shutdown().await {
-            job.fatal.install(error.0);
+    // Release the write path on exit (task 1.4 legacy / task 2.5
+    // pipelined): blocking threads end and capability clones drop before
+    // this worker joins, so run_segmented's reclaim observes no live
+    // writers. A shutdown failure means the blocking thread panicked —
+    // surfaced via the first-wins fatal state, matching the old
+    // outcome_error path.
+    match writer {
+        WorkerWriter::Legacy { lane, .. } => {
+            if let Some(l) = lane {
+                job.set_worker_lane_live(worker_idx, false);
+                if let Err(error) = l.shutdown().await {
+                    job.fatal.install(error.0);
+                }
+            }
+        }
+        WorkerWriter::Pipelined(pipelined) => {
+            // Detach with discard (task 2.5 exit hygiene): queued writes are
+            // dropped, in-flight writes finish; draining the completion
+            // stream releases every outstanding reservation so the job
+            // budget never leaks bytes across worker lifecycles (task 2.7
+            // formalizes the pause/retry dispositions).
+            let PipelinedWriter {
+                session,
+                mut completions,
+                mut reservations,
+                ..
+            } = *pipelined;
+            session.detach(SessionDisposition::Discard).await;
+            while let Some(completion) = completions.recv().await {
+                reservations.remove(&(completion.lease_id, completion.offset));
+            }
+            drop(reservations);
         }
     }
     result
@@ -942,8 +1025,7 @@ async fn worker_cycle(
     execution: HttpExecution,
     classifier: RetryClassifier,
     job: &Arc<SegmentedJob>,
-    lane: &mut Option<crate::io::writer_lane::WriterLane>,
-    output: &crate::io::output_session::OutputWriteHandle,
+    writer: &mut WorkerWriter,
     identity: String,
     req_spec: WorkerRequestSpec,
     counters: Arc<JobCounters>,
@@ -989,10 +1071,12 @@ async fn worker_cycle(
         if job.desired_workers() <= u64::from(u32::try_from(worker_idx).unwrap_or(u32::MAX)) {
             // Dormant (task 1.4): release the blocking writer lane while
             // parked so writer threads track the desired count.
-            if let Some(l) = lane.take() {
-                job.set_worker_lane_live(worker_idx, false);
-                if let Err(error) = l.shutdown().await {
-                    job.fatal.install(error.0);
+            if let WorkerWriter::Legacy { lane, .. } = writer {
+                if let Some(l) = lane.take() {
+                    job.set_worker_lane_live(worker_idx, false);
+                    if let Err(error) = l.shutdown().await {
+                        job.fatal.install(error.0);
+                    }
                 }
             }
             tokio::select! {
@@ -1079,21 +1163,24 @@ async fn worker_cycle(
         job.set_worker_state(worker_idx, 2);
         // Lazy writer lane (task 1.4): created on this worker's first
         // activation; the blocking thread lives until dormancy or exit.
-        let lane_handle = match lane {
-            Some(l) => l.handle(),
-            None => {
-                let created = crate::io::writer_lane::WriterLane::spawn(output.clone_capability());
-                lane.replace(created);
+        // Lazy writer lane (task 1.4): created on this worker's first
+        // activation; the blocking thread lives until dormancy or exit.
+        // Pipelined workers need no activation step (their session holds
+        // the capability from attach; the shared pool bounds threads).
+        if let WorkerWriter::Legacy { lane, output } = writer {
+            if lane.is_none() {
+                *lane = Some(crate::io::writer_lane::WriterLane::spawn(
+                    output.clone_capability(),
+                ));
                 job.set_worker_lane_live(worker_idx, true);
-                lane.as_ref().expect("just inserted").handle()
             }
-        };
+        }
         let result = transfer_lease(
             &execution,
             &classifier,
-            &job,
+            job,
             &lease,
-            &lane_handle,
+            writer,
             &identity,
             &req_spec,
             worker_idx,
@@ -1104,9 +1191,9 @@ async fn worker_cycle(
         match result {
             Ok(()) => {
                 attempt = 0; // reset backoff on success
-                // Reconcile (crediting accepted coverage, task 5.4) then
-                // complete the lease.
-                reconcile_and_credit(&job).await;
+                             // Reconcile (crediting accepted coverage, task 5.4) then
+                             // complete the lease.
+                reconcile_and_credit(job).await;
                 let mut sched = job.scheduler.lock().await;
                 let _ = sched.complete(lease.id, lease.generation);
                 job.worker_progress[worker_idx].clear();
@@ -1133,7 +1220,7 @@ async fn worker_cycle(
                 // requeue: the acknowledged prefix completes, the tail
                 // returns to pending (§17.3 tail-only retry) — one lock at
                 // the retry boundary.
-                reconcile_and_credit(&job).await;
+                reconcile_and_credit(job).await;
                 {
                     let mut sched = job.scheduler.lock().await;
                     let _ = sched.fail(lease.id, lease.generation);
@@ -1152,8 +1239,7 @@ async fn worker_cycle(
                     crate::error::ErrorCategory::Server | crate::error::ErrorCategory::RateLimited
                 ) {
                     // Throttle signal for the adaptive controller (task 9.2).
-                    job.throttle_events
-                        .fetch_add(1, Ordering::Relaxed);
+                    job.throttle_events.fetch_add(1, Ordering::Relaxed);
                     let earliest = retry_after.unwrap_or_else(|| classifier.backoff_delay(attempt));
                     let until = Instant::now() + earliest;
                     let mut gate = job.origin_backoff_until.lock().await;
@@ -1188,7 +1274,7 @@ async fn worker_cycle(
                 }
             }
             Err(WorkerError::Fatal(e)) => {
-                reconcile_and_credit(&job).await;
+                reconcile_and_credit(job).await;
                 {
                     let mut sched = job.scheduler.lock().await;
                     let _ = sched.fail(lease.id, lease.generation);
@@ -1251,7 +1337,7 @@ async fn transfer_lease(
     classifier: &RetryClassifier,
     job: &Arc<SegmentedJob>,
     lease: &SegmentLease,
-    lane: &crate::io::writer_lane::LaneHandle,
+    writer: &mut WorkerWriter,
     identity: &str,
     req_spec: &WorkerRequestSpec,
     worker_idx: usize,
@@ -1320,11 +1406,89 @@ async fn transfer_lease(
     let validated_start = response.start;
     let validated_end = response.end;
     let accepted_len = validated_end - validated_start + 1;
+    // The write path diverges here (task 2.5): the legacy lane blocks the
+    // worker per chunk; the pipelined path submits through the shared
+    // executor. Both consume the SAME validated response body and share
+    // the reconciliation/complete tail below.
+    let mut body = response.body;
+    let lane_handle = match writer {
+        WorkerWriter::Legacy { lane, .. } => {
+            let lane = lane.as_ref().expect("lane activated before transfer");
+            Some(lane.handle())
+        }
+        WorkerWriter::Pipelined(_) => None,
+    };
+    let consume = match writer {
+        WorkerWriter::Legacy { .. } => {
+            consume_legacy_body(
+                job,
+                lease,
+                &mut body,
+                lane_handle.as_ref().expect("legacy lane"),
+                worker_idx,
+                revisions,
+                validated_start,
+                validated_end,
+                classifier,
+            )
+            .await
+        }
+        WorkerWriter::Pipelined(pipelined) => {
+            consume_pipelined_body(
+                job,
+                lease,
+                &mut body,
+                pipelined,
+                worker_idx,
+                revisions,
+                validated_start,
+                validated_end,
+                classifier,
+            )
+            .await
+        }
+    };
+    consume?;
+    // Final acknowledgment: everything accepted is written. Reconcile this
+    // worker's cell (crediting accepted coverage — task 5.4) before
+    // completing the lease (§31).
+    reconcile_and_credit(job).await;
+    {
+        let mut sched = job.scheduler.lock().await;
+        let _ = sched.report_progress(lease.id, lease.generation, validated_start + accepted_len);
+    }
+    job.worker_progress[worker_idx].clear();
+    job.hub
+        .emit(crate::metrics::events::Event::SegmentCompleted {
+            worker: lease.id as usize,
+            start: validated_start,
+            end: validated_end,
+        })
+        .await;
+    Ok(())
+}
+
+/// Legacy write path (task 2.5): one blocking lane per worker; the worker
+/// awaits each write before reading the next chunk (one outstanding
+/// payload per worker). Behavior is unchanged from the pre-executor
+/// transfer loop.
+#[allow(clippy::too_many_arguments)]
+async fn consume_legacy_body(
+    job: &Arc<SegmentedJob>,
+    lease: &SegmentLease,
+    body: &mut crate::http::execution::HttpBody,
+    lane: &crate::io::writer_lane::LaneHandle,
+    worker_idx: usize,
+    revisions: &mut tokio::sync::watch::Receiver<u64>,
+    validated_start: u64,
+    _validated_end: u64,
+    classifier: &RetryClassifier,
+) -> Result<(), WorkerError> {
+    let cell = &job.worker_progress[worker_idx];
     let mut in_range_offset: u64 = 0;
     // Bounded body (§32): the configured read-idle policy and overrun
     // rejection live inside the body; the worker consumes one chunk at a
     // time and never sees frame types.
-    let mut body = response.body;
     loop {
         // Register the current revision BEFORE the read (task 7.1): a fatal
         // installed while this worker is parked mid-body publishes a
@@ -1374,8 +1538,7 @@ async fn transfer_lease(
                     .map_err(|se| WorkerError::Fatal(se.0))?;
                 // Write-ack latency for the controller's sampling (task 9.2).
                 job.write_latency_us.store(
-                    u64::try_from(write_started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX),
+                    u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
                 in_range_offset += data.len() as u64;
@@ -1442,22 +1605,337 @@ async fn transfer_lease(
             }
         }
     }
-    // Final acknowledgment: everything accepted is written. Reconcile this
-    // worker's cell (crediting accepted coverage — task 5.4) before
-    // completing the lease (§31).
-    reconcile_and_credit(job).await;
-    {
-        let mut sched = job.scheduler.lock().await;
-        let _ = sched.report_progress(lease.id, lease.generation, validated_start + accepted_len);
+    Ok(())
+}
+
+/// Pipelined write path (design D2/D3, task 2.5): the worker reserves byte
+/// budget BEFORE polling the next chunk, submits writes to the shared
+/// executor without awaiting them, and keeps receiving while earlier writes
+/// execute. Progress publication is driven by completions through the
+/// per-lease frontier: the published written-through offset only advances
+/// across contiguous acknowledgements — a missing or failed earlier write
+/// blocks every later publication (never publishes past a gap).
+#[allow(clippy::too_many_arguments)]
+async fn consume_pipelined_body(
+    job: &Arc<SegmentedJob>,
+    lease: &SegmentLease,
+    body: &mut crate::http::execution::HttpBody,
+    writer: &mut PipelinedWriter,
+    worker_idx: usize,
+    revisions: &mut tokio::sync::watch::Receiver<u64>,
+    validated_start: u64,
+    validated_end: u64,
+    classifier: &RetryClassifier,
+) -> Result<(), WorkerError> {
+    let accepted_len = validated_end - validated_start + 1;
+    let mut frontier =
+        LeaseFrontier::new(lease.id, lease.generation, validated_start, validated_end);
+    let mut in_range_offset: u64 = 0;
+    // The pre-read reservation (design D2): held across the body poll and
+    // reconciled to the actual frame size after receipt.
+    let mut reservation: Option<ByteReservation> = None;
+
+    // Handle one completion: release its reservation, fold it into the
+    // frontier and publish one coherent record when the contiguous
+    // acknowledged frontier advanced. Stale generations are ignored here —
+    // they can never credit the live lease (design D3).
+    async fn settle(
+        job: &Arc<SegmentedJob>,
+        worker_idx: usize,
+        writer: &mut PipelinedWriter,
+        frontier: &mut LeaseFrontier,
+        completion: WriteCompletion,
+    ) -> Result<(), WorkerError> {
+        let latency = writer
+            .reservations
+            .remove(&(completion.lease_id, completion.offset))
+            .map(|(reservation, submitted_at)| {
+                drop(reservation); // release queued+executing budget bytes
+                submitted_at.elapsed()
+            });
+        let success = matches!(completion.outcome, WriteOutcome::Completed);
+        match frontier.record_completion(
+            completion.lease_id,
+            completion.generation,
+            completion.offset,
+            completion.len,
+            success,
+        ) {
+            CompletionStatus::Acknowledged { through } => {
+                // Write-ack latency for the controller's sampling (task 9.2).
+                if let Some(elapsed) = latency {
+                    job.write_latency_us.store(
+                        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                }
+                // Hot-path progress (§13.3): publish the acknowledged
+                // contiguous frontier as one coherent record (task 3.2) —
+                // no scheduler lock on the completion path.
+                job.worker_progress[worker_idx].publish(LeaseRecord {
+                    lease_id: frontier.lease_id(),
+                    generation: frontier.generation(),
+                    lease_start: frontier.start(),
+                    written_through: through,
+                });
+                Ok(())
+            }
+            CompletionStatus::Failed => {
+                // A failed write blocks the frontier and is fatal for the
+                // job, matching the legacy lane-error semantics (§14.5).
+                match completion.outcome {
+                    WriteOutcome::Failed(error) => Err(WorkerError::Fatal(error.0)),
+                    _ => Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                        "write was discarded before execution".into(),
+                    ))),
+                }
+            }
+            CompletionStatus::StaleGeneration => Ok(()),
+        }
     }
-    job.worker_progress[worker_idx].clear();
-    job.hub
-        .emit(crate::metrics::events::Event::SegmentCompleted {
-            worker: lease.id as usize,
-            start: validated_start,
-            end: validated_end,
-        })
-        .await;
+
+    loop {
+        // Register the current revision BEFORE the read (task 7.1): a fatal
+        // installed while this worker is parked mid-body publishes a
+        // transition and wakes the select below — no lost convergence.
+        let _seen_revision = {
+            let seen = revisions.borrow_and_update();
+            *seen
+        };
+        if job.cancel.is_cancelled() {
+            return Err(WorkerError::Fatal(DownloadError::Cancelled));
+        }
+        if job.fatal.is_fatal() {
+            return Err(WorkerError::Fatal(DownloadError::Cancelled));
+        }
+
+        // Pre-read reservation (design D2, task 2.2): hold byte budget for
+        // the next frame BEFORE polling the body, bounded by the worker
+        // read-ahead so a fast connection cannot outrun a slow sink.
+        if reservation.is_none() {
+            let quantum = writer.frame_quantum;
+            loop {
+                let held: u64 = writer
+                    .reservations
+                    .values()
+                    .map(|(reservation, _)| reservation.held())
+                    .sum();
+                if held + quantum <= writer.budget.worker_read_ahead_bytes() {
+                    break;
+                }
+                // Read-ahead exhausted: wait for a completion to release
+                // capacity (or termination).
+                tokio::select! {
+                    completion = writer.completions.recv() => {
+                        match completion {
+                            Some(completion) => {
+                                settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                            }
+                            None => {
+                                return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                                    "write executor shut down mid-transfer".into(),
+                                )));
+                            }
+                        }
+                    }
+                    changed = revisions.changed() => {
+                        if changed.is_err() || job.fatal.is_fatal() {
+                            return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                        }
+                        let _ = _seen_revision;
+                    }
+                    _ = job.cancel.cancelled() => {
+                        return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                    }
+                }
+            }
+            reservation = Some(writer.budget.reserve(quantum).await);
+        }
+
+        let event = tokio::select! {
+            event = body.next_chunk(&job.cancel) => event,
+            completion = writer.completions.recv() => {
+                match completion {
+                    Some(completion) => {
+                        settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                    }
+                    None => {
+                        return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                            "write executor shut down mid-transfer".into(),
+                        )));
+                    }
+                }
+                continue;
+            }
+            changed = revisions.changed() => {
+                // A transition while parked: fatal must converge this
+                // worker; other transitions (progress reconciliation,
+                // saves) just re-poll the body.
+                if changed.is_err() || job.fatal.is_fatal() {
+                    return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                }
+                let _ = _seen_revision;
+                continue;
+            }
+        };
+        match event {
+            Ok(BodyEvent::Data(data)) => {
+                // Wire bytes count at RECEIPT (task 5.4, design D4): even if
+                // a later write fails, the payload crossed the network and
+                // must show in wire throughput.
+                if let Some(w) = job.counters.worker(worker_idx) {
+                    w.add_network(data.len() as u64);
+                }
+                let chunk_len = data.len() as u64;
+                let abs_offset = validated_start + in_range_offset;
+                // Rate tokens first: payload bytes only (§18.2).
+                job.acquire_rate(chunk_len).await;
+                let mut frame = reservation.take().expect("pre-read reservation held");
+                if chunk_len > frame.held() {
+                    // Oversize frame: grow the reservation (design D2
+                    // oversize-frame reconciliation).
+                    frame.grow(chunk_len - frame.held()).await;
+                }
+                frame.reconcile(chunk_len);
+                frontier.record_received(abs_offset, chunk_len);
+                frontier.record_submission(abs_offset, chunk_len);
+                // Submit WITHOUT awaiting the write: the worker keeps
+                // receiving the next bounded chunk while this write
+                // executes on the shared pool (design D2 overlap).
+                writer
+                    .session
+                    .submit(WriteSubmission {
+                        job: writer.session.job(),
+                        lease_id: lease.id,
+                        generation: lease.generation,
+                        offset: abs_offset,
+                        data,
+                    })
+                    .await
+                    .map_err(|_| {
+                        WorkerError::Fatal(DownloadError::SinkWrite(
+                            "write executor shut down mid-transfer".into(),
+                        ))
+                    })?;
+                writer
+                    .reservations
+                    .insert((lease.id, abs_offset), (frame, std::time::Instant::now()));
+                in_range_offset += chunk_len;
+            }
+            Ok(BodyEvent::End) => {
+                // Unused pre-read reservation: release it (no chunk came).
+                drop(reservation.take());
+                // Settle every outstanding write before completing the
+                // lease: completions may arrive out of order, and the
+                // frontier publishes only the contiguous acknowledged
+                // prefix (design D3).
+                while frontier.has_outstanding() {
+                    tokio::select! {
+                        completion = writer.completions.recv() => {
+                            match completion {
+                                Some(completion) => {
+                                    settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                                }
+                                None => {
+                                    return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                                        "write executor shut down mid-transfer".into(),
+                                    )));
+                                }
+                            }
+                        }
+                        changed = revisions.changed() => {
+                            if changed.is_err() || job.fatal.is_fatal() {
+                                return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                            }
+                        }
+                        _ = job.cancel.cancelled() => {
+                            return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                        }
+                    }
+                }
+                if frontier.acknowledged_through() != validated_start + accepted_len {
+                    return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                        "write pipeline settled below the validated range".into(),
+                    )));
+                }
+                break;
+            }
+            Ok(BodyEvent::Paused) => {
+                // §9.3: pause converges at a safe boundary. Drain the
+                // outstanding writes first so the acknowledged snapshot the
+                // coordinator settles covers everything already received
+                // (task 2.5; dispositions are formalized in task 2.7).
+                drop(reservation.take());
+                while frontier.has_outstanding() {
+                    tokio::select! {
+                        completion = writer.completions.recv() => {
+                            match completion {
+                                Some(completion) => {
+                                    settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                                }
+                                None => {
+                                    return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                                        "write executor shut down mid-transfer".into(),
+                                    )));
+                                }
+                            }
+                        }
+                        changed = revisions.changed() => {
+                            if changed.is_err() || job.fatal.is_fatal() {
+                                return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                            }
+                        }
+                        _ = job.cancel.cancelled() => {
+                            return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                        }
+                    }
+                }
+                // The coordinator settles the acknowledged snapshot
+                // (task 4.3) and the worker waits for the save result
+                // before reporting resumability. A save failure is fatal:
+                // the observing worker installs the shared error and all
+                // workers converge before the job fails.
+                let (ack_tx, ack_rx) = oneshot::channel();
+                job.save_now_tx
+                    .send(CoordinatorCmd::SaveNow { ack: ack_tx })
+                    .await
+                    .map_err(|_| {
+                        WorkerError::Fatal(DownloadError::Protocol(
+                            "checkpoint coordinator stopped before the pause save".into(),
+                        ))
+                    })?;
+                ack_rx
+                    .await
+                    .map_err(|_| {
+                        WorkerError::Fatal(DownloadError::Protocol(
+                            "checkpoint coordinator dropped the pause save".into(),
+                        ))
+                    })?
+                    .map_err(WorkerError::Fatal)?;
+                while job.cancel.is_paused() && !job.cancel.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if job.cancel.is_cancelled() {
+                    return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                }
+            }
+            Err(e) => {
+                // Body faults (reset, truncation, idle timeout, overrun)
+                // arrive classified (§32); the worker maps them onto the
+                // shared retry/coordination policy. Bytes received past the
+                // acknowledged frontier are lost with the attempt: count
+                // them as wasted at this lease boundary (task 5.4) — the
+                // frontier separates the receipt high-watermark from the
+                // acknowledged prefix, so re-received payload is never
+                // conflated with unique coverage.
+                drop(reservation.take());
+                let wasted = frontier
+                    .received_high_water()
+                    .saturating_sub(frontier.acknowledged_through());
+                return Err(worker_error_from_failure(e, None, classifier, wasted));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1501,11 +1979,7 @@ async fn coordinator_loop(
     // coverage with current validators before any transfer work, so a crash
     // immediately after admission still resumes. Fresh jobs snapshot empty
     // and skip the store entirely.
-    if let Err(error) = attempt_coordinator_save(
-        &job, &store, &identity, &mut last_saved,
-    )
-    .await
-    {
+    if let Err(error) = attempt_coordinator_save(&job, &store, &identity, &mut last_saved).await {
         job.fatal.install(error);
         return;
     }
@@ -1562,11 +2036,8 @@ async fn adaptive_controller_loop(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let config = crate::control::adaptive::AdaptiveConfig::default();
-    let mut controller = crate::control::adaptive::AdaptiveController::new(
-        config,
-        job.min_workers,
-        job.max_workers,
-    );
+    let mut controller =
+        crate::control::adaptive::AdaptiveController::new(config, job.min_workers, job.max_workers);
     let mut previous = counters.fold();
     let mut previous_throttled = job.throttle_events();
     let mut last = Instant::now();
@@ -1602,9 +2073,7 @@ async fn adaptive_controller_loop(
             completed_bytes: fold
                 .completed_bytes
                 .saturating_sub(previous.completed_bytes),
-            network_bytes: fold
-                .network_bytes
-                .saturating_sub(previous.network_bytes),
+            network_bytes: fold.network_bytes.saturating_sub(previous.network_bytes),
             wasted_bytes: fold.wasted_bytes.saturating_sub(previous.wasted_bytes),
             retries: fold.retries.saturating_sub(previous.retries),
             throttled,
@@ -1757,10 +2226,7 @@ mod durability_tests {
     }
 
     impl crate::resume::checkpoint_store::CheckpointStore for RecordingStore {
-        fn load(
-            &self,
-            _job_identity: &str,
-        ) -> Result<Option<Checkpoint>, CheckpointError> {
+        fn load(&self, _job_identity: &str) -> Result<Option<Checkpoint>, CheckpointError> {
             Ok(None)
         }
 
@@ -1794,19 +2260,14 @@ mod durability_tests {
         let mut session =
             OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
                 .expect("session");
-        crate::io::sink::Sink::write_at(&mut session, 0, b"durable-payload-bytes")
-            .expect("write");
+        crate::io::sink::Sink::write_at(&mut session, 0, b"durable-payload-bytes").expect("write");
         let sync = session.sync_capability().expect("sync capability");
-        let (hub, _events) = crate::metrics::events::EventHub::new(
-            16,
-            Duration::from_secs(1),
-        );
+        let (hub, _events) = crate::metrics::events::EventHub::new(16, Duration::from_secs(1));
         let store_impl = Arc::new(RecordingStore {
             state: Mutex::new((0, 0)),
             fail_saves,
         });
-        let store: Arc<dyn crate::resume::checkpoint_store::CheckpointStore> =
-            store_impl.clone();
+        let store: Arc<dyn crate::resume::checkpoint_store::CheckpointStore> = store_impl.clone();
         let store_counts = store_impl;
         let (save_now_tx, _save_rx) = mpsc::channel(8);
         let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
@@ -1861,12 +2322,7 @@ mod durability_tests {
             durable_job(&directory, DurabilityMode::Durable, false);
 
         // Seed one acknowledged written range so the save has candidates.
-        let lease = job
-            .scheduler
-            .lock()
-            .await
-            .acquire()
-            .expect("lease");
+        let lease = job.scheduler.lock().await.acquire().expect("lease");
         job.worker_progress[0].test_publish(
             lease.id,
             lease.generation,
@@ -1890,15 +2346,9 @@ mod durability_tests {
     #[tokio::test]
     async fn failed_save_after_sync_is_reported_not_silenced() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let (job, _session, store, counts) =
-            durable_job(&directory, DurabilityMode::Durable, true);
+        let (job, _session, store, counts) = durable_job(&directory, DurabilityMode::Durable, true);
 
-        let lease = job
-            .scheduler
-            .lock()
-            .await
-            .acquire()
-            .expect("lease");
+        let lease = job.scheduler.lock().await.acquire().expect("lease");
         job.worker_progress[0].test_publish(
             lease.id,
             lease.generation,
@@ -1929,12 +2379,7 @@ mod durability_tests {
         let (job, _session, store, counts) =
             durable_job(&directory, DurabilityMode::Performance, false);
 
-        let lease = job
-            .scheduler
-            .lock()
-            .await
-            .acquire()
-            .expect("lease");
+        let lease = job.scheduler.lock().await.acquire().expect("lease");
         job.worker_progress[0].test_publish(
             lease.id,
             lease.generation,
@@ -1986,12 +2431,7 @@ mod durability_tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let (job, _session, store, counts) =
             durable_job(&directory, DurabilityMode::Performance, false);
-        let lease = job
-            .scheduler
-            .lock()
-            .await
-            .acquire()
-            .expect("lease");
+        let lease = job.scheduler.lock().await.acquire().expect("lease");
         job.worker_progress[0].test_publish(
             lease.id,
             lease.generation,
@@ -2007,10 +2447,7 @@ mod durability_tests {
             .await
             .expect("second save skipped");
         let (attempts, _) = *counts.state.lock().expect("state");
-        assert_eq!(
-            attempts, 1,
-            "unchanged snapshot must not rewrite the store"
-        );
+        assert_eq!(attempts, 1, "unchanged snapshot must not rewrite the store");
 
         // New progress → the next save persists again.
         job.worker_progress[0].test_publish(
@@ -2127,5 +2564,238 @@ mod sync_tests {
         fatal.install(DownloadError::Cancelled);
         assert!(fatal.is_fatal());
         assert!(fatal.take().is_some(), "flag set but no error readable");
+    }
+}
+
+/// Task 2.5 verification: the pipelined write path under the internal
+/// switch — byte-exact H1 segmented transfer, network/storage overlap with
+/// reverse completion through the ack frontier, and read-ahead-bounded
+/// receipt under a blocked sink.
+#[cfg(test)]
+mod write_pipeline_tests {
+    use super::*;
+    use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
+    use crate::io::fault_script::{OutputFaultScript, OutputOperation};
+    use crate::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+    use std::time::Duration;
+
+    const TOTAL: u64 = 2000;
+
+    fn content() -> Vec<u8> {
+        (0..TOTAL)
+            .map(|index| ((index * 31 + 7) % 251) as u8)
+            .collect()
+    }
+
+    /// One segmented lease [0, 1999] whose body arrives as two chunks.
+    fn pipeline_http(content: &[u8]) -> ScriptedHttp {
+        ScriptedHttp::new()
+            .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+                status: 200,
+                total_size: Some(TOTAL),
+                accept_ranges: true,
+                range_verified: true,
+                ..ProbeMetadata::default()
+            }))
+            .expect_transfer(
+                TransferStep::new()
+                    .range((0, TOTAL - 1))
+                    .ok(TransferOk::new()
+                        .range(0, TOTAL - 1)
+                        .total(TOTAL)
+                        .chunk(content[..1000].to_vec())
+                        .chunk(content[1000..].to_vec())),
+            )
+    }
+
+    fn pipeline_config(pipeline_writes: bool, read_ahead_frames: u64) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.transfer.preallocate_output = false;
+        config.transfer.segmentation_threshold = 1024;
+        config.transfer.max_workers = 1;
+        config.transfer.min_workers = 1;
+        config.transfer.max_segment_size = TOTAL;
+        config.transfer.min_segment_size = 1;
+        config.transfer.verify_range_support = false;
+        config.checkpoint_flush_interval = Duration::from_secs(60);
+        config.read_buffer_size = 4096;
+        config.write_executor.pipeline_writes = pipeline_writes;
+        config.write_executor.writer_threads = 2;
+        // Read-ahead in whole frame quanta (the reservation unit).
+        config.write_budget.worker_read_ahead_bytes = read_ahead_frames * 4096;
+        config
+    }
+
+    fn wait_for(predicate: impl Fn() -> bool, timeout: Duration, label: &'static str) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !predicate() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_segmented_transfer_is_byte_exact() {
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(pipeline_http(&content)),
+            pipeline_config(true, 4),
+        );
+        let result = controller
+            .run(DownloadRequest::new(
+                "https://scripted/pipelined",
+                destination.clone(),
+            ))
+            .await
+            .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        // Server-emitted == client-received (no over-send on the scripted
+        // path), and the useful completion equals the wire payload.
+        assert_eq!(result.bytes_downloaded_from_network, TOTAL);
+        assert_eq!(result.completed_bytes, TOTAL);
+        assert_eq!(
+            std::fs::read(&destination).expect("content"),
+            content,
+            "byte-exact through the shared executor"
+        );
+    }
+
+    /// Overlap (design D2): while the FIRST write is blocked on a slow
+    /// sink, the worker keeps receiving the next chunk and submits it; the
+    /// second write completes first (reverse completion) and the frontier
+    /// publishes nothing until the first write settles. Releasing the
+    /// first gate then completes the lease byte-exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_worker_receives_while_writes_execute() {
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let registration = OutputFaultScript::register(&destination);
+        let gate = registration.script().hold_next(OutputOperation::Write);
+
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(pipeline_http(&content)),
+            pipeline_config(true, 2),
+        );
+        let (handle, task) = controller.start(DownloadRequest::new(
+            "https://scripted/overlap",
+            destination.clone(),
+        ));
+
+        // Wait until the first write is executing (blocked in the gate).
+        let gate = tokio::task::spawn_blocking(move || {
+            gate.wait_until_entered();
+            gate
+        })
+        .await
+        .expect("gate waiter");
+
+        // Overlap proof: BOTH chunks were received from the network while
+        // the first write is still blocked — the legacy path could not
+        // have read chunk 2 before chunk 1's write acknowledged.
+        wait_for(
+            || handle.snapshot().network_bytes == TOTAL,
+            Duration::from_secs(5),
+            "network receipt to overlap the blocked write",
+        );
+        assert_eq!(
+            handle.snapshot().completed_bytes,
+            0,
+            "no publication may pass the blocked first write"
+        );
+
+        // Release the SECOND write first (it was never gated): the
+        // frontier still cannot publish across the missing first write.
+        // (The gate only holds the first Write operation.)
+        gate.release();
+        let result = task.await.expect("job task").expect("job completes");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(
+            std::fs::read(&destination).expect("content"),
+            content,
+            "reverse completion must still produce byte-exact output"
+        );
+        assert_eq!(result.bytes_downloaded_from_network, TOTAL);
+        assert_eq!(result.completed_bytes, TOTAL);
+    }
+
+    /// Bounded bytes (design D2): with a one-frame read-ahead, a blocked
+    /// sink stops network receipt — the worker cannot outrun storage and
+    /// engine-owned payload stays within the configured read-ahead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_read_ahead_bounds_receipt_under_slow_storage() {
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let registration = OutputFaultScript::register(&destination);
+        let gate = registration.script().hold_next(OutputOperation::Write);
+
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(pipeline_http(&content)),
+            pipeline_config(true, 1),
+        );
+        let (handle, task) = controller.start(DownloadRequest::new(
+            "https://scripted/bounded",
+            destination.clone(),
+        ));
+        let gate = tokio::task::spawn_blocking(move || {
+            gate.wait_until_entered();
+            gate
+        })
+        .await
+        .expect("gate waiter");
+
+        // The first chunk was received and submitted; the read-ahead cap
+        // (one frame) stops further receipt while the write is blocked.
+        wait_for(
+            || handle.snapshot().network_bytes >= 1000,
+            Duration::from_secs(5),
+            "first chunk receipt",
+        );
+        // The receipt plateau is stable: no further chunk arrives while
+        // the sink is blocked (the state cannot advance on its own).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            handle.snapshot().network_bytes,
+            1000,
+            "read-ahead must bound receipt while the sink is blocked"
+        );
+
+        // Releasing the sink completes the transfer byte-exactly.
+        gate.release();
+        let result = task.await.expect("job task").expect("job completes");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(
+            std::fs::read(&destination).expect("content"),
+            content,
+            "backpressured pipeline still produces byte-exact output"
+        );
+    }
+
+    /// The legacy path (default) is unaffected by the switch: identical
+    /// scripted transfer completes byte-exactly with lanes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_path_remains_the_default_and_byte_exact() {
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(pipeline_http(&content)),
+            pipeline_config(false, 4),
+        );
+        let result = controller
+            .run(DownloadRequest::new(
+                "https://scripted/legacy",
+                destination.clone(),
+            ))
+            .await
+            .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(std::fs::read(&destination).expect("content"), content);
     }
 }

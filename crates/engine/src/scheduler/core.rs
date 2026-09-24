@@ -251,16 +251,11 @@ impl SegmentScheduler {
                 let Some(before) = self.lease_next_offset(record.lease_id) else {
                     return 0; // unknown/expired lease: skipped
                 };
-                if !self.report_progress(
-                    record.lease_id,
-                    record.generation,
-                    record.written_through,
-                ) {
+                if !self.report_progress(record.lease_id, record.generation, record.written_through)
+                {
                     return 0; // stale generation: rejected, no coverage
                 }
-                let after = self
-                    .lease_next_offset(record.lease_id)
-                    .unwrap_or(before);
+                let after = self.lease_next_offset(record.lease_id).unwrap_or(before);
                 // The accepted delta (task 5.4): only bytes the scheduler
                 // ACCEPTED within the validated lease count as unique
                 // completed coverage — writes beyond a shrunk (split) lease

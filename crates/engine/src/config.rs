@@ -276,6 +276,69 @@ impl Default for PoolConfig {
         }
     }
 }
+/// Outstanding-write byte budgets (design D2, task 2.2): caps on the
+/// payload bytes the engine retains between network receipt and write
+/// acknowledgement (queued+executing), enforced before each body chunk is
+/// read. Invalid budgets fail validation before any network activity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteBudgetConfig {
+    /// Engine-global outstanding payload bytes across all jobs.
+    pub global_max_bytes: u64,
+    /// Per-job outstanding payload bytes.
+    pub job_max_bytes: u64,
+    /// Per-worker read-ahead: submitted-but-unacknowledged bytes one
+    /// worker may hold; at least one frame quantum (`read_buffer_size`),
+    /// enforced by validation.
+    pub worker_read_ahead_bytes: u64,
+}
+
+impl Default for WriteBudgetConfig {
+    fn default() -> Self {
+        // Provisional conservative limits (design D2): two
+        // `read_buffer_size` frames of read-ahead per active worker, a
+        // job pool admitting the default `max_workers` of them, and an
+        // engine-wide aggregate. Tuned by the phase 2 benchmark gate;
+        // not a committed final default.
+        const FRAME: u64 = 128 * 1024; // default read_buffer_size
+        Self {
+            global_max_bytes: 64 * 1024 * 1024,
+            job_max_bytes: 8 * 2 * FRAME,
+            worker_read_ahead_bytes: 2 * FRAME,
+        }
+    }
+}
+
+/// Shared blocking write-executor policy (design D2, tasks 2.2-2.3): a
+/// small fixed-size blocking pool serves positional writes for every
+/// job's network workers, so blocking filesystem threads never scale with
+/// `jobs × workers`. Invalid bounds fail validation before network
+/// activity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteExecutorConfig {
+    /// Shared blocking writer threads across all jobs (provisional 2-4
+    /// per design D2; tuned by the phase 2 benchmark gate).
+    pub writer_threads: u32,
+    /// Executor-wide bound on queued+executing payload bytes — defense in
+    /// depth beyond the write budgets; must admit at least one frame
+    /// quantum (validated against `read_buffer_size`).
+    pub max_queued_bytes: u64,
+    /// Internal rollout switch (design D2, task 2.5): route segmented
+    /// worker writes through the shared pipelined executor instead of the
+    /// legacy per-worker blocking lanes. Defaults to `false` — the legacy
+    /// path remains the production behavior until the phase 2 gate proves
+    /// parity (task 2.8); removed after acceptance (task 9.5).
+    pub pipeline_writes: bool,
+}
+
+impl Default for WriteExecutorConfig {
+    fn default() -> Self {
+        Self {
+            writer_threads: 4,
+            max_queued_bytes: 32 * 1024 * 1024,
+            pipeline_writes: false,
+        }
+    }
+}
 
 /// How many additional HTTP/2 connections a segmented job may open to one
 /// origin beyond the first multiplexed connection (§24, D5, task 6.2).
@@ -344,6 +407,12 @@ pub struct EngineConfig {
     pub transfer: TransferPolicy,
     pub retry: RetryPolicy,
     pub network: NetworkPolicy,
+    /// Outstanding-write byte budgets (design D2, task 2.2): engine-global,
+    /// per-job and per-worker read-ahead caps on unacknowledged payload.
+    pub write_budget: WriteBudgetConfig,
+    /// Shared blocking write-executor policy (design D2, task 2.3): the
+    /// small bounded blocking pool serving positional writes for all jobs.
+    pub write_executor: WriteExecutorConfig,
 }
 
 /// Restrict resolved addresses / redirect targets (§21.5 SSRF hook).
@@ -391,6 +460,8 @@ impl Default for EngineConfig {
             transfer: TransferPolicy::default(),
             retry: RetryPolicy::default(),
             network: NetworkPolicy::default(),
+            write_budget: WriteBudgetConfig::default(),
+            write_executor: WriteExecutorConfig::default(),
         }
     }
 }
@@ -420,6 +491,8 @@ impl std::fmt::Debug for EngineConfig {
             .field("transfer", &self.transfer)
             .field("retry", &self.retry)
             .field("network", &self.network)
+            .field("write_budget", &self.write_budget)
+            .field("write_executor", &self.write_executor)
             .finish()
     }
 }
@@ -443,6 +516,8 @@ impl PartialEq for EngineConfig {
             && self.transfer == other.transfer
             && self.retry == other.retry
             && self.network == other.network
+            && self.write_budget == other.write_budget
+            && self.write_executor == other.write_executor
     }
 }
 
@@ -567,6 +642,42 @@ impl EngineConfig {
                 "must be >= read_buffer_size",
             ));
         }
+        if self.write_budget.global_max_bytes == 0
+            || self.write_budget.job_max_bytes == 0
+            || self.write_budget.worker_read_ahead_bytes == 0
+        {
+            return Err(invalid("write_budget.*", "must be greater than zero"));
+        }
+        if self.write_budget.job_max_bytes > self.write_budget.global_max_bytes {
+            return Err(invalid(
+                "write_budget.job_max_bytes",
+                "must be <= write_budget.global_max_bytes",
+            ));
+        }
+        if self.write_budget.worker_read_ahead_bytes > self.write_budget.job_max_bytes {
+            return Err(invalid(
+                "write_budget.worker_read_ahead_bytes",
+                "must be <= write_budget.job_max_bytes",
+            ));
+        }
+        if u64::from(self.read_buffer_size) > self.write_budget.worker_read_ahead_bytes {
+            return Err(invalid(
+                "write_budget.worker_read_ahead_bytes",
+                "must be >= read_buffer_size (one frame quantum)",
+            ));
+        }
+        if self.write_executor.writer_threads == 0 {
+            return Err(invalid(
+                "write_executor.writer_threads",
+                "must be at least 1",
+            ));
+        }
+        if u64::from(self.read_buffer_size) > self.write_executor.max_queued_bytes {
+            return Err(invalid(
+                "write_executor.max_queued_bytes",
+                "must be >= read_buffer_size (one frame quantum)",
+            ));
+        }
         if self.checkpoint_flush_interval.is_zero() || self.metrics_interval.is_zero() {
             return Err(invalid(
                 "checkpoint_flush_interval/metrics_interval",
@@ -676,6 +787,55 @@ mod tests {
         assert_eq!(
             c.validate().expect_err("must reject").field,
             "transfer.max_workers"
+        );
+    }
+
+    #[test]
+    fn zero_write_budget_rejected() {
+        let mut c = EngineConfig::default();
+        c.write_budget.global_max_bytes = 0;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.*"
+        );
+        let mut c = EngineConfig::default();
+        c.write_budget.job_max_bytes = 0;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.*"
+        );
+        let mut c = EngineConfig::default();
+        c.write_budget.worker_read_ahead_bytes = 0;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.*"
+        );
+    }
+
+    #[test]
+    fn write_budget_ordering_rejected() {
+        // Job budget above the engine-global budget.
+        let mut c = EngineConfig::default();
+        c.write_budget.job_max_bytes = c.write_budget.global_max_bytes + 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.job_max_bytes"
+        );
+
+        // Worker read-ahead above the job budget.
+        let mut c = EngineConfig::default();
+        c.write_budget.worker_read_ahead_bytes = c.write_budget.job_max_bytes + 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.worker_read_ahead_bytes"
+        );
+
+        // Read-ahead below one frame quantum cannot ever admit a frame.
+        let mut c = EngineConfig::default();
+        c.write_budget.worker_read_ahead_bytes = u64::from(c.read_buffer_size) - 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.worker_read_ahead_bytes"
         );
     }
 

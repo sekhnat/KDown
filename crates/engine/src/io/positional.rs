@@ -131,9 +131,7 @@ mod tests {
                 return Ok(0);
             }
             let n = self.limit.map_or(buf.len(), |l| l.min(buf.len()));
-            self.writes
-                .borrow_mut()
-                .push((offset, buf[..n].to_vec()));
+            self.writes.borrow_mut().push((offset, buf[..n].to_vec()));
             Ok(n)
         }
     }
@@ -208,8 +206,7 @@ mod tests {
     #[test]
     fn offset_overflow_fails_before_any_write() {
         let w = ScriptedWriter::new();
-        let err = write_all_at(&w, u64::MAX - 1, b"0123")
-            .expect_err("offset + len overflows u64");
+        let err = write_all_at(&w, u64::MAX - 1, b"0123").expect_err("offset + len overflows u64");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(w.calls.get(), 0);
     }

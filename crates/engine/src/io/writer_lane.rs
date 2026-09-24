@@ -69,11 +69,7 @@ impl WriterLane {
         let join = tokio::task::spawn_blocking(move || {
             while let Some(request) = rx.blocking_recv() {
                 match request {
-                    LaneRequest::Write {
-                        offset,
-                        data,
-                        ack,
-                    } => {
+                    LaneRequest::Write { offset, data, ack } => {
                         let result = handle.write_blocking(offset, &data);
                         // The awaiting worker owns the other side; a dropped
                         // ack (worker gone) just discards the result.
@@ -166,7 +162,9 @@ mod tests {
         lane_a.shutdown().await.expect("join a");
         lane_b.shutdown().await.expect("join b");
         lane_c.shutdown().await.expect("join c");
-        session.reclaim_exclusive().expect("reclaim after lanes join");
+        session
+            .reclaim_exclusive()
+            .expect("reclaim after lanes join");
         assert_eq!(
             std::fs::read(session.temp_path()).expect("content"),
             b"seg-a-seg-bsegment-c"
@@ -182,8 +180,14 @@ mod tests {
         let handle = lane.handle();
         // Sequence: submit, await, submit again — the one-item queue keeps
         // at most one outstanding payload per lane.
-        handle.write(0, Bytes::from_static(b"one")).await.expect("w1");
-        handle.write(3, Bytes::from_static(b"two")).await.expect("w2");
+        handle
+            .write(0, Bytes::from_static(b"one"))
+            .await
+            .expect("w1");
+        handle
+            .write(3, Bytes::from_static(b"two"))
+            .await
+            .expect("w2");
         drop(handle);
         lane.shutdown().await.expect("join");
         session.reclaim_exclusive().expect("reclaim");
@@ -203,10 +207,12 @@ mod tests {
         let lane = WriterLane::spawn(handles.pop().expect("h"));
         let handle = lane.handle();
         let lane = tokio::spawn(async move {
-            handle.write(0, Bytes::from_static(b"first"))
+            handle
+                .write(0, Bytes::from_static(b"first"))
                 .await
                 .expect("w1");
-            handle.write(5, Bytes::from_static(b"second"))
+            handle
+                .write(5, Bytes::from_static(b"second"))
                 .await
                 .expect("w2");
             drop(handle);
@@ -221,5 +227,4 @@ mod tests {
             b"firstsecond"
         );
     }
-
 }

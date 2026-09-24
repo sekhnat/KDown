@@ -475,7 +475,8 @@ mod tests {
     fn write_read_commit_roundtrip() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
+            let mut sink =
+                FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
             sink.write_at(0, b"hello").expect("write");
             sink.write_at(5, b" world").expect("write at 5");
             assert_eq!(sink.size().expect("size"), 11);
@@ -504,7 +505,8 @@ mod tests {
     fn drop_without_commit_cleans_temp() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
+            let mut sink =
+                FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
             sink.write_at(0, b"partial").expect("write");
             // Dropped without finalize/commit/abort.
         }
@@ -532,8 +534,13 @@ mod tests {
         std::fs::create_dir(&orphan_dir).expect("mkdir");
         let orphan_dest = orphan_dir.join("x.bin");
         let temp = dir.path().join("explicit.part");
-        let mut sink = FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false, false)
-            .expect("open");
+        let mut sink = FileSink::open(
+            &orphan_dest,
+            &TempFileSpec::Explicit(temp.clone()),
+            false,
+            false,
+        )
+        .expect("open");
         sink.write_at(0, b"data").expect("write");
         sink.finalize().expect("finalize");
         std::fs::remove_dir_all(&orphan_dir).expect("remove target dir");

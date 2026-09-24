@@ -117,7 +117,8 @@ pub(crate) struct OutputSyncCapability {
 
 impl std::fmt::Debug for OutputSyncCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputSyncCapability").finish_non_exhaustive()
+        f.debug_struct("OutputSyncCapability")
+            .finish_non_exhaustive()
     }
 }
 
@@ -400,9 +401,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = destination(&directory);
         let temp = temp_path(&destination);
-        let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), true, false, Some(32))
-                .expect("fresh session");
+        let mut session = OutputSession::create(
+            &destination,
+            &TempFileSpec::default(),
+            true,
+            false,
+            Some(32),
+        )
+        .expect("fresh session");
 
         assert_eq!(session.size().expect("preallocated size"), 32);
         session.write_at(0, b"fresh").expect("write");
@@ -421,8 +427,7 @@ mod tests {
         let temp = temp_path(&destination);
         std::fs::write(&temp, b"prior").expect("seed partial");
 
-        let mut session =
-            shol_open(&destination).expect("reopen session");
+        let mut session = shol_open(&destination).expect("reopen session");
         assert_eq!(session.size().expect("reopened size"), 5);
         session.write_at(5, b" resume").expect("append by offset");
         session.flush(FlushLevel::PageCache).expect("flush");
@@ -541,10 +546,7 @@ mod tests {
         lane2.shutdown().await.expect("join lane 2");
         session.reclaim_exclusive().expect("all writers joined");
         session.finalize().expect("finalize after reclaim");
-        assert_eq!(
-            std::fs::read(&temp).expect("assembled temp"),
-            b"first-last"
-        );
+        assert_eq!(std::fs::read(&temp).expect("assembled temp"), b"first-last");
     }
 
     /// Write-only capabilities expose no flush/sync/size/abort authority:

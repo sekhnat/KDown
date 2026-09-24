@@ -195,10 +195,7 @@ fn parse_args() -> (std::net::SocketAddr, ServerConfig) {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
-        let takes_value = !matches!(
-            arg.as_str(),
-            "--ignore-ranges"
-        );
+        let takes_value = !matches!(arg.as_str(), "--ignore-ranges");
         let value = if takes_value {
             match it.next() {
                 Some(v) => v,
@@ -253,7 +250,10 @@ fn parse_args() -> (std::net::SocketAddr, ServerConfig) {
         loss_percent,
         retry_after_secs,
     };
-    (addr.unwrap_or_else(|| "127.0.0.1:0".parse().expect("default addr")), cfg)
+    (
+        addr.unwrap_or_else(|| "127.0.0.1:0".parse().expect("default addr")),
+        cfg,
+    )
 }
 
 fn parse_u16(v: &str) -> Option<u16> {
@@ -338,19 +338,21 @@ async fn main() {
 
 /// Build a rustls server config from PEM files, advertising both ALPN
 /// protocols so hyper's auto builder picks h2 or http/1.1 per connection.
-fn tls_server_config(cert_path: &std::path::Path, key_path: &std::path::Path) -> tokio_rustls::rustls::ServerConfig {
+fn tls_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> tokio_rustls::rustls::ServerConfig {
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(
-        &mut BufReader::new(File::open(cert_path).expect("open cert")),
-    )
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(
+        File::open(cert_path).expect("open cert"),
+    ))
     .collect::<Result<_, _>>()
     .expect("parse cert pem");
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(
-        &mut BufReader::new(File::open(key_path).expect("open key")),
-    )
-    .expect("parse key pem")
-    .expect("key present");
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path).expect("open key")))
+            .expect("parse key pem")
+            .expect("key present");
     let mut config = tokio_rustls::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -374,11 +376,12 @@ async fn serve_tls_connection(
         let state = state.clone();
         let cfg = cfg.clone();
         let stats = stats.clone();
-        async move {
-            Ok::<_, std::convert::Infallible>(handle_request(req, state, cfg, stats).await)
-        }
+        async move { Ok::<_, std::convert::Infallible>(handle_request(req, state, cfg, stats).await) }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await {
+    if let Err(e) = builder
+        .serve_connection_with_upgrades(TokioIo::new(stream), service)
+        .await
+    {
         if std::env::var("FIXTURE_SERVER_TRACE").is_ok() {
             eprintln!("[fixture_server] tls connection error: {e}");
         }
@@ -392,7 +395,9 @@ fn empty_body() -> BoxBody {
 }
 
 fn stats_body(stats: &ServerStats) -> BoxBody {
-    BoxBody::new(http_body_util::Full::new(hyper::body::Bytes::from(stats.summary())))
+    BoxBody::new(http_body_util::Full::new(hyper::body::Bytes::from(
+        stats.summary(),
+    )))
 }
 
 /// Streaming synthetic body: block-derived chunks on an mpsc channel,
@@ -404,7 +409,9 @@ fn stream_body_box(
     stats: Arc<ServerStats>,
     truncate: bool,
 ) -> BoxBody {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>(4);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>,
+    >(4);
     let seed = cfg.seed;
     let throttle_mib_s = cfg.throttle_mib_s;
     let reset_after_bytes = cfg.reset_after_bytes;
@@ -422,14 +429,20 @@ fn stream_body_box(
             chunks.push(block[in_block..in_block + take_in_block].to_vec());
             if chunks.len() * STREAM_CHUNK >= 256 * 1024 {
                 for chunk in chunks.drain(..) {
-                    if tx.send(Ok(hyper::body::Frame::data(chunk.into()))).await.is_err() {
+                    if tx
+                        .send(Ok(hyper::body::Frame::data(chunk.into())))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
             }
             off += take_in_block as u64;
             sent_this_response += take_in_block as u64;
-            stats.emitted.fetch_add(take_in_block as u64, Ordering::Relaxed);
+            stats
+                .emitted
+                .fetch_add(take_in_block as u64, Ordering::Relaxed);
             if truncate {
                 // Deterministic connection loss: premature end after the
                 // first chunk (incomplete body on h1 and h2 alike).
@@ -458,7 +471,9 @@ fn stream_body_box(
 /// hyper body over a chunk channel (tokio-stream is a dev-dependency, so
 /// the stream wrapper is implemented directly).
 struct ChanBody {
-    rx: tokio::sync::mpsc::Receiver<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>,
+    rx: tokio::sync::mpsc::Receiver<
+        Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>,
+    >,
 }
 
 impl hyper::body::Body for ChanBody {
@@ -511,7 +526,11 @@ async fn handle_request(
                 .body(empty_body())
                 .expect("fail response");
         }
-        Decision::Serve { status, range, truncate } => (status, range, truncate),
+        Decision::Serve {
+            status,
+            range,
+            truncate,
+        } => (status, range, truncate),
     };
     // Loopback RTT approximation: one RTT before the response headers.
     if let Some(rtt) = cfg.rtt {
@@ -525,7 +544,10 @@ async fn handle_request(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, body_len);
     if status == 206 {
-        builder = builder.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", cfg.size));
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", cfg.size),
+        );
     }
     if is_head {
         return builder.body(empty_body()).expect("head response");
@@ -542,7 +564,11 @@ enum Decision {
     /// Normal response: 200 full or 206 range (end inclusive).
     /// `truncate` marks a deterministic connection-loss cut: the body
     /// aborts after its first chunk (the client sees an incomplete body).
-    Serve { status: u16, range: Option<(u64, u64)>, truncate: bool },
+    Serve {
+        status: u16,
+        range: Option<(u64, u64)>,
+        truncate: bool,
+    },
 }
 
 async fn current_etag(state: &tokio::sync::Mutex<ServerState>) -> String {
@@ -604,7 +630,11 @@ async fn decide_response(
             rng ^= rng << 17;
             (rng % 10_000) as f64 / 100.0 < cfg.loss_percent
         };
-        Decision::Serve { status, range, truncate }
+        Decision::Serve {
+            status,
+            range,
+            truncate,
+        }
     } else {
         Decision::Fail(status)
     }
@@ -612,9 +642,7 @@ async fn decide_response(
 
 /// Read one HTTP/1.1 request head (headers until CRLFCRLF), returning the
 /// parsed Range and the request line for logging/diagnostics.
-async fn read_request(
-    socket: &mut TcpStream,
-) -> Option<(Option<(u64, u64)>, String, bool)> {
+async fn read_request(socket: &mut TcpStream) -> Option<(Option<(u64, u64)>, String, bool)> {
     let mut head = Vec::with_capacity(1024);
     let mut one = [0u8; 1];
     // Byte-at-a-time header read: loopback latency is irrelevant here and
@@ -687,7 +715,11 @@ async fn serve_connection(
         let etag = current_etag(&state).await;
         let (status, range, truncate) = match decision {
             Decision::Fail(status) => (status, None, false),
-            Decision::Serve { status, range, truncate } => (status, range, truncate),
+            Decision::Serve {
+                status,
+                range,
+                truncate,
+            } => (status, range, truncate),
         };
         // Loopback RTT approximation: one RTT before the response headers.
         if let Some(rtt) = cfg.rtt {
@@ -712,7 +744,10 @@ async fn serve_connection(
             if is_head {
                 continue;
             }
-            if stream_body(&mut socket, &cfg, start, end, &stats, truncate).await.is_err() {
+            if stream_body(&mut socket, &cfg, start, end, &stats, truncate)
+                .await
+                .is_err()
+            {
                 return;
             }
         } else {
@@ -756,7 +791,9 @@ async fn stream_body(
         socket
             .write_all(&block[in_block..in_block + take_in_block])
             .await?;
-        stats.emitted.fetch_add(take_in_block as u64, Ordering::Relaxed);
+        stats
+            .emitted
+            .fetch_add(take_in_block as u64, Ordering::Relaxed);
         if truncate {
             // Deterministic connection loss: abort right after the first
             // chunk (the client observes an incomplete body).
@@ -774,12 +811,10 @@ async fn stream_body(
             }
         }
         if bytes_per_sec.is_finite() {
-            let delay = Duration::from_secs_f64(
-                take_in_block as f64 / bytes_per_sec.max(f64::EPSILON),
-            );
+            let delay =
+                Duration::from_secs_f64(take_in_block as f64 / bytes_per_sec.max(f64::EPSILON));
             tokio::time::sleep(delay).await;
         }
     }
     Ok(())
 }
-

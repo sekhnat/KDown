@@ -76,7 +76,9 @@ impl WindowSample {
     pub fn under_pressure(&self, config: &AdaptiveConfig) -> bool {
         self.retries > config.max_retries_per_window
             || self.throttled > config.max_throttled_per_window
-            || self.wasted_bytes > 0 && self.wasted_bytes >= self.completed_bytes && self.completed_bytes > 0
+            || self.wasted_bytes > 0
+                && self.wasted_bytes >= self.completed_bytes
+                && self.completed_bytes > 0
     }
 }
 
@@ -282,14 +284,20 @@ mod tests {
         // Window 1: establish the baseline (hold).
         assert_eq!(controller.decide(sample(500_000, 500), 1), Decision::Hold);
         // Window 2: same goodput → the first probe (+1).
-        assert_eq!(controller.decide(sample(500_000, 500), 1), Decision::ProbeUp);
+        assert_eq!(
+            controller.decide(sample(500_000, 500), 1),
+            Decision::ProbeUp
+        );
         // The probe applied: current 2. Immediately after a change: cooldown
         // holds even with great samples.
         assert_eq!(controller.decide(sample(2_000_000, 500), 2), Decision::Hold);
         // (Cooldown is wall-clock: for the deterministic trace, force expiry.)
         controller.cooldown_until = None;
         // Material gain → keep the probe and probe again.
-        assert_eq!(controller.decide(sample(2_000_000, 500), 2), Decision::ProbeUp);
+        assert_eq!(
+            controller.decide(sample(2_000_000, 500), 2),
+            Decision::ProbeUp
+        );
     }
 
     #[test]
@@ -299,7 +307,10 @@ mod tests {
         // Baseline at level 1.
         assert_eq!(controller.decide(sample(500_000, 500), 1), Decision::Hold);
         // Probe (+1).
-        assert_eq!(controller.decide(sample(500_000, 500), 1), Decision::ProbeUp);
+        assert_eq!(
+            controller.decide(sample(500_000, 500), 1),
+            Decision::ProbeUp
+        );
         controller.cooldown_until = None;
         // The probe produced NO gain (same goodput): revert to 1.
         assert_eq!(controller.decide(sample(500_000, 500), 2), Decision::Reduce);
@@ -320,7 +331,10 @@ mod tests {
         // pre-probe level.
         let mut controller = AdaptiveController::new(config, 1, 8);
         assert_eq!(controller.decide(sample(500_000, 500), 3), Decision::Hold);
-        assert_eq!(controller.decide(sample(500_000, 500), 3), Decision::ProbeUp);
+        assert_eq!(
+            controller.decide(sample(500_000, 500), 3),
+            Decision::ProbeUp
+        );
         controller.cooldown_until = None;
         let pressured = WindowSample {
             retries: 10,
@@ -358,10 +372,16 @@ mod tests {
     fn empty_windows_hold() {
         let config = AdaptiveConfig::default();
         let mut controller = AdaptiveController::new(config, 1, 8);
-        assert_eq!(controller.decide(WindowSample::default(), 1), Decision::Hold);
+        assert_eq!(
+            controller.decide(WindowSample::default(), 1),
+            Decision::Hold
+        );
         assert_eq!(
             controller.decide(
-                WindowSample { elapsed: Duration::from_millis(100), ..Default::default() },
+                WindowSample {
+                    elapsed: Duration::from_millis(100),
+                    ..Default::default()
+                },
                 1,
             ),
             Decision::Hold

@@ -431,9 +431,7 @@ impl SingleStreamController {
         let cancel = CancellationToken::new();
         // One counter shard per potential worker (task 5.4: per-worker
         // attribution); mirrors the segmented job's worker-progress cells.
-        let counters = Arc::new(JobCounters::new(
-            self.config.transfer.max_workers.max(16),
-        ));
+        let counters = Arc::new(JobCounters::new(self.config.transfer.max_workers.max(16)));
         let (hub, _stream) = EventHub::new(256, self.config.metrics_interval);
         let hub: SharedHub = Arc::new(hub);
         let handle = DownloadHandle {
@@ -1837,9 +1835,14 @@ mod completion_tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = directory.path().join("output.bin");
         std::fs::write(&destination, b"previous destination").expect("seed old destination");
-        let mut sink =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, false, Some(3))
-                .expect("open output session");
+        let mut sink = OutputSession::create(
+            &destination,
+            &TempFileSpec::default(),
+            false,
+            false,
+            Some(3),
+        )
+        .expect("open output session");
         sink.write_at(0, b"new").expect("write temp output");
         sink.fail_next_flush();
         let controller = SingleStreamController::with_execution(

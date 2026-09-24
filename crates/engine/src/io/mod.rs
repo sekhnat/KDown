@@ -7,9 +7,12 @@ pub(crate) mod fault_script;
 pub(crate) mod output_session;
 pub(crate) mod positional;
 pub(crate) mod publish;
-pub(crate) mod writer_lane;
 pub mod sanitize;
 pub mod sink;
+pub(crate) mod write_budget;
+pub(crate) mod write_executor;
+pub(crate) mod write_frontier;
+pub(crate) mod writer_lane;
 
 pub use buffer_pool::{BufferPool, PooledBuffer};
 pub use sanitize::sanitize_filename;
