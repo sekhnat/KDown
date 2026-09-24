@@ -37,14 +37,11 @@ fn controller(cfg: EngineConfig) -> SingleStreamController {
 }
 
 /// The rate-limit test server: ranges served from deterministic content.
-fn rate_limit_server(
-    content: Arc<Vec<u8>>,
-) -> crate::support::test_server::TestServer {
+fn rate_limit_server(content: Arc<Vec<u8>>) -> crate::support::test_server::TestServer {
     TestServer::new().serve_handler("/ratelimit", move |req| {
         let total = content.len() as u64;
         if req.method == "HEAD" {
-            return ScriptedResponse::ok((*content).clone())
-                .with_header("accept-ranges", "bytes");
+            return ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes");
         }
         if let Some((s, e)) = req.range {
             let body = content[s as usize..=(e as usize).min(total as usize - 1)].to_vec();
@@ -226,7 +223,10 @@ async fn rate_limit_slow_limit_throttles_throughput() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_limit_update_before_job_is_honored() {
     let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 3003));
-    let server = rate_limit_server(content.clone()).start().await.expect("start");
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("prestart.bin");
     let c_cfg = segmented_cfg();
@@ -366,7 +366,8 @@ async fn single_stream_restart_counts_wasted_bytes() {
     );
     assert!(result.retries >= 1, "{result:?}");
     assert_eq!(
-        result.completed_bytes, content.len() as u64,
+        result.completed_bytes,
+        content.len() as u64,
         "unique coverage is exact: {result:?}"
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
@@ -382,7 +383,10 @@ async fn single_stream_restart_counts_wasted_bytes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrency_increase_decrease_increase_no_lost_work() {
     let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 3006));
-    let server = rate_limit_server(content.clone()).start().await.expect("start");
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("cycle.bin");
     let mut c_cfg = segmented_cfg();
@@ -418,7 +422,10 @@ async fn concurrency_increase_decrease_increase_no_lost_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_concurrency_clamps_to_configured_bounds() {
     let content = Arc::new(deterministic_bytes(1024 * 1024, 3007));
-    let server = rate_limit_server(content.clone()).start().await.expect("start");
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("clamp.bin");
     let mut c_cfg = segmented_cfg();
@@ -453,15 +460,17 @@ async fn manual_concurrency_clamps_to_configured_bounds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adaptive_concurrency_starts_at_min_and_stays_in_bounds() {
     let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 3008));
-    let server = rate_limit_server(content.clone()).start().await.expect("start");
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("adaptive.bin");
 
     let mut adaptive_cfg = segmented_cfg();
     adaptive_cfg.transfer.max_workers = 4;
     adaptive_cfg.transfer.min_workers = 2;
-    adaptive_cfg.transfer.concurrency_mode =
-        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
     adaptive_cfg.transfer.max_segment_size = 512 * 1024;
     let c = controller(adaptive_cfg);
     let (handle, join) = c.start(DownloadRequest::new(server.url("/ratelimit"), dest.clone()));
@@ -497,7 +506,10 @@ async fn adaptive_concurrency_starts_at_min_and_stays_in_bounds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fixed_mode_starts_at_configured_max() {
     let content = Arc::new(deterministic_bytes(1024 * 1024, 3009));
-    let server = rate_limit_server(content.clone()).start().await.expect("start");
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("fixed.bin");
     let mut c_cfg = segmented_cfg();
@@ -541,8 +553,8 @@ async fn split_events_and_active_worker_gauge_are_reported() {
                 .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
                 .with_header("accept-ranges", "bytes");
             if req.range.is_none() {
-                resp = ScriptedResponse::ok((*content).clone())
-                    .with_header("accept-ranges", "bytes");
+                resp =
+                    ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes");
             }
             // Pace the first worker so idle workers observe the live tail
             // and split it while it streams.
@@ -637,8 +649,7 @@ async fn adaptive_probe_activates_additional_workers() {
     let mut adaptive_cfg = segmented_cfg();
     adaptive_cfg.transfer.max_workers = 4;
     adaptive_cfg.transfer.min_workers = 1;
-    adaptive_cfg.transfer.concurrency_mode =
-        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
     // One whole-file lease: growth requires a live-tail split by the new
     // worker, exactly the activation path the fix must exercise.
     adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
@@ -657,7 +668,10 @@ async fn adaptive_probe_activates_additional_workers() {
             }
         }
     }
-    assert!(first_worker, "the first adaptive worker must hold the lease");
+    assert!(
+        first_worker,
+        "the first adaptive worker must hold the lease"
+    );
 
     // The controller probes up within ~2 windows (500 ms each). A second
     // worker must then be observed holding a lease simultaneously.
@@ -773,7 +787,8 @@ async fn worker_gauges_distinguish_desired_provisioned_active() {
     assert_eq!(desired, 4, "fixed desired = max_workers");
     assert_eq!(provisioned, 4, "four worker tasks exist");
     assert_eq!(
-        provisioned, active + parked,
+        provisioned,
+        active + parked,
         "provisioned splits exactly into active + parked"
     );
     assert!(
@@ -829,8 +844,7 @@ async fn writer_lanes_track_desired_concurrency() {
     adaptive_cfg.transfer.segmentation_threshold = 1;
     adaptive_cfg.transfer.max_workers = 4;
     adaptive_cfg.transfer.min_workers = 1;
-    adaptive_cfg.transfer.concurrency_mode =
-        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
     adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
     adaptive_cfg.transfer.max_segment_size = content.len() as u64;
     let c = controller(adaptive_cfg);
@@ -928,8 +942,7 @@ async fn adaptive_pause_resume_with_parked_and_active_workers() {
     adaptive_cfg.transfer.segmentation_threshold = 1;
     adaptive_cfg.transfer.max_workers = 4;
     adaptive_cfg.transfer.min_workers = 1;
-    adaptive_cfg.transfer.concurrency_mode =
-        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
     adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
     adaptive_cfg.transfer.max_segment_size = content.len() as u64;
     let c = controller(adaptive_cfg);
@@ -1005,8 +1018,7 @@ async fn adaptive_cancel_keep_partial_with_parked_workers() {
     adaptive_cfg.transfer.segmentation_threshold = 1;
     adaptive_cfg.transfer.max_workers = 4;
     adaptive_cfg.transfer.min_workers = 1;
-    adaptive_cfg.transfer.concurrency_mode =
-        kdown_engine::config::ConcurrencyMode::Adaptive;
+    adaptive_cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
     adaptive_cfg.transfer.initial_segment_size = content.len() as u64;
     adaptive_cfg.transfer.max_segment_size = content.len() as u64;
     let c = controller(adaptive_cfg);

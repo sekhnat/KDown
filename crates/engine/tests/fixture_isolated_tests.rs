@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{
-    DownloadRequest, ResultStatus, SingleStreamController,
-};
+use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
 
 mod support;
 use support::fixtures;
@@ -157,7 +155,14 @@ async fn isolated_server_segmented_download_matches() {
 /// retry path (server behavior + client resilience over real HTTP).
 #[tokio::test]
 async fn isolated_transient_failures_recover_via_retry() {
-    let server = spawn_server(&["--size", "512KiB", "--seed", "7", "--transient-fail", "2:503"]);
+    let server = spawn_server(&[
+        "--size",
+        "512KiB",
+        "--seed",
+        "7",
+        "--transient-fail",
+        "2:503",
+    ]);
     let url = format!("http://{}/f.bin", server.addr);
     let (result, _dir) = download(&url, |cfg| {
         cfg.transfer.segmentation_threshold = 1;
@@ -172,7 +177,11 @@ async fn isolated_transient_failures_recover_via_retry() {
     // The probe's validating bytes=0-0 GET may consume one injected failure;
     // at least one worker-visible retry must have happened and the job must
     // recover with the exact file.
-    assert!(result.retries >= 1, "expected injected failures to be retried, retries={}", result.retries);
+    assert!(
+        result.retries >= 1,
+        "expected injected failures to be retried, retries={}",
+        result.retries
+    );
     let path = result.final_path.clone().expect("published");
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
@@ -252,8 +261,10 @@ async fn isolated_ignore_ranges_serves_full_200() {
     let server = spawn_server(&["--size", "4KiB", "--seed", "11", "--ignore-ranges"]);
     use std::io::Write as _;
     let mut conn = std::net::TcpStream::connect(server.addr.clone()).expect("connect");
-    conn.write_all(b"GET /f.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1\r\nConnection: close\r\n\r\n")
-        .expect("req");
+    conn.write_all(
+        b"GET /f.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1\r\nConnection: close\r\n\r\n",
+    )
+    .expect("req");
     let mut response = Vec::new();
     std::io::Read::read_to_end(&mut conn, &mut response).expect("resp");
     let head = String::from_utf8_lossy(&response).to_string();
@@ -329,10 +340,7 @@ fn configure_tls(cfg: &mut EngineConfig, ca: &std::path::Path) {
 
 /// Read the fixture server's `/__stats` counters through the engine with the
 /// same TLS trust configuration as the job under test.
-async fn read_tls_stats(
-    cfg: &EngineConfig,
-    server: &IsolatedServer,
-) -> (u64, u64, u64) {
+async fn read_tls_stats(cfg: &EngineConfig, server: &IsolatedServer) -> (u64, u64, u64) {
     let dir = tempfile::tempdir().expect("stats tmpdir");
     let transport = HttpTransport::from_config(cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg.clone());
@@ -347,7 +355,10 @@ async fn read_tls_stats(
     let text = std::fs::read_to_string(dir.path().join("stats.txt")).expect("stats text");
     let parse = |key: &str| {
         text.lines()
-            .find_map(|l| l.strip_prefix(key).and_then(|v| v.trim().parse::<u64>().ok()))
+            .find_map(|l| {
+                l.strip_prefix(key)
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            })
             .expect(key)
     };
     (parse("emitted="), parse("connections="), parse("requests="))
@@ -372,7 +383,10 @@ async fn isolated_tls_h2_segmented_parity() {
     let controller = SingleStreamController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
-        .run(DownloadRequest::new(url.clone(), dir.path().join("out.bin")))
+        .run(DownloadRequest::new(
+            url.clone(),
+            dir.path().join("out.bin"),
+        ))
         .await
         .expect("download");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
@@ -381,13 +395,17 @@ async fn isolated_tls_h2_segmented_parity() {
     assert_eq!(result.bytes_reused_from_checkpoint, 0);
 
     let (emitted, _conns, requests) = read_tls_stats(&cfg, &server).await;
-    assert!(requests > 1, "segmented H2 must issue multiple requests: {requests}");
+    assert!(
+        requests > 1,
+        "segmented H2 must issue multiple requests: {requests}"
+    );
     // The validating bytes=0-0 probe contributes <= a few payload bytes;
     // anything approaching 2x would be split-overlap re-delivery.
     assert!(
         emitted >= server.size && emitted <= server.size + 64,
         "H2 segmented coverage must not duplicate payload on the wire \
-         (emitted {emitted} for {} bytes)", server.size
+         (emitted {emitted} for {} bytes)",
+        server.size
     );
 }
 
@@ -442,7 +460,8 @@ async fn isolated_tls_ignore_ranges_falls_back() {
     assert!(
         emitted <= 2 * server.size + 64 * 1024,
         "range-ignoring server must downgrade to a single transfer \
-         (emitted {emitted} for {} bytes)", server.size
+         (emitted {emitted} for {} bytes)",
+        server.size
     );
     assert!(
         requests <= 8,
@@ -477,13 +496,14 @@ async fn isolated_tls_mid_transfer_reset_recovers() {
         .await
         .expect("download");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert!(result.retries >= 1, "expected reset retries: {}", result.retries);
+    assert!(
+        result.retries >= 1,
+        "expected reset retries: {}",
+        result.retries
+    );
     let path = result.final_path.clone().expect("published");
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
-
-
-
 
 // ---- Controlled shaping modes (optimize-transfer-engine-v2 task 0.3) ----
 
@@ -517,14 +537,7 @@ async fn isolated_rtt_shapes_per_request_latency() {
 /// recovers through retries with byte-exact output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn isolated_connection_loss_recovers_via_retry() {
-    let server = spawn_server(&[
-        "--size",
-        "256KiB",
-        "--seed",
-        "31",
-        "--loss-percent",
-        "40",
-    ]);
+    let server = spawn_server(&["--size", "256KiB", "--seed", "31", "--loss-percent", "40"]);
     let url = format!("http://{}/f.bin", server.addr);
     let (result, _dir) = download(&url, |cfg| {
         cfg.transfer.segmentation_threshold = 1;
@@ -536,7 +549,11 @@ async fn isolated_connection_loss_recovers_via_retry() {
     })
     .await;
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert!(result.retries >= 1, "expected loss retries: {}", result.retries);
+    assert!(
+        result.retries >= 1,
+        "expected loss retries: {}",
+        result.retries
+    );
     let path = result.final_path.clone().expect("published");
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }

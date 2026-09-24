@@ -42,7 +42,14 @@ fn controller(cfg: EngineConfig) -> SingleStreamController {
 fn spawn_fixture_server(size: &str, seed: u64) -> (std::process::Child, String, String) {
     let bin = env!("CARGO_BIN_EXE_fixture_server");
     let mut child = std::process::Command::new(bin)
-        .args(["--size", size, "--seed", &seed.to_string(), "--addr", "127.0.0.1:0"])
+        .args([
+            "--size",
+            size,
+            "--seed",
+            &seed.to_string(),
+            "--addr",
+            "127.0.0.1:0",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -79,7 +86,10 @@ async fn unsupported_physical_allocation_falls_back_and_completes() {
     let dest = dir.path().join("out.bin");
     let c = controller(cfg(true));
     let result = c
-        .run(DownloadRequest::new(format!("http://{addr}/f.bin"), dest.clone()))
+        .run(DownloadRequest::new(
+            format!("http://{addr}/f.bin"),
+            dest.clone(),
+        ))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
@@ -99,7 +109,10 @@ async fn logical_only_allocation_completes_identically() {
     let dest = dir.path().join("out.bin");
     let c = controller(cfg(false));
     let result = c
-        .run(DownloadRequest::new(format!("http://{addr}/f.bin"), dest.clone()))
+        .run(DownloadRequest::new(
+            format!("http://{addr}/f.bin"),
+            dest.clone(),
+        ))
         .await
         .expect("terminal");
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");

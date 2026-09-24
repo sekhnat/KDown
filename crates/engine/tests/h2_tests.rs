@@ -231,3 +231,85 @@ async fn h2_single_connection_default_multiplexes() {
         "single H2 connection expected to carry all range streams"
     );
 }
+
+/// Task 2.6: the pipelined write path (shared executor, byte budgets,
+/// per-lease ack frontiers) serves HTTP/2 segmented transfer through the
+/// SAME transport-agnostic seam — concurrent streams, out-of-order write
+/// completion, exact offsets and hash — without altering range validation
+/// or the single-connection H2 default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_pipelined_segmented_download_is_byte_exact_on_one_connection() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let (addr, ca_pem, conns) = start_h2_tls_server(content.clone()).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+
+    let mut cfg = h2_cfg(&ca_path);
+    cfg.h2_policy = H2ConnectionPolicy::Single;
+    cfg.write_executor.pipeline_writes = true;
+    cfg.write_executor.writer_threads = 2;
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg);
+    let dest = dir.path().join("out.bin");
+    let req = DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    );
+    let result = controller.run(req).await.expect("run");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content),
+        "pipelined writes must assemble every H2 stream byte-exactly"
+    );
+    assert_eq!(
+        result.bytes_downloaded_from_network,
+        content.len() as u64,
+        "received payload equals the server-emitted body"
+    );
+    // The default H2 policy holds under the pipelined write path: one
+    // multiplexed connection carries every concurrent range stream.
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        1,
+        "pipelined streams must not open additional H2 connections"
+    );
+}
+
+/// The additional-H2-connection policy hook keeps its meaning under the
+/// pipelined write path (explicit configuration is respected, not bypassed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_pipelined_respects_additional_connections_policy() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let (addr, ca_pem, conns) = start_h2_tls_server(content.clone()).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+
+    let mut cfg = h2_cfg(&ca_path);
+    cfg.h2_policy = H2ConnectionPolicy::Additional { max_connections: 4 };
+    cfg.pool.max_per_origin = 4;
+    cfg.max_connections_per_origin = 4;
+    cfg.write_executor.pipeline_writes = true;
+    cfg.write_executor.writer_threads = 2;
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg);
+    let dest = dir.path().join("out.bin");
+    let req = DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    );
+    let result = controller.run(req).await.expect("run");
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+    assert!(
+        conns.load(Ordering::SeqCst) >= 1,
+        "server accepted no connections"
+    );
+}

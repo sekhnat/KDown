@@ -62,8 +62,7 @@ fn delayed_static(
             }
             None => ScriptedResponse::ok((*content).clone()),
         };
-        base.with_header("accept-ranges", "bytes")
-            .chunked(delay)
+        base.with_header("accept-ranges", "bytes").chunked(delay)
     }
 }
 
@@ -99,7 +98,10 @@ async fn live_tail_split_never_doubles_wire_payload() {
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Accepted unique coverage is exact regardless of overlap.
-    assert_eq!(result.completed_bytes, len, "accepted bytes must equal file size");
+    assert_eq!(
+        result.completed_bytes, len,
+        "accepted bytes must equal file size"
+    );
 
     let emitted = server.payload_emitted().await;
     assert!(

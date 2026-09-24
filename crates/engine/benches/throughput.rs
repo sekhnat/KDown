@@ -99,7 +99,10 @@ pub mod fixtures {
     pub enum ContentSource {
         InMemory(std::sync::Arc<Vec<u8>>),
         /// `len` bytes derived from per-block xorshift runs (`seed`).
-        Synthetic { len: u64, seed: u64 },
+        Synthetic {
+            len: u64,
+            seed: u64,
+        },
     }
 
     impl ContentSource {
@@ -126,8 +129,7 @@ pub mod fixtures {
                         let block_index = off / SYNTHETIC_BLOCK as u64;
                         let block = synthetic_block_bytes(block_index, *seed);
                         let in_block = (off % SYNTHETIC_BLOCK as u64) as usize;
-                        let take = (SYNTHETIC_BLOCK - in_block)
-                            .min((end - off + 1) as usize);
+                        let take = (SYNTHETIC_BLOCK - in_block).min((end - off + 1) as usize);
                         out.extend_from_slice(&block[in_block..in_block + take]);
                         off += take as u64;
                     }
@@ -173,12 +175,8 @@ fn fixture() -> ContentSource {
 
 /// Deterministic synthetic fixture: any size, tiny resident cost (task 1.3).
 fn synthetic_fixture(len: u64) -> ContentSource {
-    ContentSource::Synthetic {
-        len,
-        seed: 0xBEEF,
-    }
+    ContentSource::Synthetic { len, seed: 0xBEEF }
 }
-
 
 // ---------------------------------------------------------------------------
 // Benchmark HTTP servers
@@ -354,10 +352,12 @@ async fn start_h2_tls_server_paced(
                                 }
                                 // Stream in bounded chunks (task 1.3): never
                                 // materialize the whole range server-side.
-                                let (tx, rx) = tokio::sync::mpsc::channel::<Result<
-                                    hyper::body::Frame<hyper::body::Bytes>,
-                                    std::convert::Infallible,
-                                >>(4);
+                                let (tx, rx) = tokio::sync::mpsc::channel::<
+                                    Result<
+                                        hyper::body::Frame<hyper::body::Bytes>,
+                                        std::convert::Infallible,
+                                    >,
+                                >(4);
                                 tokio::spawn(async move {
                                     if let Some((s, e)) = range {
                                         let mut off = s;
@@ -598,11 +598,16 @@ fn fmt_record(name: &str, r: &ResourceRecord) -> String {
         r.cpu_percent,
         r.peak_rss_kib,
         r.context_switches,
-        r.connections.map_or_else(|| "n/r".into(), |c| c.to_string()),
+        r.connections
+            .map_or_else(|| "n/r".into(), |c| c.to_string()),
         r.verification(),
         r.server_emitted.map_or_else(
             || "n/r".into(),
-            |e| format!("{e}/{} /{}", r.server_connections.unwrap_or(0), r.server_requests.unwrap_or(0)),
+            |e| format!(
+                "{e}/{} /{}",
+                r.server_connections.unwrap_or(0),
+                r.server_requests.unwrap_or(0)
+            ),
         )
     )
 }
@@ -612,9 +617,7 @@ const RECORD_HEADER: &str = "| Scenario | Goodput (MiB/s) | Wire (MiB/s) | Compl
 /// Emit the scenario report to stderr (criterion captures stdout) and the
 /// results file so before/after comparisons (task 2.4) have an artifact.
 fn emit_report(group: &str, records: &[(String, ResourceRecord)]) {
-    let mut out = format!(
-        "# {group} resource records (task 1.1/1.2)\n\n{RECORD_HEADER}\n"
-    );
+    let mut out = format!("# {group} resource records (task 1.1/1.2)\n\n{RECORD_HEADER}\n");
     for (name, r) in records {
         out.push_str(&fmt_record(name, r));
         out.push('\n');
@@ -700,7 +703,14 @@ fn bench_h1_throughput(c: &mut Criterion) {
         });
         records.push((
             format!("h1/workers_{workers}"),
-            record_scenario(&format!("workers_{workers}"), &rt, &cfg, &url, &expected_hash, None),
+            record_scenario(
+                &format!("workers_{workers}"),
+                &rt,
+                &cfg,
+                &url,
+                &expected_hash,
+                None,
+            ),
         ));
     }
     group.finish();
@@ -756,7 +766,14 @@ fn bench_h2_throughput(c: &mut Criterion) {
         });
         records.push((
             format!("h2/workers_{workers}"),
-            record_scenario(&format!("workers_{workers}"), &rt, &cfg, &url, &expected_hash, None),
+            record_scenario(
+                &format!("workers_{workers}"),
+                &rt,
+                &cfg,
+                &url,
+                &expected_hash,
+                None,
+            ),
         ));
     }
     group.finish();
@@ -1018,7 +1035,11 @@ fn main() {
     // here are the client's alone. Usage:
     //   throughput --isolated 127.0.0.1:PORT --isolated-size 1GiB \
     //     [--isolated-seed 0] [--isolated-workers 4] [--isolated-label name]
-    if let Some(addr) = args.iter().position(|a| a == "--isolated").map(|i| args[i + 1].clone()) {
+    if let Some(addr) = args
+        .iter()
+        .position(|a| a == "--isolated")
+        .map(|i| args[i + 1].clone())
+    {
         run_isolated_client(
             addr,
             arg_value(&args, "--isolated-size"),
@@ -1028,8 +1049,7 @@ fn main() {
             arg_value(&args, "--isolated-workers")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
-            arg_value(&args, "--isolated-label")
-                .unwrap_or_else(|| "isolated".to_string()),
+            arg_value(&args, "--isolated-label").unwrap_or_else(|| "isolated".to_string()),
             arg_value(&args, "--isolated-ca"),
             arg_value(&args, "--isolated-dest"),
         );
@@ -1052,7 +1072,9 @@ fn parse_u64_arg(v: &str) -> Option<u64> {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 /// Run one client download against a running isolated fixture server and
@@ -1109,9 +1131,10 @@ fn run_isolated_client(
         } else {
             Some(tempfile::tempdir().expect("dest tmpdir"))
         };
-        let dest_root: std::path::PathBuf = dest_dir
-            .as_ref()
-            .map_or_else(|| dir.as_ref().expect("tmpdir").path().to_path_buf(), std::path::PathBuf::from);
+        let dest_root: std::path::PathBuf = dest_dir.as_ref().map_or_else(
+            || dir.as_ref().expect("tmpdir").path().to_path_buf(),
+            std::path::PathBuf::from,
+        );
         let _scratch = match dir {
             Some(d) => d,
             None => tempfile::tempdir().expect("scratch tmpdir"),
@@ -1145,7 +1168,10 @@ fn run_isolated_client(
         }
         record
     });
-    emit_report(&format!("isolated/{label}"), &[(format!("isolated/{label}"), record)]);
+    emit_report(
+        &format!("isolated/{label}"),
+        &[(format!("isolated/{label}"), record)],
+    );
 }
 
 /// Multi-job contention harness (task 0.3): a one-job baseline, same-origin
@@ -1248,9 +1274,13 @@ fn run_jobs_matrix() {
             aggregate.wall = batch_wall;
             aggregate.completed_bytes = aggregate_bytes;
             aggregate.network_bytes = per_job.iter().map(|r| r.network_bytes).sum();
-            aggregate.cpu_percent = per_job.iter().map(|r| r.cpu_percent).sum::<f64>()
-                / per_job.len().max(1) as f64;
-            aggregate.peak_rss_kib = per_job.iter().map(|r| r.peak_rss_kib).max().expect("jobs present");
+            aggregate.cpu_percent =
+                per_job.iter().map(|r| r.cpu_percent).sum::<f64>() / per_job.len().max(1) as f64;
+            aggregate.peak_rss_kib = per_job
+                .iter()
+                .map(|r| r.peak_rss_kib)
+                .max()
+                .expect("jobs present");
             records.push((format!("{label}/AGGREGATE"), aggregate));
         }
     }
@@ -1259,10 +1289,7 @@ fn run_jobs_matrix() {
 
 /// Fetch the isolated fixture's `/__stats` counters by downloading the
 /// tiny document through the engine (same TLS/CA semantics as the job).
-async fn fetch_isolated_stats(
-    cfg: &EngineConfig,
-    base: &str,
-) -> Option<(u64, u64, u64)> {
+async fn fetch_isolated_stats(cfg: &EngineConfig, base: &str) -> Option<(u64, u64, u64)> {
     let dir = tempfile::tempdir().ok()?;
     let transport = HttpTransport::from_config(cfg).ok()?;
     let controller = SingleStreamController::new(transport, cfg.clone());
@@ -1282,7 +1309,11 @@ async fn fetch_isolated_stats(
             .find_map(|l| l.strip_prefix(key).map(|v| v.trim().parse::<u64>().ok()))
             .flatten()
     };
-    Some((parse("emitted=")?, parse("connections=")?, parse("requests=")?))
+    Some((
+        parse("emitted=")?,
+        parse("connections=")?,
+        parse("requests=")?,
+    ))
 }
 
 /// Target-sizing sweep (task 6.3): one measured run per configuration over
@@ -1304,8 +1335,12 @@ fn run_sweep() {
             records.push((
                 format!("sweep/{protocol}/explicit-{target_mib}MiB"),
                 sweep_run(
-                    &rt, protocol, fixture_size, workers,
-                    Some(target_mib * mib), 0,
+                    &rt,
+                    protocol,
+                    fixture_size,
+                    workers,
+                    Some(target_mib * mib),
+                    0,
                 ),
             ));
         }
@@ -1365,8 +1400,7 @@ fn compare_run(
         cfg.transfer.min_workers = 1;
         cfg.transfer.max_segment_size = 8 * 1024 * 1024;
         if adaptive {
-            cfg.transfer.concurrency_mode =
-                kdown_engine::config::ConcurrencyMode::Adaptive;
+            cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
         }
         cfg.network.response_header_timeout = Duration::from_secs(30);
         cfg.network.read_idle_timeout = Duration::from_secs(30);
@@ -1393,16 +1427,8 @@ fn compare_run(
             )
         };
         let dir = tempfile::tempdir().expect("dest tmpdir");
-        let (result, record) = measure_download(
-            "compare",
-            &cfg,
-            url,
-            dir.path(),
-            size,
-            &expected_hash,
-            None,
-        )
-        .await;
+        let (result, record) =
+            measure_download("compare", &cfg, url, dir.path(), size, &expected_hash, None).await;
         assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
@@ -1414,7 +1440,10 @@ fn compare_run(
 }
 
 /// HTTP/1.1 fixture server with optional per-chunk pacing (shaped cases).
-async fn start_h1_server_paced(content: ContentSource, pacing: Option<Duration>) -> std::net::SocketAddr {
+async fn start_h1_server_paced(
+    content: ContentSource,
+    pacing: Option<Duration>,
+) -> std::net::SocketAddr {
     // Reuse the unpaced server when no shaping is requested.
     let Some(pacing) = pacing else {
         return start_h1_server(content).await;
@@ -1515,15 +1544,11 @@ fn sweep_run(
         cfg.transfer.max_workers = workers;
         cfg.transfer.min_workers = workers.min(2);
         if let Some(target) = explicit_target_bytes {
-            cfg.transfer.segment_sizing =
-                kdown_engine::config::SegmentSizing::Explicit;
-            cfg.transfer.initial_segment_size = target.clamp(
-                cfg.transfer.min_segment_size,
-                cfg.transfer.max_segment_size,
-            );
+            cfg.transfer.segment_sizing = kdown_engine::config::SegmentSizing::Explicit;
+            cfg.transfer.initial_segment_size =
+                target.clamp(cfg.transfer.min_segment_size, cfg.transfer.max_segment_size);
         } else {
-            cfg.transfer.segment_sizing =
-                kdown_engine::config::SegmentSizing::Automatic;
+            cfg.transfer.segment_sizing = kdown_engine::config::SegmentSizing::Automatic;
             cfg.transfer.auto_oversubscription = oversubscription;
         }
         cfg.network.response_header_timeout = Duration::from_secs(30);
@@ -1544,16 +1569,8 @@ fn sweep_run(
             )
         };
         let dir = tempfile::tempdir().expect("dest tmpdir");
-        let (result, record) = measure_download(
-            "sweep",
-            &cfg,
-            url,
-            dir.path(),
-            size,
-            &expected_hash,
-            None,
-        )
-        .await;
+        let (result, record) =
+            measure_download("sweep", &cfg, url, dir.path(), size, &expected_hash, None).await;
         assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
