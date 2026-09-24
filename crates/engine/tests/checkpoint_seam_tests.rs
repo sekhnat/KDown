@@ -970,7 +970,7 @@ async fn segmented_pause_persists_absorbed_snapshot_monotonically() {
     assert!(dir.path().join("seg.bin.part").exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn segmented_save_failure_converges_workers_to_failed() {
     let (scripted, _content) = segmented_script(false);
     let store = ScriptedCheckpointStore::new();
@@ -1018,7 +1018,7 @@ async fn segmented_save_failure_converges_workers_to_failed() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn segmented_post_commit_delete_failure_retains_completed() {
     let (scripted, content) = segmented_script(false);
     let store = ScriptedCheckpointStore::new();
@@ -1290,7 +1290,7 @@ async fn sequential_resume_cadence_and_commit_use_one_adapter() {
     no_sidecar_files(dir.path());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn segmented_resume_cadence_and_commit_use_one_adapter() {
     // A segmented job with admitted prior state: admission load, worker
     // cadence saves, and commit cleanup all cross the one adapter with no

@@ -106,6 +106,32 @@ impl JobCounters {
     }
 }
 
+impl ProgressSnapshot {
+    /// Useful completed-byte goodput (§19.1): unique newly completed file
+    /// bytes per second of elapsed time. Reused checkpoint bytes never
+    /// inflate this number.
+    #[must_use]
+    pub fn useful_goodput_per_sec(&self) -> f64 {
+        self.completed_bytes as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
+    }
+
+    /// Wire throughput: all network payload bytes (including retransmit
+    /// overhead) per second of elapsed time.
+    #[must_use]
+    pub fn wire_throughput_per_sec(&self) -> f64 {
+        self.network_bytes as f64 / self.elapsed.as_secs_f64().max(f64::EPSILON)
+    }
+
+    /// Synthetic accounting check (observability spec): wire bytes bound
+    /// both wasted retransmit overhead and unique completed bytes; reused
+    /// checkpoint bytes are never also counted as network bytes.
+    #[must_use]
+    pub fn accounting_consistent(&self) -> bool {
+        self.wasted_bytes <= self.network_bytes
+            && self.completed_bytes <= self.network_bytes
+    }
+}
+
 /// Immutable folded view (§19.1): `completed_bytes` counts unique file
 /// bytes only.
 #[derive(Debug, Clone, Copy, Default)]
@@ -167,3 +193,80 @@ mod tests {
         assert_eq!(snap.network_bytes, 50);
     }
 }
+
+    /// Synthetic accounting (observability spec, resumed coverage):
+    /// reused checkpoint bytes count toward neither goodput nor wire
+    /// throughput.
+    #[test]
+    fn reused_checkpoint_bytes_do_not_inflate_throughput() {
+        let snap = ProgressSnapshot {
+            network_bytes: 4 * 1024 * 1024,
+            completed_bytes: 4 * 1024 * 1024,
+            reused_bytes: 12 * 1024 * 1024,
+            retries: 0,
+            wasted_bytes: 0,
+            elapsed: Duration::from_secs(2),
+        };
+        assert!(snap.accounting_consistent());
+        // Goodput counts only the 4 MiB newly transferred, never the
+        // 12 MiB reused.
+        assert_eq!(snap.useful_goodput_per_sec(), 2.0 * 1024.0 * 1024.0);
+        assert_eq!(snap.wire_throughput_per_sec(), 2.0 * 1024.0 * 1024.0);
+    }
+
+    /// Synthetic accounting (retried transfer): retransmitted bytes
+    /// separate wire throughput from useful goodput.
+    #[test]
+    fn retransferred_bytes_separate_wire_from_useful() {
+        let snap = ProgressSnapshot {
+            network_bytes: 150,
+            completed_bytes: 100,
+            reused_bytes: 0,
+            retries: 1,
+            wasted_bytes: 50,
+            elapsed: Duration::from_secs(2),
+        };
+        assert!(snap.accounting_consistent());
+        assert_eq!(snap.useful_goodput_per_sec(), 50.0);
+        assert_eq!(snap.wire_throughput_per_sec(), 75.0);
+    }
+
+    /// Synthetic accounting (failure fixture): a warning without any
+    /// retransferred payload must never be reported as bytes.
+    #[test]
+    fn warnings_are_not_bytes() {
+        let counters = JobCounters::new(1);
+        counters.worker(0).expect("slot").add_completed(100);
+        counters.worker(0).expect("slot").add_network(100);
+        let mut snap = counters.fold();
+        snap.elapsed = Duration::from_secs(1);
+        // Ten warnings, zero retransmitted bytes.
+        let warnings = 10usize;
+        assert_eq!(snap.wasted_bytes, 0);
+        assert_ne!(warnings as u64, snap.wasted_bytes, "warnings are not bytes");
+        assert_eq!(snap.useful_goodput_per_sec(), 100.0);
+        assert!(snap.accounting_consistent());
+    }
+
+    /// Inconsistent synthetic snapshots (over-counting) are detectable.
+    #[test]
+    fn inconsistent_accounting_is_flagged() {
+        let snap = ProgressSnapshot {
+            network_bytes: 10,
+            completed_bytes: 40,
+            reused_bytes: 0,
+            retries: 0,
+            wasted_bytes: 0,
+            elapsed: Duration::from_secs(1),
+        };
+        assert!(!snap.accounting_consistent());
+        let wasted = ProgressSnapshot {
+            network_bytes: 10,
+            completed_bytes: 5,
+            reused_bytes: 0,
+            retries: 0,
+            wasted_bytes: 20,
+            elapsed: Duration::from_secs(1),
+        };
+        assert!(!wasted.accounting_consistent());
+    }

@@ -109,6 +109,15 @@ pub struct DownloadResult {
     pub final_path: Option<PathBuf>,
     pub bytes_downloaded_from_network: u64,
     pub bytes_reused_from_checkpoint: u64,
+    /// Unique newly completed file bytes (real `JobCounters` counter,
+    /// task 1.1): excludes reused checkpoint bytes and retransmitted
+    /// duplicates. This is the useful-goodput numerator for benchmarks.
+    pub completed_bytes: u64,
+    /// Wasted/retransmitted network bytes (real counter): payload received
+    /// but not uniquely completed. Never derived from warning counts.
+    pub wasted_bytes: u64,
+    /// Retry attempts charged by the transfer paths (real counter).
+    pub retries: u64,
     pub total_size: Option<u64>,
     pub elapsed: Duration,
     pub validators: ResourceValidators,
@@ -128,6 +137,9 @@ pub enum ResultStatus {
 struct CompletionSummary {
     network_bytes: u64,
     reused_bytes: u64,
+    completed_bytes: u64,
+    wasted_bytes: u64,
+    retries: u64,
     total_size: Option<u64>,
     elapsed: Duration,
     validators: ResourceValidators,
@@ -174,7 +186,10 @@ pub struct DownloadHandle {
     /// worker-concurrency reduction; `None` for single-stream jobs.
     segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
     /// Shared rate-limit bucket for the job (§18: runtime changeable).
-    rate_bucket: Arc<std::sync::Mutex<Option<Arc<crate::control::rate_limit::TokenBucket>>>>,
+    /// Stable job-wide bucket (task 5.3): rate 0 = unlimited; runtime
+    /// updates mutate it in place so the same object reaches the eventual
+    /// job and its active workers.
+    rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 }
 
 impl DownloadHandle {
@@ -202,6 +217,11 @@ impl DownloadHandle {
     /// Lift a pause.
     pub fn resume_now(&self) {
         self.cancel.unpause();
+        // Wake parked segmented workers (task 7.2): resume is a scheduler-
+        // relevant transition for lease-less parked workers.
+        if let Some(job) = self.segmented_cell.get() {
+            job.notify_transition();
+        }
     }
 
     /// Request cancellation (§9.4) with DeletePartial cleanup.
@@ -263,32 +283,20 @@ impl DownloadHandle {
                     Some(bytes_per_second)
                 },
             });
-        // Replace the segmented job's bucket (or drop it for unlimited).
+        // One stable bucket: pre-start updates mutate it in place so the
+        // SAME object reaches the eventual job (task 5.3); live updates
+        // mutate the running job's bucket through the same object.
+        self.rate_bucket.set_rate(bytes_per_second);
         if let Some(job) = self.segmented_cell.get() {
-            let bucket = if bytes_per_second == 0 {
-                None
-            } else {
-                Some(Arc::new(crate::control::rate_limit::TokenBucket::new(
-                    bytes_per_second,
-                )))
-            };
-            job.set_rate_bucket(bucket);
+            job.set_rate(bytes_per_second);
         }
-        let mut bucket = self.rate_bucket.lock().expect("rate bucket lock");
-        *bucket = if bytes_per_second == 0 {
-            None
-        } else {
-            Some(Arc::new(crate::control::rate_limit::TokenBucket::new(
-                bytes_per_second,
-            )))
-        };
     }
 
     /// The active rate limit (`None` = unlimited).
     #[must_use]
     pub fn rate_limit(&self) -> Option<u64> {
-        let bucket = self.rate_bucket.lock().expect("rate bucket lock");
-        bucket.as_ref().map(|b| b.rate()).filter(|r| *r != 0)
+        let rate = self.rate_bucket.rate();
+        (rate != 0).then_some(rate)
     }
 
     /// Subscribe to this job's event stream (§7.3, §19.4). Multiple
@@ -402,7 +410,11 @@ impl SingleStreamController {
         let metrics_for_run = self.metrics.clone();
         let state = StateMachine::new();
         let cancel = CancellationToken::new();
-        let counters = Arc::new(JobCounters::new(1));
+        // One counter shard per potential worker (task 5.4: per-worker
+        // attribution); mirrors the segmented job's worker-progress cells.
+        let counters = Arc::new(JobCounters::new(
+            self.config.transfer.max_workers.max(16),
+        ));
         let (hub, _stream) = EventHub::new(256, self.config.metrics_interval);
         let hub: SharedHub = Arc::new(hub);
         let handle = DownloadHandle {
@@ -417,7 +429,7 @@ impl SingleStreamController {
             total_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_known: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             segmented_cell: Arc::new(std::sync::OnceLock::new()),
-            rate_bucket: Arc::new(std::sync::Mutex::new(None)),
+            rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
         };
         // The run task publishes the live SegmentedJob into the same cell
         // the handle reads (task 5.8).
@@ -488,9 +500,7 @@ impl SingleStreamController {
         counters: Arc<JobCounters>,
         hub: SharedHub,
         segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
-        rate_bucket_shared: Arc<
-            std::sync::Mutex<Option<Arc<crate::control::rate_limit::TokenBucket>>>,
-        >,
+        rate_bucket_shared: Arc<crate::control::rate_limit::TokenBucket>,
     ) -> Result<DownloadResult, DownloadError> {
         // Overwrite policy pre-check (§14.6): FailIfExists rejects before
         // any network activity.
@@ -502,6 +512,9 @@ impl SingleStreamController {
                 final_path: None,
                 bytes_downloaded_from_network: 0,
                 bytes_reused_from_checkpoint: 0,
+                completed_bytes: 0,
+                wasted_bytes: 0,
+                retries: 0,
                 total_size: None,
                 elapsed: Duration::ZERO,
                 validators: ResourceValidators::default(),
@@ -677,6 +690,9 @@ impl SingleStreamController {
                                 final_path: None,
                                 bytes_downloaded_from_network: 0,
                                 bytes_reused_from_checkpoint: 0,
+                                completed_bytes: 0,
+                                wasted_bytes: 0,
+                                retries: 0,
                                 total_size: None,
                                 elapsed: Duration::ZERO,
                                 validators: ResourceValidators::default(),
@@ -764,6 +780,7 @@ impl SingleStreamController {
                 &request.destination,
                 &TempFileSpec::default(),
                 self.config.transfer.preallocate_output,
+                self.config.transfer.preallocate_physical,
                 meta.total_size,
             )
             .map_err(|error| error.0)?
@@ -782,8 +799,9 @@ impl SingleStreamController {
             // write handles; ownership is reclaimed only after they join.
             sink.preserve_partial();
             // Pre-set rate limit (set before the probe completed) carries
-            // into the segmented job (task 5.8).
-            let initial_bucket = rate_bucket_shared.lock().expect("rate bucket lock").clone();
+            // into the segmented job: the SAME stable bucket object (task
+            // 5.3), so pre-start and live updates share one bucket.
+            let initial_bucket = rate_bucket_shared.clone();
             // Segmented view: every admitted range is reusable (§12.1).
             let resumed = plan.segmented();
             counters
@@ -1035,6 +1053,7 @@ impl SingleStreamController {
                                 &request.destination,
                                 &TempFileSpec::default(),
                                 self.config.transfer.preallocate_output,
+                                self.config.transfer.preallocate_physical,
                                 meta.total_size,
                             )
                             .map_err(|error| error.0)?;
@@ -1301,6 +1320,7 @@ impl SingleStreamController {
                                         &request.destination,
                                         &TempFileSpec::default(),
                                         self.config.transfer.preallocate_output,
+                                        self.config.transfer.preallocate_physical,
                                         meta.total_size,
                                     )
                                     .map_err(|error| error.0)?;
@@ -1350,6 +1370,9 @@ impl SingleStreamController {
         let summary = CompletionSummary {
             network_bytes: snapshot.network_bytes,
             reused_bytes: snapshot.reused_bytes,
+            completed_bytes: snapshot.completed_bytes,
+            wasted_bytes: snapshot.wasted_bytes,
+            retries: snapshot.retries,
             total_size,
             elapsed: started.elapsed(),
             validators,
@@ -1434,7 +1457,7 @@ impl SingleStreamController {
         &self,
         request: &DownloadRequest,
         state: Arc<StateMachine>,
-        counters: Arc<JobCounters>,
+        _counters: Arc<JobCounters>,
         hub: SharedHub,
         store: &dyn CheckpointStore,
         identity: &str,
@@ -1448,12 +1471,14 @@ impl SingleStreamController {
             // Segmented cleanup warnings (delete failures) join the
             // admission warnings; the outcome remains Cancelled (§9.2).
             warnings.extend(outcome.warnings);
-            let snap = counters.fold();
             return Ok(DownloadResult {
                 status: ResultStatus::Cancelled,
                 final_path: None,
-                bytes_downloaded_from_network: snap.network_bytes,
-                bytes_reused_from_checkpoint: snap.reused_bytes,
+                bytes_downloaded_from_network: outcome.network_bytes,
+                bytes_reused_from_checkpoint: outcome.reused_bytes,
+                completed_bytes: outcome.completed_bytes,
+                wasted_bytes: outcome.wasted_bytes,
+                retries: outcome.retries,
                 total_size: None,
                 elapsed: outcome.elapsed,
                 validators: outcome.validators,
@@ -1469,6 +1494,9 @@ impl SingleStreamController {
                 final_path: None,
                 bytes_downloaded_from_network: outcome.network_bytes,
                 bytes_reused_from_checkpoint: outcome.reused_bytes,
+                completed_bytes: outcome.completed_bytes,
+                wasted_bytes: outcome.wasted_bytes,
+                retries: outcome.retries,
                 total_size: outcome.total_size.into(),
                 elapsed: outcome.elapsed,
                 validators: outcome.validators,
@@ -1480,6 +1508,9 @@ impl SingleStreamController {
         let summary = CompletionSummary {
             network_bytes: outcome.network_bytes,
             reused_bytes: outcome.reused_bytes,
+            completed_bytes: outcome.completed_bytes,
+            wasted_bytes: outcome.wasted_bytes,
+            retries: outcome.retries,
             total_size: Some(outcome.total_size),
             elapsed: outcome.elapsed,
             validators: outcome.validators,
@@ -1586,6 +1617,9 @@ impl SingleStreamController {
             final_path: Some(final_path),
             bytes_downloaded_from_network: summary.network_bytes,
             bytes_reused_from_checkpoint: summary.reused_bytes,
+            completed_bytes: summary.completed_bytes,
+            wasted_bytes: summary.wasted_bytes,
+            retries: summary.retries,
             total_size: summary.total_size,
             elapsed: summary.elapsed,
             validators: summary.validators,
@@ -1611,6 +1645,9 @@ impl SingleStreamController {
             final_path: None,
             bytes_downloaded_from_network: summary.network_bytes,
             bytes_reused_from_checkpoint: summary.reused_bytes,
+            completed_bytes: summary.completed_bytes,
+            wasted_bytes: summary.wasted_bytes,
+            retries: summary.retries,
             total_size: summary.total_size,
             elapsed: summary.elapsed,
             validators: summary.validators,
@@ -1633,6 +1670,9 @@ impl SingleStreamController {
             final_path: None,
             bytes_downloaded_from_network: snap.network_bytes,
             bytes_reused_from_checkpoint: snap.reused_bytes,
+            completed_bytes: snap.completed_bytes,
+            wasted_bytes: snap.wasted_bytes,
+            retries: snap.retries,
             total_size: None,
             elapsed,
             validators,
@@ -1718,6 +1758,9 @@ impl SingleStreamController {
             final_path: None,
             bytes_downloaded_from_network: snap.network_bytes,
             bytes_reused_from_checkpoint: snap.reused_bytes,
+            completed_bytes: snap.completed_bytes,
+            wasted_bytes: snap.wasted_bytes,
+            retries: snap.retries,
             total_size: None,
             elapsed,
             validators: ResourceValidators::default(),
@@ -1776,7 +1819,7 @@ mod completion_tests {
         let destination = directory.path().join("output.bin");
         std::fs::write(&destination, b"previous destination").expect("seed old destination");
         let mut sink =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, Some(3))
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, Some(3))
                 .expect("open output session");
         sink.write_at(0, b"new").expect("write temp output");
         sink.fail_next_flush();
@@ -1812,6 +1855,9 @@ mod completion_tests {
                 CompletionSummary {
                     network_bytes: 3,
                     reused_bytes: 0,
+                    completed_bytes: 3,
+                    wasted_bytes: 0,
+                    retries: 0,
                     total_size: Some(3),
                     elapsed: Duration::ZERO,
                     validators: ResourceValidators::default(),
@@ -2066,7 +2112,7 @@ mod completion_tests {
             injected_error(OutputOperation::Cleanup),
         );
         let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, None)
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
                 .expect("output session");
         session.write_at(0, b"partial").expect("write");
 
@@ -2083,6 +2129,52 @@ mod completion_tests {
                 OutputOperation::Write,
                 OutputOperation::Cleanup
             ]
+        );
+    }
+    /// Ordinary segmented chunks never flush (task 3.1): the flush operation
+    /// fires exactly once — the owner's finalization — not once per chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn segmented_chunk_path_never_flushes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        // Observe-only script: records operations, injects nothing.
+        let registration = OutputFaultScript::register(&destination);
+
+        let mut config = EngineConfig::default();
+        config.transfer.preallocate_output = false;
+        config.transfer.segmentation_threshold = 1024;
+        config.transfer.max_workers = 2;
+        config.transfer.max_segment_size = 1000;
+        config.transfer.min_segment_size = 1;
+        config.transfer.verify_range_support = false;
+
+        let controller = SingleStreamController::with_execution(
+            HttpExecution::from_adapter(fault_http(
+                true,
+                &(0..FAULT_TOTAL)
+                    .map(|i| ((i * 17 + 3) % 251) as u8)
+                    .collect::<Vec<u8>>(),
+            )),
+            config,
+        );
+        let result = controller
+            .run(DownloadRequest::new(
+                "https://completion.test/no-chunk-flush",
+                destination.clone(),
+            ))
+            .await
+            .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+
+        let flushes = registration
+            .script()
+            .operations()
+            .iter()
+            .filter(|op| **op == OutputOperation::Flush)
+            .count();
+        assert_eq!(
+            flushes, 1,
+            "ordinary segmented chunks must not flush; only the owner finalizes (flush ops: {flushes})"
         );
     }
 }

@@ -219,6 +219,7 @@ async fn interruption_during_final_rename_leaves_temp_or_final() {
         &dest,
         &kdown_engine::io::sink::TempFileSpec::default(),
         false,
+        false,
     )
     .expect("reopen");
     sink.finalize().expect("finalize");

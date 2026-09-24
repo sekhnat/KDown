@@ -7,11 +7,13 @@
 //! (§17.4). Runtime concurrency reduction settles excess workers (task
 //! 5.8).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::config::{DurabilityMode, EngineConfig};
 use crate::control::retry::{RetryClassifier, RetryDecision};
@@ -22,17 +24,16 @@ use crate::http::{
     BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, RequestSpec,
     TransferIntent, TransferRequest,
 };
-use crate::io::output_session::{OutputSession, OutputWriteHandle};
-use crate::io::sink::FlushLevel;
+use crate::io::output_session::OutputSession;
+use crate::io::writer_lane::WriterLane;
 use crate::job::controller::{DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::SharedHub;
 use crate::resume::checkpoint::Checkpoint;
 use crate::resume::checkpoint_store::CheckpointStore;
-use crate::scheduler::core::{SchedulerPolicy, SegmentScheduler};
+use crate::scheduler::core::{SchedulerPolicy, SegmentScheduler, TargetSelector};
 use crate::scheduler::lease::SegmentLease;
-use crate::scheduler::LeaseId;
 
 /// Shared worker↔controller state for one segmented job.
 pub struct SegmentedJob {
@@ -40,18 +41,52 @@ pub struct SegmentedJob {
     /// Coordinated origin backoff gate (§17.4): when set, all workers wait
     /// until this instant before their next request.
     origin_backoff_until: AsyncMutex<Option<Instant>>,
-    /// Terminal error: set once, stops all workers (§14.5).
-    fatal: AsyncMutex<Option<DownloadError>>,
+    /// Terminal error state (§14.5, task 5.2): a cheap atomic flag for the
+    /// chunk path plus a small mutex owning the first-wins detailed error.
+    fatal: FatalState,
     cancel: CancellationToken,
     hub: SharedHub,
     counters: Arc<JobCounters>,
-    /// Job-level token bucket (§18): `None` = unlimited; rate changes at
-    /// runtime take effect on the next acquire.
-    rate_bucket: std::sync::Mutex<Option<Arc<crate::control::rate_limit::TokenBucket>>>,
+    /// Stable per-job token bucket (§18, task 5.3): one `Arc<TokenBucket>`
+    /// for the job's lifetime; rate `0` = unlimited. Live rate updates
+    /// mutate the bucket in place — active workers never see the object
+    /// replaced, and unlimited chunks take no outer lock.
+    rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
     total_size: u64,
     validators: crate::http::validators::ResourceValidators,
-    /// Requested worker concurrency (handle API, task 5.8).
+    /// Durable-mode data-sync capability over the output file (task 3.3):
+    /// used by the shared save path to synchronize before persisting.
+    sync: Option<crate::io::output_session::OutputSyncCapability>,
+    /// Selected checkpoint durability (task 3.3): drives the save path's
+    /// sync-before-persist ordering.
+    durability: DurabilityMode,
+    /// Versioned scheduler-state signal (task 7.1): bumped AFTER every
+    /// state transition (work added/removed, split eligibility, progress
+    /// reconciliation, desired-worker changes, fatal, resume). Parked
+    /// workers register before sleeping and recheck on change — no lost
+    /// work, no fixed polling.
+    revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The job-level checkpoint coordinator's command channel (task 4.1):
+    /// workers wake the coordinator for pause-boundary saves. The task's
+    /// join handle stays with `run_segmented`, which stops the coordinator
+    /// before reclaim/verify/publish/cleanup.
+    save_now_tx: mpsc::Sender<CoordinatorCmd>,
+    /// Requested worker concurrency (handle API, task 5.8). Manual updates
+    /// clamp to `[min_workers, max_workers]` (task 8.2) and suspend the
+    /// adaptive controller (task 9.3: manual precedence).
     desired_workers: AtomicU64,
+    /// A manual concurrency override happened (task 9.3): the adaptive
+    /// controller suspends for the job's remainder.
+    manual_override: AtomicBool,
+    /// Throttle events (429/503-style responses) observed by any worker
+    /// (task 9.2's controller sampling).
+    throttle_events: AtomicU64,
+    /// Last positional-write acknowledgment latency, in microseconds
+    /// (task 9.2's controller sampling).
+    write_latency_us: AtomicU64,
+    /// Configured bounds for manual concurrency control (task 8.2).
+    min_workers: u64,
+    max_workers: u64,
     /// Hot-path lease progress (§13.3, task 6.3): one atomic cell per
     /// worker. A worker publishing durable-through offsets for its current
     /// lease writes `(lease_id, generation, durable_through)` into its own
@@ -61,26 +96,55 @@ pub struct SegmentedJob {
     worker_progress: Vec<Arc<LeaseProgress>>,
 }
 
-/// One worker's in-flight lease progress (§13.3): lock-free.
+/// One worker's published progress record (§13.3): read as ONE coherent
+/// observation — lease id, generation and written-through offset always come
+/// from the same publication, never mixed across generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseRecord {
+    /// Current lease id (`0` = none/cleared).
+    pub lease_id: u64,
+    /// Generation the lease was acquired under.
+    pub generation: u64,
+    /// Lease start offset (for reconciliation).
+    pub lease_start: u64,
+    /// Written-through offset (exclusive) acknowledged by the output path.
+    /// Written means OS-acknowledged page-cache writes; this is NOT a
+    /// durability claim (checkpoint saves synchronize separately, task 3.3).
+    pub written_through: u64,
+}
+
+/// One worker's in-flight lease progress (§13.3, task 5.1, design D3).
+///
+/// Single-writer sequence-counter cell: the writer (one worker task owns
+/// this cell) stores an odd sequence, then the fields, then an even
+/// sequence; readers retry when the two sequence reads differ or are odd.
+/// **Every access uses `SeqCst`**: one global order prevents a reader from
+/// treating mixed publications as one record, even across clear/reuse, and
+/// write acknowledgment happens before publication via the worker's task
+/// continuation. Sequence wrap is unreachable in practice (u64, +2 per
+/// publish); a wrap would force readers to retry until a fresh publication
+/// lands — the writer never resets while readers exist.
 #[derive(Debug, Default)]
 pub struct LeaseProgress {
-    /// Current lease id (`0` = none).
+    sequence: AtomicU64,
     lease_id: AtomicU64,
-    /// Generation the lease was acquired under.
     generation: AtomicU64,
-    /// Durable-through offset (exclusive) acknowledged by the sink.
-    durable_through: AtomicU64,
-    /// Lease start offset (for reconciliation).
     lease_start: AtomicU64,
+    written_through: AtomicU64,
 }
 
 impl LeaseProgress {
-    fn publish(&self, lease_id: LeaseId, generation: u64, lease_start: u64, durable_through: u64) {
-        self.lease_id.store(lease_id, Ordering::Relaxed);
-        self.generation.store(generation, Ordering::Relaxed);
-        self.lease_start.store(lease_start, Ordering::Relaxed);
-        self.durable_through
-            .store(durable_through, Ordering::Relaxed);
+    /// Single-writer publication (task 5.1): odd sequence → fields → even
+    /// sequence, all `SeqCst`.
+    fn publish(&self, record: LeaseRecord) {
+        let seq = self.sequence.load(Ordering::SeqCst);
+        self.sequence.store(seq | 1, Ordering::SeqCst);
+        self.lease_id.store(record.lease_id, Ordering::SeqCst);
+        self.generation.store(record.generation, Ordering::SeqCst);
+        self.lease_start.store(record.lease_start, Ordering::SeqCst);
+        self.written_through
+            .store(record.written_through, Ordering::SeqCst);
+        self.sequence.store((seq | 1) + 1, Ordering::SeqCst);
     }
 
     /// Test hook mirroring [`Self::publish`] for scheduler reconciliation
@@ -88,72 +152,191 @@ impl LeaseProgress {
     #[cfg(test)]
     pub(crate) fn test_publish(
         &self,
-        lease_id: LeaseId,
+        lease_id: crate::scheduler::LeaseId,
         generation: u64,
         lease_start: u64,
-        durable_through: u64,
+        written_through: u64,
     ) {
-        self.publish(lease_id, generation, lease_start, durable_through);
+        self.publish(LeaseRecord {
+            lease_id,
+            generation,
+            lease_start,
+            written_through,
+        });
     }
 
     fn clear(&self) {
-        self.lease_id.store(0, Ordering::Relaxed);
-        self.generation.store(0, Ordering::Relaxed);
-        self.lease_start.store(0, Ordering::Relaxed);
-        self.durable_through.store(0, Ordering::Relaxed);
+        self.publish(LeaseRecord {
+            lease_id: 0,
+            generation: 0,
+            lease_start: 0,
+            written_through: 0,
+        });
     }
 
-    /// A consistent-enough snapshot for scheduler reconciliation (§13.3):
-    /// `(lease_id, generation, durable_through)`; `(0, .., ..)` when idle.
-    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.lease_id.load(Ordering::Relaxed),
-            self.generation.load(Ordering::Relaxed),
-            self.durable_through.load(Ordering::Relaxed),
-        )
+    /// One coherent snapshot (task 5.1): retry when the two sequence reads
+    /// differ or are odd; `(0, .., ..)` records read as idle.
+    pub(crate) fn snapshot(&self) -> Option<LeaseRecord> {
+        loop {
+            let seq1 = self.sequence.load(Ordering::SeqCst);
+            if seq1 % 2 == 1 {
+                // Mid-publication: the writer is between stores.
+                std::hint::spin_loop();
+                continue;
+            }
+            let record = LeaseRecord {
+                lease_id: self.lease_id.load(Ordering::SeqCst),
+                generation: self.generation.load(Ordering::SeqCst),
+                lease_start: self.lease_start.load(Ordering::SeqCst),
+                written_through: self.written_through.load(Ordering::SeqCst),
+            };
+            let seq2 = self.sequence.load(Ordering::SeqCst);
+            if seq1 == seq2 {
+                return if record.lease_id == 0 {
+                    None
+                } else {
+                    Some(record)
+                };
+            }
+            // Torn or concurrent publication: retry.
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Terminal failure state (task 5.2, design D3): a separate atomic fatal
+/// flag gives workers a cheap `Acquire` check on the chunk path — no
+/// asynchronous error lock per chunk. Installing a terminal failure takes
+/// the small mutex, sets the error only if absent (first-wins: a racing
+/// failure cannot replace the first recorded error), then publishes the
+/// flag with `Release`. The controller reads the error only after workers
+/// and the coordinator have joined.
+#[derive(Debug, Default)]
+struct FatalState {
+    flag: AtomicBool,
+    error: std::sync::Mutex<Option<DownloadError>>,
+}
+
+impl FatalState {
+    /// Cheap chunk-path check (`Acquire`).
+    fn is_fatal(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Install the terminal error; returns true when THIS call recorded it
+    /// (first-wins ownership).
+    fn install(&self, error: DownloadError) -> bool {
+        let mut guard = self.error.lock().expect("fatal error lock");
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(error);
+        drop(guard);
+        // Never publish the flag before the error object is in place.
+        self.flag.store(true, Ordering::Release);
+        true
+    }
+
+    /// The authoritative terminal error (read once, after joins).
+    fn take(&self) -> Option<DownloadError> {
+        self.error
+            .lock()
+            .expect("fatal error lock")
+            .take()
     }
 }
 
 impl SegmentedJob {
-    /// Whether no leases are active (all work done or in pending).
+    /// Whether no leases are active (all work done or in pending) — a
+    /// direct, allocation-free scheduler query (task 6.2).
     async fn active_leases_empty(&self) -> bool {
-        self.scheduler.lock().await.active_leases().is_empty()
+        !self.scheduler.lock().await.has_active()
     }
 
-    /// Whether no leases held by workers other than `worker_idx` remain
-    /// (used for concurrency-reduction exit decisions, task 5.8).
-    ///
-    /// Leases are not worker-attributed in v1; an idle exiting worker
-    /// simply checks whether any lease remains unconsumed.
-    async fn active_leases_empty_owned_by_others(&self, worker_idx: usize) -> bool {
-        let _ = worker_idx;
-        self.scheduler.lock().await.active_leases().is_empty()
-    }
 
-    /// The shared worker counters slot (v1: all workers share slot 0's
-    /// atomics; counts remain exact, attribution is coarse).
-    fn counters_slot(&self) -> Option<&crate::metrics::counters::WorkerCounters> {
-        self.counters.worker(0)
-    }
 
     /// Set the desired worker count at runtime (task 5.8: handle API).
     /// Excess workers settle their leases and exit on the next loop.
     pub fn set_desired_workers(&self, n: u64) {
-        self.desired_workers.store(n.max(1), Ordering::Relaxed);
+        // Clamp manual control to the configured bounds (task 8.2).
+        let clamped = n.clamp(self.min_workers, self.max_workers);
+        self.desired_workers.store(clamped, Ordering::Relaxed);
+        // Manual override suspends the adaptive controller for the job's
+        // remainder (task 9.3: manual precedence over the controller).
+        self.manual_override.store(true, Ordering::Relaxed);
+        // Concurrency change is a transition: parked workers above/below the
+        // desired count must wake (task 7.1).
+        self.notify_transition();
     }
 
-    /// Attach or replace the job rate bucket (§18.2).
-    pub fn set_rate_bucket(&self, bucket: Option<Arc<crate::control::rate_limit::TokenBucket>>) {
-        *self.rate_bucket.lock().expect("rate bucket lock") = bucket;
+    /// The adaptive controller's internal adjustment (task 9.1): does NOT
+    /// mark a manual override.
+    fn adjust_desired_workers(&self, n: u64) {
+        let clamped = n.clamp(self.min_workers, self.max_workers);
+        self.desired_workers.store(clamped, Ordering::Relaxed);
+        self.notify_transition();
+    }
+
+    /// Worker idle ratio over the currently desired workers (task 9.2):
+    /// the fraction holding no lease right now.
+    fn worker_idle_ratio(&self) -> f64 {
+        let desired = self.desired_workers().max(1) as usize;
+        let idle = self
+            .worker_progress
+            .iter()
+            .take(desired)
+            .filter(|cell| cell.snapshot().is_none())
+            .count();
+        idle as f64 / desired as f64
+    }
+
+    /// Whether a manual override is active (task 9.3).
+    fn is_manual_override(&self) -> bool {
+        self.manual_override.load(Ordering::Relaxed)
+    }
+
+    /// Throttle events since job start (task 9.2).
+    fn throttle_events(&self) -> u64 {
+        self.throttle_events.load(Ordering::Relaxed)
+    }
+
+    /// Publish a scheduler-state transition (task 7.1): called AFTER the
+    /// mutating mutation completed while holding (or having held) the
+    /// scheduler serialization — parked workers recheck state on wake.
+    /// Publish a scheduler-state transition (task 7.1): called AFTER the
+    /// state mutation completed. Public for the runtime-control handle.
+    pub fn notify_transition(&self) {
+        // `send_modify` takes `&self` (tokio watch has interior mutability)
+        // and always marks every receiver changed.
+        self.revision_tx.send_modify(|r| {
+            *r = r.wrapping_add(1);
+        });
+    }
+
+    /// Subscribe to scheduler-state transitions (one receiver per worker).
+    fn subscribe_revisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision_tx.as_ref().subscribe()
+    }
+
+    /// Update the job rate limit at runtime (§18.2, task 5.3): mutates the
+    /// stable bucket in place; takes effect on the next acquire. `0` =
+    /// unlimited.
+    pub fn set_rate(&self, bytes_per_second: u64) {
+        self.rate_bucket.set_rate(bytes_per_second);
+    }
+
+    /// The job's configured rate (`None` = unlimited).
+    #[must_use]
+    pub fn rate_limit(&self) -> Option<u64> {
+        let rate = self.rate_bucket.rate();
+        (rate != 0).then_some(rate)
     }
 
     /// Acquire tokens for `len` payload bytes, sleeping when the bucket
-    /// gates (§18.2: payload bytes only, no busy wait).
+    /// gates (§18.2: payload bytes only, no busy wait, no outer lock —
+    /// the bucket checks its atomic limit before the internal state lock).
     async fn acquire_rate(&self, len: u64) {
-        let bucket = self.rate_bucket.lock().expect("rate bucket lock").clone();
-        if let Some(b) = bucket {
-            b.acquire_async(len).await;
-        }
+        self.rate_bucket.acquire_async(len).await;
     }
 
     #[must_use]
@@ -161,8 +344,8 @@ impl SegmentedJob {
         self.desired_workers.load(Ordering::Relaxed)
     }
 
-    async fn take_fatal(&self) -> Option<DownloadError> {
-        self.fatal.lock().await.take()
+    fn take_fatal(&self) -> Option<DownloadError> {
+        self.fatal.take()
     }
 
     async fn completed_ranges(&self) -> Vec<(u64, u64)> {
@@ -172,6 +355,12 @@ impl SegmentedJob {
     async fn is_complete(&self) -> bool {
         self.scheduler.lock().await.is_complete()
     }
+
+    /// Whether the scheduler is finished (no pending, no active) — the
+    /// persistent pool's job-done condition (task 8.1).
+    async fn is_finished(&self) -> bool {
+        self.scheduler.lock().await.is_finished()
+    }
 }
 
 /// A completed segmented transfer's accounting (before verify/commit).
@@ -180,6 +369,12 @@ pub struct SegmentedOutcome {
     pub error: Option<DownloadError>,
     pub network_bytes: u64,
     pub reused_bytes: u64,
+    /// Unique newly completed file bytes (real counter, task 1.1).
+    pub completed_bytes: u64,
+    /// Wasted/retransmitted network bytes (real counter, task 1.1).
+    pub wasted_bytes: u64,
+    /// Retry attempts charged (real counter, task 1.1).
+    pub retries: u64,
     pub total_size: u64,
     pub elapsed: Duration,
     pub validators: crate::http::validators::ResourceValidators,
@@ -211,31 +406,101 @@ pub(crate) async fn run_segmented(
     start_offset_ranges: Vec<(u64, u64)>,
     started: Instant,
     handle_cell: Option<Arc<std::sync::OnceLock<Arc<SegmentedJob>>>>,
-    initial_rate_bucket: Option<Arc<crate::control::rate_limit::TokenBucket>>,
+    initial_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 ) -> SegmentedOutcome {
     let mut warnings: Vec<String> = vec![];
-    let policy = SchedulerPolicy::new(
+    // Lease sizing per configuration (task 6.1): the explicit
+    // `initial_segment_size` is honored (previously ignored in favor of
+    // `max_segment_size`); the opt-in automatic selector derives the target
+    // from remaining coverage and the initial active workers.
+    let target = match config.transfer.segment_sizing {
+        crate::config::SegmentSizing::Explicit => {
+            TargetSelector::Explicit(config.transfer.initial_segment_size)
+        }
+        crate::config::SegmentSizing::Automatic => TargetSelector::Automatic {
+            initial_workers: u64::from(config.transfer.max_workers.max(1)),
+            oversubscription: config.transfer.auto_oversubscription,
+        },
+    };
+    let policy = SchedulerPolicy::with_target(
         config.transfer.min_segment_size,
         config.transfer.max_segment_size,
+        target,
+        256 * 1024,
     );
     let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
-    let desired = u64::from(config.transfer.max_workers.max(1));
+    // Adaptive mode (task 9.1, design D6) starts at `min_workers` and probes
+    // upward; fixed mode keeps the configured fixed concurrency.
+    let adaptive = config.transfer.concurrency_mode
+        == crate::config::ConcurrencyMode::Adaptive;
+    let desired = if adaptive {
+        u64::from(config.transfer.min_workers.max(1))
+    } else {
+        u64::from(config.transfer.max_workers.max(1))
+    };
     let worker_progress: Vec<Arc<LeaseProgress>> = (0..desired.max(16))
         .map(|_| Arc::new(LeaseProgress::default()))
         .collect();
+    let sync_capability = match session.sync_capability() {
+        Ok(cap) => Some(cap),
+        Err(error) => {
+            let snapshot = counters.fold();
+            return SegmentedOutcome {
+                status: ResultStatus::Failed,
+                error: Some(error.0),
+                network_bytes: snapshot.network_bytes,
+                reused_bytes: snapshot.reused_bytes,
+                completed_bytes: snapshot.completed_bytes,
+                wasted_bytes: snapshot.wasted_bytes,
+                retries: snapshot.retries,
+                total_size,
+                elapsed: started.elapsed(),
+                validators: meta.validators.clone(),
+                warnings,
+                completed_ranges: start_offset_ranges,
+            };
+        }
+    };
+    // The checkpoint coordinator channel exists before the job so workers
+    // can wake it; the join handle stays with run_segmented.
+    let (save_now_tx, save_now_rx) = mpsc::channel(8);
+    // The versioned scheduler-state signal (task 7.1).
+    let (revision_tx, _revision_rx_init) = tokio::sync::watch::channel(0u64);
     let job = Arc::new(SegmentedJob {
         scheduler: AsyncMutex::new(scheduler),
         origin_backoff_until: AsyncMutex::new(None),
-        fatal: AsyncMutex::new(None),
+        fatal: FatalState::default(),
         cancel: cancel.clone(),
         hub: hub.clone(),
         counters: counters.clone(),
-        rate_bucket: std::sync::Mutex::new(initial_rate_bucket),
+        rate_bucket: initial_rate_bucket,
         total_size,
         validators: meta.validators.clone(),
+        sync: sync_capability,
+        durability: config.transfer.durability,
+        revision_tx: Arc::new(revision_tx),
+        save_now_tx,
         desired_workers: AtomicU64::new(desired),
+        manual_override: AtomicBool::new(false),
+        throttle_events: AtomicU64::new(0),
+        write_latency_us: AtomicU64::new(0),
+        min_workers: u64::from(config.transfer.min_workers.max(1)),
+        max_workers: u64::from(config.transfer.max_workers.max(1)),
         worker_progress,
     });
+    // One job-level checkpoint coordinator (task 4.1): owns interval timing,
+    // reconciliation and persistence; workers never save on the chunk path.
+    let coordinator_join = tokio::spawn(coordinator_loop(
+        job.clone(),
+        store.clone(),
+        identity.to_string(),
+        config.checkpoint_flush_interval,
+        save_now_rx,
+    ));
+    // Yield once so the coordinator's immediate save (admitted coverage on
+    // resumed jobs, §15.5) runs before the transfer's chunk loop monopolizes
+    // the worker.
+    tokio::time::sleep(Duration::from_millis(1)).await;
     // Publish the live job for the handle's runtime controls (task 5.8).
     if let Some(cell) = &handle_cell {
         let _ = cell.set(job.clone());
@@ -254,6 +519,9 @@ pub(crate) async fn run_segmented(
                 error: Some(error.0),
                 network_bytes: snapshot.network_bytes,
                 reused_bytes: snapshot.reused_bytes,
+                completed_bytes: snapshot.completed_bytes,
+                wasted_bytes: snapshot.wasted_bytes,
+                retries: snapshot.retries,
                 total_size,
                 elapsed: started.elapsed(),
                 validators: meta.validators.clone(),
@@ -262,42 +530,53 @@ pub(crate) async fn run_segmented(
             };
         }
     };
-    for worker_idx in 0..worker_count {
+    // One long-lived blocking writer lane per worker (task 2.3): writes are
+    // positional and concurrent; the lane owns the write-only capability
+    // until shutdown, keeping reclaim fail-closed.
+    let mut lanes = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let handle = writers.pop().expect("one output handle per worker");
+        lanes.push(WriterLane::spawn(handle));
+    }
+    // `lanes` stay owned here so shutdown can join every blocking task; the
+    // workers receive only cloneable submit handles.
+    for (lane_idx, worker_idx) in (0..worker_count).enumerate() {
         let execution = execution.clone();
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
-        let sink = writers.pop().expect("one output handle per worker");
+        let lane = lanes[lane_idx].handle();
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
             headers: request.headers.clone(),
             identity_encoding: true,
         };
-        let chunk_size = (config.read_buffer_size as usize).max(4096);
-        let buffer_budget = config.buffer_pool_max_bytes;
-        let checkpoint_interval = config.checkpoint_flush_interval;
-        let durable_mode = config.transfer.durability;
         let counters_w = counters.clone();
-        let store = store.clone();
         let identity_owned = identity.to_string();
         handles.push(tokio::spawn(async move {
             worker_loop(
                 execution,
                 classifier,
                 job,
-                sink,
-                store,
+                lane,
                 identity_owned,
                 req_spec,
-                buffer_budget,
-                chunk_size,
-                checkpoint_interval,
-                durable_mode,
                 counters_w,
                 worker_idx,
                 started,
             )
             .await
         }));
+    }
+
+    // Adaptive controller task (task 9.1, design D6): evaluates windowed
+    // useful-goodput deltas and probes +1 conservatively. Manual overrides
+    // (handle `set_concurrency`) suspend it for the job's remainder.
+    if adaptive {
+        let controller_job = job.clone();
+        let controller_counters = counters.clone();
+        tokio::spawn(async move {
+            adaptive_controller_loop(controller_job, controller_counters).await;
+        });
     }
 
     let mut outcome_error: Option<DownloadError> = None;
@@ -319,6 +598,29 @@ pub(crate) async fn run_segmented(
         }
     }
     drop(writers);
+    // Join every writer lane before reclaim: no write is in flight and each
+    // capability has been released (design D1, task 2.3).
+    for lane in lanes {
+        if let Err(error) = lane.shutdown().await {
+            outcome_error.get_or_insert(error.0);
+        }
+    }
+    // Stop the checkpoint coordinator before reclaim/verify/publish/cleanup
+    // (task 4.3, design D2): no save can race post-commit cleanup or a
+    // stale checkpoint. All workers have joined, so no boundary save can
+    // arrive afterwards; the stop acks after any in-flight save drained.
+    let (stop_ack_tx, stop_ack_rx) = oneshot::channel();
+    if job
+        .save_now_tx
+        .send(CoordinatorCmd::Stop {
+            ack: stop_ack_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = stop_ack_rx.await;
+    }
+    let _ = coordinator_join.await;
     let ownership_reclaimed = match session.reclaim_exclusive() {
         Ok(()) => true,
         Err(error) => {
@@ -346,6 +648,8 @@ pub(crate) async fn run_segmented(
             vec![]
         };
         warnings.extend(cleanup_warnings);
+        // One consistent fold for the whole terminal record (task 1.1).
+        let snap = counters.fold();
         return SegmentedOutcome {
             status: if ownership_reclaimed {
                 ResultStatus::Cancelled
@@ -353,8 +657,11 @@ pub(crate) async fn run_segmented(
                 ResultStatus::Failed
             },
             error: outcome_error.or(Some(DownloadError::Cancelled)),
-            network_bytes: counters.fold().network_bytes,
-            reused_bytes: counters.fold().reused_bytes,
+            network_bytes: snap.network_bytes,
+            reused_bytes: snap.reused_bytes,
+            completed_bytes: snap.completed_bytes,
+            wasted_bytes: snap.wasted_bytes,
+            retries: snap.retries,
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -362,19 +669,23 @@ pub(crate) async fn run_segmented(
             completed_ranges: completed,
         };
     }
-    if let Some(f) = job.take_fatal().await {
+    if let Some(f) = job.take_fatal() {
         outcome_error.get_or_insert(f);
     }
     let completed = job.completed_ranges().await;
     let complete = job.is_complete().await;
+    let snap = counters.fold();
     if let Some(e) = outcome_error {
         let _ = state.transition(JobState::Failing);
         let _ = state.transition(JobState::Failed);
         return SegmentedOutcome {
             status: ResultStatus::Failed,
             error: Some(e),
-            network_bytes: counters.fold().network_bytes,
-            reused_bytes: counters.fold().reused_bytes,
+            network_bytes: snap.network_bytes,
+            reused_bytes: snap.reused_bytes,
+            completed_bytes: snap.completed_bytes,
+            wasted_bytes: snap.wasted_bytes,
+            retries: snap.retries,
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -390,8 +701,11 @@ pub(crate) async fn run_segmented(
             error: Some(DownloadError::Protocol(
                 "segmented transfer ended with incomplete coverage".into(),
             )),
-            network_bytes: counters.fold().network_bytes,
-            reused_bytes: counters.fold().reused_bytes,
+            network_bytes: snap.network_bytes,
+            reused_bytes: snap.reused_bytes,
+            completed_bytes: snap.completed_bytes,
+            wasted_bytes: snap.wasted_bytes,
+            retries: snap.retries,
             total_size,
             elapsed: started.elapsed(),
             validators: job.validators.clone(),
@@ -402,8 +716,11 @@ pub(crate) async fn run_segmented(
     SegmentedOutcome {
         status: ResultStatus::Completed,
         error: None,
-        network_bytes: counters.fold().network_bytes,
-        reused_bytes: counters.fold().reused_bytes,
+        network_bytes: snap.network_bytes,
+        reused_bytes: snap.reused_bytes,
+        completed_bytes: snap.completed_bytes,
+        wasted_bytes: snap.wasted_bytes,
+        retries: snap.retries,
         total_size,
         elapsed: started.elapsed(),
         validators: job.validators.clone(),
@@ -425,6 +742,9 @@ enum WorkerError {
     Retryable {
         error: DownloadError,
         retry_after: Option<Duration>,
+        /// Bytes received past the acknowledged written-through frontier:
+        /// retransmitted overhead counted at the lease boundary (task 5.4).
+        wasted: u64,
     },
     Fatal(DownloadError),
     GenerationChanged(DownloadError),
@@ -438,10 +758,15 @@ fn worker_error_from_failure(
     error: DownloadError,
     retry_after: Option<Duration>,
     classifier: &RetryClassifier,
+    wasted: u64,
 ) -> WorkerError {
     match error.category() {
         crate::error::ErrorCategory::ResourceChanged => WorkerError::GenerationChanged(error),
-        _ if classifier.retryable(&error) => WorkerError::Retryable { error, retry_after },
+        _ if classifier.retryable(&error) => WorkerError::Retryable {
+            error,
+            retry_after,
+            wasted,
+        },
         _ => WorkerError::Fatal(error),
     }
 }
@@ -452,38 +777,56 @@ async fn worker_loop(
     execution: HttpExecution,
     classifier: RetryClassifier,
     job: Arc<SegmentedJob>,
-    sink: OutputWriteHandle,
-    store: Arc<dyn CheckpointStore>,
+    lane: crate::io::writer_lane::LaneHandle,
     identity: String,
     req_spec: WorkerRequestSpec,
-    buffer_budget: u64,
-    chunk_size: usize,
-    checkpoint_interval: Duration,
-    durable_mode: DurabilityMode,
     counters: Arc<JobCounters>,
     worker_idx: usize,
     started: Instant,
 ) -> Result<(), DownloadError> {
-    let _ = (durable_mode, started);
-    let pool = Arc::new(crate::io::BufferPool::new(chunk_size, buffer_budget));
+    let _ = started;
     let mut attempt: u32 = 0;
+    // Versioned scheduler-state signal (task 7.1/7.2): parked workers wake
+    // on transitions instead of polling on a fixed timer.
+    let mut revisions = job.subscribe_revisions();
 
     loop {
+        // Register the current revision BEFORE checking for work (task 7.1):
+        // any transition after this mark re-notifies and wakes the park
+        // below, so no transition is ever slept through. The guard drops
+        // immediately — only the seen-version matters.
+        let _seen_revision = {
+            let seen = revisions.borrow_and_update();
+            *seen
+        };
+
         // Terminal conditions.
         if job.cancel.is_cancelled() {
             return Ok(());
         }
-        if job.fatal.lock().await.is_some() {
+        if job.fatal.is_fatal() {
             return Ok(());
         }
-        // Concurrency reduction: over the desired count -> settle and exit
-        // (task 5.8). Workers leave only when they hold no lease.
-        if job.desired_workers() < u64::from(u32::try_from(worker_idx + 1).unwrap_or(u32::MAX)) {
-            // Workers with index >= desired exit once idle.
-            // (Leases are settled inside the acquire branch below.)
-            if job.active_leases_empty_owned_by_others(worker_idx).await {
-                return Ok(());
+        // All work settled: the job is done — persistent workers exit
+        // together (task 8.1 termination).
+        if job.is_finished().await {
+            return Ok(());
+        }
+        // Concurrency reduction (task 8.1): a worker above the desired
+        // count deactivates — it holds no lease here (any in-flight lease
+        // was settled by completing/failing before the next loop), so it
+        // parks DORMANT instead of exiting (task 8.2: a later increase
+        // reactivates it via the revision signal, without rebuilding).
+        if job.desired_workers() <= u64::from(u32::try_from(worker_idx).unwrap_or(u32::MAX)) {
+            tokio::select! {
+                changed = revisions.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                _ = job.cancel.cancelled() => return Ok(()),
             }
+            continue;
         }
 
         // Acquire a lease (short lock, §13.3).
@@ -498,25 +841,46 @@ async fn worker_loop(
         let lease = match lease {
             Some(l) => l,
             None => {
-                // No pending work: if nothing is active either, we're done.
+                // No pending work; if nothing is active either, the job is
+                // finished — exit on the next loop-top check (task 8.1).
                 if job.active_leases_empty().await {
                     return Ok(());
                 }
                 // Other workers still hold work; opportunistically split a
-                // big live tail once, then wait (§12.3).
+                // big live tail once, then wait (§12.3). The split threshold
+                // is scheduler policy, not a worker constant (task 6.2).
                 let split = {
                     let mut sched = job.scheduler.lock().await;
-                    let live = sched.active_leases();
-                    let biggest = live.iter().copied().max_by_key(SegmentLease::remaining);
-                    match biggest {
-                        Some(b) => sched.split_tail(b.id, b.generation, 256 * 1024),
+                    let threshold = sched.policy().split_threshold;
+                    let split = match sched.largest_splittable(threshold) {
+                        Some(b) => sched.split_tail(b.id, b.generation, threshold),
                         None => None,
+                    };
+                    if split.is_some() {
+                        // New lease available for parked workers (task 7.1).
+                        job.notify_transition();
                     }
+                    split
                 };
                 match split {
                     Some(tail) => tail,
                     None => {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        // Park on the versioned state signal (task 7.2):
+                        // wake on any transition (new pending, requeue,
+                        // split eligibility via progress, desired-worker
+                        // changes, fatal, resume, completion) or on
+                        // cancellation. Recheck on wake — never spin.
+                        tokio::select! {
+                            changed = revisions.changed() => {
+                                if changed.is_err() {
+                                    // The signal channel closed: the job is
+                                    // going away.
+                                    return Ok(());
+                                }
+                            }
+                            _ = job.cancel.cancelled() => return Ok(()),
+                        }
+                        let _ = _seen_revision;
                         continue;
                     }
                 }
@@ -536,32 +900,49 @@ async fn worker_loop(
             &classifier,
             &job,
             &lease,
-            &sink,
-            store.as_ref(),
+            &lane,
             &identity,
             &req_spec,
-            &pool,
-            checkpoint_interval,
             worker_idx,
+            &mut revisions,
         )
         .await;
 
         match result {
             Ok(()) => {
                 attempt = 0; // reset backoff on success
+                // Reconcile (crediting accepted coverage, task 5.4) then
+                // complete the lease.
+                reconcile_and_credit(&job).await;
                 let mut sched = job.scheduler.lock().await;
-                // Cell already absorbed inside transfer_lease before
-                // completion; clear the worker's cell now the lease ends.
                 let _ = sched.complete(lease.id, lease.generation);
                 job.worker_progress[worker_idx].clear();
+                // Completion frees bytes / finishes the job (task 7.1).
+                job.notify_transition();
             }
-            Err(WorkerError::Retryable { error, retry_after }) => {
-                // Absorb the worker's acknowledged prefix before requeueing
-                // (§17.3 tail-only retry) — one lock at the retry boundary.
+            Err(WorkerError::Retryable {
+                error,
+                retry_after,
+                wasted,
+            }) => {
+                // Retry accounting at the lease boundary (task 5.4): charge
+                // the received-but-lost gap to THIS worker's shard before
+                // the tail-only requeue.
+                if wasted > 0 {
+                    if let Some(w) = counters.worker(worker_idx) {
+                        w.add_wasted(wasted);
+                    }
+                }
+                // Reconcile (credit accepted coverage, task 5.4) then
+                // requeue: the acknowledged prefix completes, the tail
+                // returns to pending (§17.3 tail-only retry) — one lock at
+                // the retry boundary.
+                reconcile_and_credit(&job).await;
                 {
                     let mut sched = job.scheduler.lock().await;
-                    sched.absorb_worker_progress(&job.worker_progress);
                     let _ = sched.fail(lease.id, lease.generation);
+                    // Requeue adds pending work (task 7.1).
+                    job.notify_transition();
                 }
                 job.worker_progress[worker_idx].clear();
                 if let Some(w) = counters.worker(worker_idx) {
@@ -572,6 +953,9 @@ async fn worker_loop(
                     error.category(),
                     crate::error::ErrorCategory::Server | crate::error::ErrorCategory::RateLimited
                 ) {
+                    // Throttle signal for the adaptive controller (task 9.2).
+                    job.throttle_events
+                        .fetch_add(1, Ordering::Relaxed);
                     let earliest = retry_after.unwrap_or_else(|| classifier.backoff_delay(attempt));
                     let until = Instant::now() + earliest;
                     let mut gate = job.origin_backoff_until.lock().await;
@@ -598,27 +982,24 @@ async fn worker_loop(
                         tokio::time::sleep(delay).await;
                     }
                     RetryDecision::GiveUp => {
-                        let mut fatal = job.fatal.lock().await;
-                        if fatal.is_none() {
-                            *fatal = Some(DownloadError::RetryExhausted {
-                                source: Box::new(error),
-                            });
-                        }
+                        job.fatal.install(DownloadError::RetryExhausted {
+                            source: Box::new(error),
+                        });
                         return Ok(());
                     }
                 }
             }
             Err(WorkerError::Fatal(e)) => {
+                reconcile_and_credit(&job).await;
                 {
                     let mut sched = job.scheduler.lock().await;
-                    sched.absorb_worker_progress(&job.worker_progress);
                     let _ = sched.fail(lease.id, lease.generation);
+                    job.notify_transition();
                 }
                 job.worker_progress[worker_idx].clear();
-                let mut fatal = job.fatal.lock().await;
-                if fatal.is_none() {
-                    *fatal = Some(e);
-                }
+                // Terminal failure wakes every parked worker (task 7.1).
+                job.fatal.install(e);
+                job.notify_transition();
                 return Ok(());
             }
             Err(WorkerError::GenerationChanged(e)) => {
@@ -632,12 +1013,31 @@ async fn worker_loop(
                 {
                     let mut sched = job.scheduler.lock().await;
                     let _ = sched.bump_generation();
+                    // Generation invalidation is a transition (task 7.1).
+                    job.notify_transition();
                 }
-                let mut fatal = job.fatal.lock().await;
-                if fatal.is_none() {
-                    *fatal = Some(e);
-                }
+                // Terminal failure wakes every parked worker (task 7.1).
+                job.fatal.install(e);
+                job.notify_transition();
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// Reconcile worker cells into the scheduler and credit each cell's
+/// accepted-delta to the OWNING worker's completed shard (tasks 5.4/8.2):
+/// only scheduler-accepted bytes count as unique completed coverage, so
+/// writes beyond a split-shrunk lease end are never double-counted. The
+/// operation is idempotent (a second reconcile of the same progress credits
+/// nothing).
+async fn reconcile_and_credit(job: &Arc<SegmentedJob>) {
+    let mut sched = job.scheduler.lock().await;
+    let deltas = sched.absorb_worker_progress(&job.worker_progress);
+    for (worker_idx, delta) in deltas.into_iter().enumerate() {
+        if delta > 0 {
+            if let Some(w) = job.counters.worker(worker_idx) {
+                w.add_completed(delta);
             }
         }
     }
@@ -653,15 +1053,13 @@ async fn transfer_lease(
     classifier: &RetryClassifier,
     job: &Arc<SegmentedJob>,
     lease: &SegmentLease,
-    sink: &OutputWriteHandle,
-    store: &dyn CheckpointStore,
+    lane: &crate::io::writer_lane::LaneHandle,
     identity: &str,
     req_spec: &WorkerRequestSpec,
-    pool: &Arc<crate::io::BufferPool>,
-    checkpoint_interval: Duration,
     worker_idx: usize,
+    revisions: &mut tokio::sync::watch::Receiver<u64>,
 ) -> Result<(), WorkerError> {
-    let _ = (pool, checkpoint_interval);
+    let _ = (identity, req_spec);
     // Coordinated backoff gate (§17.4): wait until the earliest acceptable
     // retry time before issuing the request.
     loop {
@@ -683,13 +1081,13 @@ async fn transfer_lease(
     // Fall back to the lease's scheduler-side next_offset when the cell is
     // empty (e.g., first attempt after acquire).
     let cell = &job.worker_progress[worker_idx];
-    let cell_id = cell.lease_id.load(Ordering::Relaxed);
-    let start_from = if cell_id == lease.id {
-        cell.durable_through
-            .load(Ordering::Relaxed)
-            .max(lease.next_offset)
-    } else {
-        lease.next_offset
+    let start_from = match cell.snapshot() {
+        // The worker's own progress record holds the acknowledged
+        // written-through offset (task 3.2: one coherent record).
+        Some(record) if record.lease_id == lease.id => {
+            record.written_through.max(lease.next_offset)
+        }
+        _ => lease.next_offset,
     };
     // Semantic ranged transfer (§32): the intent carries the requested
     // range, established total, and expected validators (generation
@@ -717,89 +1115,109 @@ async fn transfer_lease(
         Err(HttpFailure {
             error, retry_after, ..
         }) => {
-            return Err(worker_error_from_failure(error, retry_after, classifier));
+            // No body bytes were received for this attempt: zero waste.
+            return Err(worker_error_from_failure(error, retry_after, classifier, 0));
         }
     };
     let validated_start = response.start;
     let validated_end = response.end;
     let accepted_len = validated_end - validated_start + 1;
     let mut in_range_offset: u64 = 0;
-    let mut last_checkpoint = Instant::now();
     // Bounded body (§32): the configured read-idle policy and overrun
     // rejection live inside the body; the worker consumes one chunk at a
     // time and never sees frame types.
     let mut body = response.body;
     loop {
+        // Register the current revision BEFORE the read (task 7.1): a fatal
+        // installed while this worker is parked mid-body publishes a
+        // transition and wakes the select below — no lost convergence.
+        let _seen_revision = {
+            let seen = revisions.borrow_and_update();
+            *seen
+        };
         if job.cancel.is_cancelled() {
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
         }
-        if job.fatal.lock().await.is_some() {
+        if job.fatal.is_fatal() {
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
         }
-        match body.next_chunk(&job.cancel).await {
+        let event = tokio::select! {
+            event = body.next_chunk(&job.cancel) => event,
+            changed = revisions.changed() => {
+                // A transition while parked: fatal must converge this
+                // worker; other transitions (progress reconciliation,
+                // saves) just re-poll the body.
+                if changed.is_err() || job.fatal.is_fatal() {
+                    return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                }
+                let _ = _seen_revision;
+                continue;
+            }
+        };
+        match event {
             Ok(BodyEvent::Data(data)) => {
-                // Write at the absolute offset (positional, §14.2). Rate
-                // tokens first: payload bytes only (§18.2).
+                // Wire bytes count at RECEIPT (task 5.4, design D4): even if
+                // a later write fails, the payload crossed the network and
+                // must show in wire throughput.
+                if let Some(w) = job.counters.worker(worker_idx) {
+                    w.add_network(data.len() as u64);
+                }
+                // Write at the absolute offset (positional, §14.2) through
+                // this worker's blocking writer lane. Rate tokens first:
+                // payload bytes only (§18.2). The lane acknowledges before
+                // the worker publishes progress or completed counters (one
+                // outstanding payload per worker, task 2.3); no per-chunk
+                // flush.
                 let abs_offset = validated_start + in_range_offset;
                 job.acquire_rate(data.len() as u64).await;
-                sink.write_at(abs_offset, &data)
+                let write_started = Instant::now();
+                lane.write(abs_offset, data.clone())
                     .await
                     .map_err(|se| WorkerError::Fatal(se.0))?;
-                sink.flush(FlushLevel::PageCache)
-                    .await
-                    .map_err(|error| WorkerError::Fatal(error.0))?;
-                if let Some(w) = job.counters_slot() {
-                    w.add_network(data.len() as u64);
-                    // Unique completed bytes: only newly-acknowledged file
-                    // bytes count (§19.1, invariant 5).
-                    w.add_completed(data.len() as u64);
-                }
+                // Write-ack latency for the controller's sampling (task 9.2).
+                job.write_latency_us.store(
+                    u64::try_from(write_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 in_range_offset += data.len() as u64;
 
                 // Hot-path progress (§13.3, task 6.3): publish the
-                // durable-through offset with Relaxed atomics into this
-                // worker's cell — no scheduler lock on the chunk path. The
-                // scheduler reconciles at lease boundaries and the
-                // checkpoint cadence.
+                // acknowledged written-through offset as one coherent record
+                // (task 3.2) — no scheduler lock on the chunk path.
                 let durable_through = validated_start + in_range_offset;
-                job.worker_progress[worker_idx].publish(
-                    lease.id,
-                    lease.generation,
-                    lease.start,
-                    durable_through,
-                );
-
-                // Checkpoint cadence (§15.4): completed ranges only; this is
-                // a lease-boundary-quality reconciliation where the scheduler
-                // lock is taken once per interval, not per chunk (§13.3).
-                if last_checkpoint.elapsed() >= checkpoint_interval {
-                    last_checkpoint = Instant::now();
-                    let ranges = {
-                        let mut sched = job.scheduler.lock().await;
-                        sched.absorb_worker_progress(&job.worker_progress);
-                        sched.completed_ranges()
-                    };
-                    persist_checkpoint(store, identity, job, ranges).map_err(WorkerError::Fatal)?;
-                }
+                job.worker_progress[worker_idx].publish(LeaseRecord {
+                    lease_id: lease.id,
+                    generation: lease.generation,
+                    lease_start: lease.start,
+                    written_through: durable_through,
+                });
             }
             Ok(BodyEvent::End) => break, // clean EOF
             Ok(BodyEvent::Paused) => {
-                // §9.3: pause converges at a safe boundary. Before waiting,
-                // the scheduler snapshot is absorbed and persisted so the
-                // paused state is genuinely resumable (§15.4). A save
-                // failure is fatal: the observing worker installs the shared
-                // error and all workers converge before the job fails.
-                {
-                    let ranges = {
-                        let mut sched = job.scheduler.lock().await;
-                        sched.absorb_worker_progress(&job.worker_progress);
-                        sched.settled_ranges()
-                    };
-                    if !ranges.is_empty() {
-                        persist_checkpoint(store, identity, job, ranges)
-                            .map_err(WorkerError::Fatal)?;
-                    }
-                }
+                // §9.3: pause converges at a safe boundary. The coordinator
+                // settles the acknowledged snapshot (task 4.3) and the
+                // worker waits for the save result before reporting
+                // resumability. A save failure is fatal: the observing
+                // worker installs the shared error and all workers converge
+                // before the job fails.
+                let (ack_tx, ack_rx) = oneshot::channel();
+                job.save_now_tx
+                    .send(CoordinatorCmd::SaveNow { ack: ack_tx })
+                    .await
+                    .map_err(|_| {
+                        WorkerError::Fatal(DownloadError::Protocol(
+                            "checkpoint coordinator stopped before the pause save".into(),
+                        ))
+                    })?;
+                ack_rx
+                    .await
+                    .map_err(|_| {
+                        WorkerError::Fatal(DownloadError::Protocol(
+                            "checkpoint coordinator dropped the pause save".into(),
+                        ))
+                    })?
+                    .map_err(WorkerError::Fatal)?;
                 while job.cancel.is_paused() && !job.cancel.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -810,16 +1228,28 @@ async fn transfer_lease(
             Err(e) => {
                 // Body faults (reset, truncation, idle timeout, overrun)
                 // arrive classified (§32); the worker maps them onto the
-                // shared retry/coordination policy.
-                return Err(worker_error_from_failure(e, None, classifier));
+                // shared retry/coordination policy. Bytes received past the
+                // acknowledged written-through frontier are lost with the
+                // attempt: count them as wasted at this lease boundary
+                // (task 5.4).
+                let written_frontier = cell
+                    .snapshot()
+                    .filter(|record| record.lease_id == lease.id)
+                    .map(|record| record.written_through)
+                    .unwrap_or(lease.next_offset)
+                    .max(lease.next_offset);
+                let received_frontier = validated_start + in_range_offset;
+                let wasted = received_frontier.saturating_sub(written_frontier);
+                return Err(worker_error_from_failure(e, None, classifier, wasted));
             }
         }
     }
     // Final acknowledgment: everything accepted is written. Reconcile this
-    // worker's cell into the scheduler before completing the lease (§31).
+    // worker's cell (crediting accepted coverage — task 5.4) before
+    // completing the lease (§31).
+    reconcile_and_credit(job).await;
     {
         let mut sched = job.scheduler.lock().await;
-        sched.absorb_worker_progress(&job.worker_progress);
         let _ = sched.report_progress(lease.id, lease.generation, validated_start + accepted_len);
     }
     job.worker_progress[worker_idx].clear();
@@ -833,28 +1263,639 @@ async fn transfer_lease(
     Ok(())
 }
 
-/// Persist a checkpoint from the scheduler's completed set (§15.4):
-/// only durably acknowledged bytes are recorded.
-///
-/// # Errors
-/// [`DownloadError::Checkpoint`] when the persistence fails: callers
-/// route it into the shared fatal path instead of continuing without
-/// the promised resumable state.
-fn persist_checkpoint(
-    store: &dyn CheckpointStore,
-    identity: &str,
-    job: &SegmentedJob,
+// ---------------------------------------------------------------------------
+// Job-level checkpoint coordinator (tasks 4.1-4.3, design D2)
+// ---------------------------------------------------------------------------
+
+/// Commands into the coordinator.
+enum CoordinatorCmd {
+    /// Save at a pause boundary; the ack carries the save result so the
+    /// pausing worker reports resumability only after the save settled.
+    SaveNow {
+        ack: oneshot::Sender<Result<(), DownloadError>>,
+    },
+    /// Stop the coordinator after draining in-flight work (task 4.3: no
+    /// post-cleanup saves).
+    Stop { ack: oneshot::Sender<()> },
+}
+
+/// What the last successful save recorded; unchanged candidates are skipped
+/// (task 4.1: coalescing compares intervals plus identity/validator metadata,
+/// not a chunk counter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedRevision {
     ranges: Vec<(u64, u64)>,
+    generation: u64,
+    validators: crate::http::validators::ResourceValidators,
+}
+
+/// The coordinator loop: wakes on the configured interval and on boundary
+/// commands; every save runs the shared mode-aware path (task 3.3).
+async fn coordinator_loop(
+    job: Arc<SegmentedJob>,
+    store: Arc<dyn CheckpointStore>,
+    identity: String,
+    interval: Duration,
+    mut cmd_rx: mpsc::Receiver<CoordinatorCmd>,
+) {
+    let mut last_saved: Option<SavedRevision> = None;
+    // Immediate first save (§15.5): a resumed job persists its admitted
+    // coverage with current validators before any transfer work, so a crash
+    // immediately after admission still resumes. Fresh jobs snapshot empty
+    // and skip the store entirely.
+    if let Err(error) = attempt_coordinator_save(
+        &job, &store, &identity, &mut last_saved,
+    )
+    .await
+    {
+        job.fatal.install(error);
+        return;
+    }
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(CoordinatorCmd::SaveNow { ack }) => {
+                        let result = attempt_coordinator_save(
+                            &job, &store, &identity, &mut last_saved,
+                        )
+                        .await;
+                        let _ = ack.send(result);
+                    }
+                    Some(CoordinatorCmd::Stop { ack }) => {
+                        // Drained: any in-flight save completed before this
+                        // point (the loop body is sequential).
+                        let _ = ack.send(());
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            _ = tick.tick() => {
+                // Interval save: skip-unchanged snapshots make a no-progress
+                // tick a no-op (task 4.1). A persistence failure is fatal
+                // (task 4.2): install the shared error — first wins — and
+                // stop saving; workers converge on the fatal flag and the
+                // job reports exactly one terminal failure.
+                if let Err(error) = attempt_coordinator_save(
+                    &job, &store, &identity, &mut last_saved,
+                )
+                .await
+                {
+                    job.fatal.install(error);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The adaptive range-concurrency controller loop (tasks 9.1-9.3, design
+/// D6): every `window`, sample the counter deltas (unique completed =
+/// useful goodput — resumed bytes excluded — plus network/wasted, retries,
+/// throttle events, worker idle ratio and write latency), decide, and apply
+/// within strict bounds. Manual override suspends the loop for the job's
+/// remainder.
+async fn adaptive_controller_loop(job: Arc<SegmentedJob>, counters: Arc<JobCounters>) {
+    let config = crate::control::adaptive::AdaptiveConfig::default();
+    let mut controller = crate::control::adaptive::AdaptiveController::new(
+        config,
+        job.min_workers,
+        job.max_workers,
+    );
+    let mut previous = counters.fold();
+    let mut previous_throttled = job.throttle_events();
+    let mut last = Instant::now();
+    loop {
+        tokio::time::sleep(config.window).await;
+        if job.cancel.is_cancelled() || job.fatal.is_fatal() {
+            return;
+        }
+        // Manual override: suspend for the remainder (design D5).
+        if job.is_manual_override() {
+            controller.manual_override();
+            return;
+        }
+        let now = Instant::now();
+        let fold = counters.fold();
+        // Throttle events: window diff (task 9.2).
+        let now_throttled = job.throttle_events();
+        let throttled = now_throttled.saturating_sub(previous_throttled);
+        previous_throttled = now_throttled;
+        let sample = crate::control::adaptive::WindowSample {
+            completed_bytes: fold
+                .completed_bytes
+                .saturating_sub(previous.completed_bytes),
+            network_bytes: fold
+                .network_bytes
+                .saturating_sub(previous.network_bytes),
+            wasted_bytes: fold.wasted_bytes.saturating_sub(previous.wasted_bytes),
+            retries: fold.retries.saturating_sub(previous.retries),
+            throttled,
+            worker_idle_ratio: job.worker_idle_ratio(),
+            elapsed: now.saturating_duration_since(last),
+        };
+        previous = fold;
+        last = now;
+        let current = job.desired_workers();
+        let decision = controller.decide(sample, current);
+        if decision != crate::control::adaptive::Decision::Hold {
+            let next = controller.apply(decision, current);
+            if next != current {
+                job.adjust_desired_workers(next);
+            }
+        }
+    }
+}
+
+/// One coordinator save attempt — the shared mode-aware save path (tasks
+/// 3.3/4.1, design D2):
+///
+/// 1. snapshot acknowledged, generation-validated ranges under one short
+///    scheduler lock (never data whose write acknowledgment has not
+///    returned), then release the lock before filesystem operations;
+/// 2. skip unchanged snapshots (same ranges, generation and validators);
+/// 3. **Durable** mode synchronizes the output file data *before* persisting
+///    the corresponding ranges — a failed sync prevents any save of new
+///    ranges; **Performance** mode saves after written acknowledgment
+///    without a sync;
+/// 4. on failed persistence the in-memory revision does not advance.
+///
+/// The sidecar format is unchanged.
+async fn attempt_coordinator_save(
+    job: &Arc<SegmentedJob>,
+    store: &Arc<dyn CheckpointStore>,
+    identity: &str,
+    last_saved: &mut Option<SavedRevision>,
 ) -> Result<(), DownloadError> {
+    // 1. Coherent snapshot under the scheduler lock (reconcile + credit the
+    // accepted deltas — task 5.4 — then settle).
+    let (ranges, generation) = {
+        let mut sched = job.scheduler.lock().await;
+        let deltas = sched.absorb_worker_progress(&job.worker_progress);
+        for (worker_idx, delta) in deltas.into_iter().enumerate() {
+            if delta > 0 {
+                if let Some(w) = job.counters.worker(worker_idx) {
+                    w.add_completed(delta);
+                }
+            }
+        }
+        let result = (sched.settled_ranges(), sched.generation());
+        // Progress reconciliation can make a live tail splittable — parked
+        // workers recheck (task 7.1).
+        job.notify_transition();
+        result
+    };
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let candidates = SavedRevision {
+        ranges,
+        generation,
+        validators: job.validators.clone(),
+    };
+    // 2. Skip unchanged snapshots (task 4.1: no rewrite without new coverage).
+    if last_saved.as_ref() == Some(&candidates) {
+        return Ok(());
+    }
+
+    // Generation fence (design D2): a generation rollover between the
+    // snapshot and this check invalidates the snapshot — stale-generation
+    // coverage is never persisted. Residual exposure (a bump between this
+    // check and the store write) is safe: the ranges are genuinely written
+    // bytes and the sidecar carries the old validators, which resume
+    // validation rejects; the job is already fatal after a generation bump.
+    {
+        let sched = job.scheduler.lock().await;
+        if sched.generation() != candidates.generation {
+            return Ok(());
+        }
+    }
+
+    // 3. Durability ordering: data sync strictly before metadata save.
+    if job.durability == DurabilityMode::Durable {
+        let sync = job.sync.as_ref().ok_or_else(|| {
+            DownloadError::SinkWrite("durable checkpoint save has no sync capability".into())
+        })?;
+        // Blocking fs work off the network tasks (task 4.2): one
+        // spawn_blocking per infrequent checkpoint, never per chunk.
+        let sync = sync.clone();
+        tokio::task::spawn_blocking(move || sync.sync_data())
+            .await
+            .map_err(|join_err| {
+                DownloadError::SinkWrite(format!("checkpoint sync task failed: {join_err}"))
+            })??;
+    }
+
+    // 4. Persist off the latency-sensitive path (task 4.2).
     let mut cp = Checkpoint::new(
         identity,
         String::new(), // original URL is set by the caller's checkpoint; identity hash suffices here
         format!("tmp-{identity}"),
     );
     cp.total_size = Some(job.total_size);
-    cp.validators = job.validators.clone();
-    cp.completed_ranges = ranges;
-    store
-        .save_atomic(&cp)
-        .map_err(|e| DownloadError::Checkpoint(e.to_string()))
+    cp.validators = candidates.validators.clone();
+    cp.completed_ranges = candidates.ranges.clone();
+    let store_result = {
+        let checkpoint = cp;
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .save_atomic(&checkpoint)
+                .map_err(|e| DownloadError::Checkpoint(e.to_string()))
+        })
+        .await
+        .map_err(|join_err| {
+            DownloadError::Checkpoint(format!("checkpoint store task failed: {join_err}"))
+        })?
+    };
+    match store_result {
+        Ok(()) => {
+            // Revision advances only on a successful save.
+            *last_saved = Some(candidates);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::io::sink::TempFileSpec;
+    use crate::resume::checkpoint::Checkpoint;
+    use crate::resume::CheckpointError;
+    use std::sync::Mutex;
+
+    /// Injectable recording store: counts save attempts vs successes.
+    struct RecordingStore {
+        state: Mutex<(usize, usize)>, // (attempts, successful)
+        fail_saves: bool,
+    }
+
+    impl crate::resume::checkpoint_store::CheckpointStore for RecordingStore {
+        fn load(
+            &self,
+            _job_identity: &str,
+        ) -> Result<Option<Checkpoint>, CheckpointError> {
+            Ok(None)
+        }
+
+        fn save_atomic(&self, _checkpoint: &Checkpoint) -> Result<(), CheckpointError> {
+            let mut state = self.state.lock().expect("recording store");
+            state.0 += 1;
+            if self.fail_saves {
+                return Err(CheckpointError::Corrupt("injected save failure".into()));
+            }
+            state.1 += 1;
+            Ok(())
+        }
+
+        fn delete(&self, _job_identity: &str) -> Result<(), CheckpointError> {
+            Ok(())
+        }
+    }
+
+    /// A segmented job over one real temp output with the given durability.
+    fn durable_job(
+        directory: &tempfile::TempDir,
+        durability: DurabilityMode,
+        fail_saves: bool,
+    ) -> (
+        Arc<SegmentedJob>,
+        OutputSession,
+        Arc<dyn crate::resume::checkpoint_store::CheckpointStore>,
+        Arc<RecordingStore>,
+    ) {
+        let destination = directory.path().join("out.bin");
+        let mut session =
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
+                .expect("session");
+        crate::io::sink::Sink::write_at(&mut session, 0, b"durable-payload-bytes")
+            .expect("write");
+        let sync = session.sync_capability().expect("sync capability");
+        let (hub, _events) = crate::metrics::events::EventHub::new(
+            16,
+            Duration::from_secs(1),
+        );
+        let store_impl = Arc::new(RecordingStore {
+            state: Mutex::new((0, 0)),
+            fail_saves,
+        });
+        let store: Arc<dyn crate::resume::checkpoint_store::CheckpointStore> =
+            store_impl.clone();
+        let store_counts = store_impl;
+        let (save_now_tx, _save_rx) = mpsc::channel(8);
+        let (revision_tx, _revision_rx) = tokio::sync::watch::channel(0u64);
+        let job = SegmentedJob {
+            scheduler: AsyncMutex::new(SegmentScheduler::initialize(
+                100,
+                &[],
+                SchedulerPolicy::new(1, 100),
+            )),
+            origin_backoff_until: AsyncMutex::new(None),
+            fatal: FatalState::default(),
+            cancel: crate::control::CancellationToken::new(),
+            hub: std::sync::Arc::new(hub),
+            counters: Arc::new(JobCounters::new(1)),
+            rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
+            total_size: 100,
+            validators: crate::http::validators::ResourceValidators::default(),
+            sync: Some(sync),
+            durability,
+            revision_tx: Arc::new(revision_tx),
+            save_now_tx,
+            desired_workers: AtomicU64::new(1),
+            manual_override: AtomicBool::new(false),
+            throttle_events: AtomicU64::new(0),
+            write_latency_us: AtomicU64::new(0),
+            min_workers: 1,
+            max_workers: 1,
+            worker_progress: vec![Arc::new(LeaseProgress::default())],
+        };
+        let job = Arc::new(job);
+        (job, session, store, store_counts)
+    }
+
+    /// Write→sync boundary (durable mode, tasks 3.4/4.1): a failed sync must
+    /// prevent ANY save — the store sees zero save attempts, and the
+    /// revision does not advance.
+    #[tokio::test]
+    async fn failed_sync_prevents_checkpoint_save() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        // Fail the sync by scripting a Flush-op failure for this destination.
+        let script =
+            crate::io::fault_script::OutputFaultScript::register(&directory.path().join("out.bin"));
+        script.script().fail_next(
+            crate::io::fault_script::OutputOperation::Flush,
+            DownloadError::SinkWrite("injected sync failure".into()),
+        );
+        let (job, _session, store, counts) =
+            durable_job(&directory, DurabilityMode::Durable, false);
+
+        // Seed one acknowledged written range so the save has candidates.
+        let lease = job
+            .scheduler
+            .lock()
+            .await
+            .acquire()
+            .expect("lease");
+        job.worker_progress[0].test_publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            lease.start + 20,
+        );
+        let mut last_saved = None;
+        let error = attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect_err("sync failure is fatal");
+        assert!(matches!(error, DownloadError::SinkWrite(_)), "{error}");
+        let (attempts, successful) = *counts.state.lock().expect("state");
+        assert_eq!(attempts, 0, "no save attempt after a failed sync");
+        assert_eq!(successful, 0);
+        assert!(last_saved.is_none(), "revision never advances on failure");
+    }
+
+    /// Sync→save boundary (durable mode, task 3.4): the sync succeeds but
+    /// persistence fails — the save is attempted (sync happened first) but
+    /// no coverage is durably recorded and the revision stays put.
+    #[tokio::test]
+    async fn failed_save_after_sync_is_reported_not_silenced() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (job, _session, store, counts) =
+            durable_job(&directory, DurabilityMode::Durable, true);
+
+        let lease = job
+            .scheduler
+            .lock()
+            .await
+            .acquire()
+            .expect("lease");
+        job.worker_progress[0].test_publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            lease.start + 20,
+        );
+        let mut last_saved = None;
+        let error = attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect_err("save failure is fatal");
+        assert!(matches!(error, DownloadError::Checkpoint(_)), "{error}");
+        let (attempts, successful) = *counts.state.lock().expect("state");
+        assert_eq!(attempts, 1, "exactly one save attempt after a good sync");
+        assert_eq!(successful, 0);
+        assert!(last_saved.is_none());
+    }
+
+    /// Performance mode (tasks 3.3/4.1): the shared save path persists
+    /// WITHOUT a data sync — the Flush script op is never touched by saves.
+    #[tokio::test]
+    async fn performance_mode_saves_without_sync() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = crate::io::fault_script::OutputFaultScript::register(directory.path());
+        script.script().fail_next(
+            crate::io::fault_script::OutputOperation::Flush,
+            DownloadError::SinkWrite("sync must not run in performance mode".into()),
+        );
+        let (job, _session, store, counts) =
+            durable_job(&directory, DurabilityMode::Performance, false);
+
+        let lease = job
+            .scheduler
+            .lock()
+            .await
+            .acquire()
+            .expect("lease");
+        job.worker_progress[0].test_publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            lease.start + 20,
+        );
+        let mut last_saved = None;
+        attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect("performance save needs no sync");
+        let (attempts, successful) = *counts.state.lock().expect("state");
+        assert_eq!((attempts, successful), (1, 1));
+        assert!(
+            last_saved.is_some(),
+            "a successful save advances the revision"
+        );
+        // The Flush op was never fired by the save path.
+        assert!(!script
+            .script()
+            .operations()
+            .contains(&crate::io::fault_script::OutputOperation::Flush));
+    }
+
+    /// Empty snapshots never touch the store (skip-unchanged semantics at
+    /// the save boundary).
+    #[tokio::test]
+    async fn empty_ranges_skip_the_save() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (job, _session, store, counts) =
+            durable_job(&directory, DurabilityMode::Durable, false);
+        let mut last_saved = None;
+        attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect("empty save is a no-op");
+        let (attempts, _) = *counts.state.lock().expect("state");
+        assert_eq!(attempts, 0);
+    }
+
+    /// Unchanged snapshots are skipped (task 4.1 coalescing): a second save
+    /// with identical ranges/generation/validators does not reach the store;
+    /// new progress persists again.
+    #[tokio::test]
+    async fn unchanged_snapshots_are_skipped() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (job, _session, store, counts) =
+            durable_job(&directory, DurabilityMode::Performance, false);
+        let lease = job
+            .scheduler
+            .lock()
+            .await
+            .acquire()
+            .expect("lease");
+        job.worker_progress[0].test_publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            lease.start + 20,
+        );
+        let mut last_saved = None;
+        attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect("first save");
+        // Same snapshot again (no new progress): skipped.
+        attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect("second save skipped");
+        let (attempts, _) = *counts.state.lock().expect("state");
+        assert_eq!(
+            attempts, 1,
+            "unchanged snapshot must not rewrite the store"
+        );
+
+        // New progress → the next save persists again.
+        job.worker_progress[0].test_publish(
+            lease.id,
+            lease.generation,
+            lease.start,
+            lease.start + 60,
+        );
+        attempt_coordinator_save(&job, &store, "identity", &mut last_saved)
+            .await
+            .expect("third save persists new coverage");
+        let (attempts, _) = *counts.state.lock().expect("state");
+        assert_eq!(attempts, 2);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Stress (task 5.1, design D3): one writer publishes records where the
+    /// written-through offset is a pure function of (lease_id, generation);
+    /// readers must NEVER observe a mixed record. Includes clear/reuse
+    /// cycles (lease_id 0) and stale-generation records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sequence_cell_never_mixes_publications_under_stress() {
+        let cell = Arc::new(LeaseProgress::default());
+        let writer_cell = cell.clone();
+        let writer = tokio::spawn(async move {
+            for lease_id in 1..=20_000u64 {
+                if lease_id % 5 == 0 {
+                    // Clear/reuse: the cell returns to idle between leases.
+                    writer_cell.clear();
+                } else {
+                    let generation = lease_id / 7;
+                    writer_cell.publish(LeaseRecord {
+                        lease_id,
+                        generation,
+                        lease_start: lease_id * 1000,
+                        // Derivable invariant: start < written_through <= start + 1000.
+                        written_through: lease_id * 1000 + (lease_id % 1000),
+                    });
+                }
+            }
+            writer_cell.clear();
+        });
+
+        let mut observed = 0u64;
+        while !writer.is_finished() {
+            if let Some(record) = cell.snapshot() {
+                observed += 1;
+                // Coherence invariants (never mixed across publications):
+                assert_eq!(
+                    record.written_through,
+                    record.lease_id * 1000 + (record.lease_id % 1000),
+                    "mixed publication observed: {record:?}"
+                );
+                assert_eq!(
+                    record.generation,
+                    record.lease_id / 7,
+                    "mixed generation: {record:?}"
+                );
+                assert!(record.lease_start < record.written_through);
+            }
+            std::hint::spin_loop();
+        }
+        writer.await.expect("writer task");
+        // Final cleared state reads idle.
+        assert!(cell.snapshot().is_none());
+        assert!(observed > 0, "stress readers observed publications");
+    }
+
+    /// Stale-generation progress (task 5.1): a stale record read by the
+    /// scheduler's reconciliation is rejected (existing invariant, now over
+    /// the sequence cell).
+    #[test]
+    fn stale_generation_records_are_rejected_by_reconciliation() {
+        let mut s = SegmentScheduler::initialize(10_000, &[], SchedulerPolicy::new(1, 100));
+        let lease = s.acquire().expect("lease");
+        let cell = LeaseProgress::default();
+        // Stale generation publication.
+        cell.test_publish(lease.id, lease.generation + 7, lease.start, 5_000);
+        s.absorb_worker_progress(&[Arc::new(cell)]);
+        assert_eq!(
+            s.active_leases()[0].next_offset,
+            lease.start,
+            "stale generation never moves the lease"
+        );
+    }
+
+    /// First-wins fatal ownership (task 5.2): simultaneous failures retain
+    /// exactly one authoritative error.
+    #[test]
+    fn simultaneous_failures_retain_exactly_one_error() {
+        let fatal = FatalState::default();
+        let first = fatal.install(DownloadError::Protocol("first failure".into()));
+        let second = fatal.install(DownloadError::SinkWrite("second failure".into()));
+        assert!(first, "the first installer owns the error");
+        assert!(!second, "a racing failure cannot replace the first error");
+        assert!(fatal.is_fatal());
+        let taken = fatal.take().expect("one error");
+        assert!(
+            matches!(taken, DownloadError::Protocol(_)),
+            "the FIRST error is retained: {taken}"
+        );
+    }
+
+    /// The fatal flag publishes only after the error object is in place:
+    /// a thread observing `is_fatal` must always find an error to take.
+    #[test]
+    fn fatal_flag_implies_error_is_readable() {
+        let fatal = FatalState::default();
+        fatal.install(DownloadError::Cancelled);
+        assert!(fatal.is_fatal());
+        assert!(fatal.take().is_some(), "flag set but no error readable");
+    }
 }

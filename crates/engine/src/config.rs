@@ -71,6 +71,34 @@ pub enum DurabilityMode {
     Durable,
 }
 
+/// Range-worker concurrency mode (task 9.1): `Fixed` (default) keeps the
+/// configured fixed concurrency; `Adaptive` opts into the conservative
+/// goodput-driven controller starting at `min_workers`. Manual runtime
+/// control remains supported in both modes and suspends the controller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConcurrencyMode {
+    /// Fixed concurrency (default; unchanged behavior).
+    #[default]
+    Fixed,
+    /// Opt-in conservative adaptive range concurrency (design D6).
+    Adaptive,
+}
+
+/// How initial segmented lease sizes are chosen (task 6.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SegmentSizing {
+    /// Honor `initial_segment_size` (default; the existing documented
+    /// meaning — previously ignored in favor of `max_segment_size`).
+    #[default]
+    Explicit,
+    /// Opt-in automatic target: `ceil(remaining bytes / (initial active
+    /// workers × `auto_oversubscription`))`, clamped to the segment bounds.
+    /// Remaining coverage comes from validated intervals, not total length.
+    Automatic,
+}
+
 /// Integrity verification requirements for a job (§16).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IntegrityPolicy {
@@ -147,8 +175,21 @@ pub struct TransferPolicy {
     pub initial_segment_size: u64,
     pub min_segment_size: u64,
     pub max_segment_size: u64,
+    /// Initial-lease sizing selector (task 6.1): `Explicit` (default) honors
+    /// `initial_segment_size`; `Automatic` opts into the derived target.
+    pub segment_sizing: SegmentSizing,
+    /// Oversubscription factor for `SegmentSizing::Automatic` (task 6.1);
+    /// initial candidate 3, tuned from benchmarks.
+    pub auto_oversubscription: u64,
+    /// Range-worker concurrency mode (task 9.1): `Fixed` (default) or
+    /// opt-in `Adaptive` (starts at `min_workers`; manual control wins).
+    pub concurrency_mode: ConcurrencyMode,
     pub segmentation_threshold: u64,
     pub preallocate_output: bool,
+    /// Opt-in physical space reservation at output preparation (task 11.1):
+    /// attempts an fallocate-style reservation where supported; unsupported
+    /// platforms/filesystems fall back to logical sizing.
+    pub preallocate_physical: bool,
     pub durability: DurabilityMode,
     pub verify_range_support: bool,
     /// Total job deadline; `None` = no deadline (§4.1).
@@ -163,8 +204,12 @@ impl Default for TransferPolicy {
             initial_segment_size: 8 * 1024 * 1024,
             min_segment_size: 1024 * 1024,
             max_segment_size: 64 * 1024 * 1024,
+            segment_sizing: SegmentSizing::default(),
+            auto_oversubscription: 3,
+            concurrency_mode: ConcurrencyMode::default(),
             segmentation_threshold: 16 * 1024 * 1024,
             preallocate_output: true,
+            preallocate_physical: false,
             durability: DurabilityMode::default(),
             verify_range_support: true,
             job_deadline: None,
@@ -275,6 +320,11 @@ pub struct EngineConfig {
     pub max_connections_total: u32,
     pub max_connections_per_origin: u32,
     pub read_buffer_size: u32,
+    /// Bounds the public `BufferPool`'s own allocation ONLY (task 10.2):
+    /// the engine's transfer path no longer constructs pools (Hyper `Bytes`
+    /// flow straight to positional writes). This is NOT a bound on Hyper's
+    /// internal ingress buffers or socket windows — peak RSS may
+    /// transiently exceed this budget because of them.
     pub buffer_pool_max_bytes: u64,
     pub checkpoint_flush_interval: Duration,
     pub metrics_interval: Duration,
@@ -419,6 +469,12 @@ fn validate_transfer(t: &TransferPolicy) -> Result<(), ConfigurationError> {
         return Err(invalid(
             "transfer.initial_segment_size",
             "must be within [min_segment_size, max_segment_size]",
+        ));
+    }
+    if t.auto_oversubscription == 0 {
+        return Err(invalid(
+            "transfer.auto_oversubscription",
+            "must be at least 1",
         ));
     }
     Ok(())

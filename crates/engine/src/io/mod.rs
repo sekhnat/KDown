@@ -5,7 +5,9 @@ pub(crate) mod destination_lease;
 #[cfg(test)]
 pub(crate) mod fault_script;
 pub(crate) mod output_session;
+pub(crate) mod positional;
 pub(crate) mod publish;
+pub(crate) mod writer_lane;
 pub mod sanitize;
 pub mod sink;
 

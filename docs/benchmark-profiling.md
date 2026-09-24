@@ -1,0 +1,210 @@
+# Benchmarking and profiling guide (§37, milestone 1)
+
+Repeatable procedures for measuring the segmented download pipeline, plus the
+recorded pre-optimization baseline. Every command is reproducible from this
+repository; results land in `crates/engine/benches/results/`.
+
+## Baseline environment (same-host comparisons only)
+
+| Setting | Value |
+|---|---|
+| CPU | AMD Ryzen 7 9700X (8C/16T), `nproc` = 16 |
+| RAM | 32 GiB (zram swap) |
+| OS | CachyOS, Linux 6.2.6 kernel series |
+| Storage | NVMe (`nvme0n1`, `nvme1n1`) + rotational HDD; bench destinations default to tmpfs-backed tempdirs |
+| Network | Loopback (127.0.0.1) fixture servers; no RTT/loss shaping in CI runs |
+| Protocol axis | HTTP/1.1 plaintext (raw TCP responder) and HTTP/2 over ALPN TLS (self-signed CA bundle) |
+| Build | `cargo bench` → release profile (`lto = thin`, `codegen-units = 1`) |
+| Durability | `DurabilityMode::Performance` (default) unless stated |
+| Fixtures | Deterministic xorshift content (`seed 0xBEEF`); synthetic block-derived for ≥256 MiB |
+
+Throughput values from different hosts, containers, or CPU-frequency states
+are not comparable. GitHub-hosted runners run smoke-only by design (no
+cross-host comparison).
+
+## Repeatable commands
+
+All commands run from the repository root.
+
+### Criterion smoke scenarios (default, CI-bounded)
+
+```sh
+scripts/bench_check.sh --smoke        # scenarios only, no baseline comparison
+scripts/bench_check.sh                # compare against benches/results/baseline.md
+```
+
+Runs the criterion groups `h1`, `h2`, `prealloc` (32 MiB fixture,
+workers 1/4, preallocation on/off) with a 0.5 s warm-up and 1.5 s
+measurement budget. Raw criterion medians are the regression-check input.
+
+### Smoke matrix (32 MiB / 256 MiB / 1 GiB × H1/H2 × 1/2/4/8 workers)
+
+```sh
+cargo bench --bench throughput -- --matrix-smoke
+```
+
+One measured (non-criterion) run per scenario: 24 scenarios, single-digit
+seconds total, no multi-GiB allocations (synthetic block-derived content).
+Writes `benches/results/matrix-smoke/records.md` and prints the same table to
+stderr. Every row is verified for final size, SHA-256, and atomic publication.
+
+### Manual matrix (multi-GiB / 16 workers — workstation only)
+
+```sh
+cargo bench --bench throughput -- --matrix-manual
+```
+
+2 GiB and 4 GiB × H1/H2 × 1/2/4/8/16 workers. Never run in CI (allocation
+and time). Writes `benches/results/matrix-manual/records.md`.
+
+### Process-isolated authoritative runs (client-only resources)
+
+The fixture server is a separate process, so client CPU/RSS/context-switch
+records exclude server cost:
+
+```sh
+cargo build --release -p kdown-engine --bin fixture_server
+target/release/fixture_server --size 1GiB --seed 0xBEEF --addr 127.0.0.1:0 &
+# read LISTENING <addr> from its stdout, then:
+cargo bench --bench throughput -- --isolated 127.0.0.1:<port> \
+    --isolated-size 1GiB --isolated-seed 0xBEEF \
+    [--isolated-workers 4] [--isolated-label mylabel]
+# → benches/results/isolated/mylabel/records.md
+```
+
+Server behavior controls: `--ignore-ranges`, `--throttle-mib-s F`,
+`--transient-fail N:CODE` (e.g. `2:503`), `--reset-after-bytes N`,
+`--change-etag-after N`. Startup protocol: `LISTENING`, `SIZE`, `SHA256`,
+`READY`. The isolated server is plaintext HTTP/1.1; H2 multiplexing stays
+covered by the in-process smoke scenarios.
+
+## Profiling procedures
+
+### Always available (no extra tooling; used by the harness)
+
+- **CPU time / CPU %** — `/proc/self/stat` utime+stime delta around each run
+  (100 Hz tick granularity).
+- **Peak RSS** — `/proc/self/status` `VmHWM`.
+- **Context switches** — `/proc/self/status`
+  `voluntary_ctxt_switches + nonvoluntary_ctxt_switches` delta around each
+  run. LIMITATION: these counters track the calling (main) thread only, not
+  the process or its worker threads — multithreaded runs report near-zero
+  deltas. Use `vmstat 1` (system-wide `cs`) or `pidstat -t` (when
+  installed) for real switch visibility; recorded per-thread switch counts
+  are therefore marked n/r where meaningless.
+- **Wire vs useful bytes** — engine `JobCounters` folded into
+  `DownloadResult` (`bytes_downloaded_from_network`, `completed_bytes`,
+  `wasted_bytes`, `retries`); goodput and wire throughput are reported
+  separately per scenario.
+- **System-wide context-switch pressure** — `vmstat 1` in a second terminal
+  during manual runs (`cs` column) when per-process deltas are not enough.
+
+### Requires tooling not installed on the baseline host (documented limitation)
+
+`perf`, `pidstat`, and `strace` are **not installed** on the baseline host,
+so cycles/instructions per useful byte, per-syscall counts, and per-thread
+CPU breakdowns are **not part of the recorded baseline**. When available,
+the following reproduce the missing views:
+
+```sh
+# CPU cycles/instructions per useful byte (isolated server strongly advised)
+perf stat -e cycles,instructions,context-switches,cs \
+    -p "$(pgrep -f 'throughput --isolated')" -- sleep 30
+# Per-thread CPU and paging during a run
+pidstat -t -p "$(pgrep -f 'throughput --isolated')" 1
+# Syscall counts and write sizes on the output path
+strace -c -f -e trace=write,pwrite64,pwritev2,fsync,fdatasync,ftruncate \
+    target/release/deps/throughput-* --isolated 127.0.0.1:PORT --isolated-size 1GiB
+```
+
+Until those tools are installed, syscall counts are reported as
+"unavailable" and CPU cost per useful byte is approximated by the recorded
+CPU% per goodput (record rows), which is sufficient to detect order-of-
+magnitude regressions.
+
+### Checkpoint / write latency status
+
+Dedicated checkpoint-save and fsync latency instrumentation is **not yet in
+place**; it lands with the job-level checkpoint coordinator (milestone 4 of
+the optimization change). Until then:
+
+- Durable-mode runs pay `sync_all` per checkpoint interval inside worker
+  chunk paths; the cost is visible indirectly as goodput loss vs the
+  performance-mode record under identical conditions.
+- Post-coordinator, per-save latency and per-interval write latency will be
+  reported through job events and added to this document.
+
+## Recorded pre-optimization baseline (2026-09-24)
+
+Harness corrections included (task 1.1-1.4): real counter accounting,
+case-insensitive Range parsing in the raw H1 responder, size/hash/publication
+verification per run.
+
+### Criterion medians (32 MiB, 0.5 s warm-up, 1.5 s measurement)
+
+| Scenario | Median | Throughput |
+|---|---|---|
+| h1/workers_1 | 8.87 ms | ~3.6 GiB/s |
+| h1/workers_4 | 8.89 ms | ~3.6 GiB/s |
+| h2/workers_1 | 15.64 ms | ~2.0 GiB/s |
+| h2/workers_4 | 16.13 ms | ~2.0 GiB/s |
+| prealloc_true | 18.19 ms | ~1.8 GiB/s |
+| prealloc_false | 17.59 ms | ~1.8 GiB/s |
+
+### Smoke-matrix resource records (highlights)
+
+Full tables: `benches/results/matrix-smoke/records.md`.
+
+- **h1 workers_1** is a clean single stream: network == completed == fixture
+  size at every size (32 MiB → 798 MiB/s, 1 GiB → 811 MiB/s; loopback-bound).
+- **h1 segmented (workers ≥ 2) re-downloads overlapping ranges**: network
+  bytes exceed the fixture (32 MiB × 2 workers → 50 MiB; × 4 → 67 MiB;
+  256 MiB × 8 → 432 MiB = 1.6×). Cause: idle workers split a live lease's
+  tail while the split lease's worker keeps streaming its original request;
+  the pre-change counters also re-count re-acknowledged prefix bytes as
+  unique completed (retry accounting is corrected in milestone 5.4). This
+  waste is visible now because byte fields come from real counters.
+- **h2 segmented stays exact** (network == fixture) at every size/worker
+  count: multiplexed streams finish fast enough that idle-split duplication
+  does not trigger, but goodput plateaus at ~820-845 MiB/s regardless of
+  workers — the H2 single-connection path does not scale with range workers
+  on loopback.
+- CPU% scales with duplicated work (h1/256MiB/workers_8: 611% CPU for
+  1.6× the file).
+- Peak RSS grows with worker count (9.4 → 29 MiB across the matrix) — the
+  pre-change per-worker `BufferPool` allocation contributes; removed in
+  milestone 10.
+
+### Pre-optimization findings this baseline pins
+
+1. Segmented output serializes on one mutex-protected sink (see proposal);
+   h1 goodput plateaus despite parallel workers.
+2. Idle-worker tail splits duplicate network traffic on H1 (up to 1.6× wire
+   bytes at 8 workers) without inflating `retries`/`wasted` counters.
+3. Per-chunk `PageCache` flush + synchronous checkpoint saves sit on the
+   chunk path (measured via goodput delta between durability modes in
+   milestone-2.4 comparisons).
+4. Worker-count scaling on H2 is flat (~820-845 MiB/s from 1 to 8 workers).
+
+Milestone 2.4 re-runs this exact matrix after the positional-output change
+and records the comparison in `benches/results/comparison-milestone-2.md`.
+
+## Memory-path scope (milestone 10)
+
+- **One frame per worker, no staging** (task 10.3, direct path): each
+  segmented worker holds at most ONE received Hyper `Bytes` frame in flight
+  (submitted to its writer lane, acknowledged before the next read).
+  There is no staging queue, no pooled-buffer copy, and no per-worker full
+  budget: retained payload = one frame per active worker (≤
+  `read_buffer_size` each, typically 128 KiB × `max_workers`).
+- **`buffer_pool_max_bytes` bounds the pool, not Hyper**: the engine's
+  transfer path no longer constructs `BufferPool`s (removed, task 10.1);
+  the pool remains public for embedding callers and bounds ONLY its own
+  buffers. Hyper's internal ingress buffers and socket receive windows are
+  outside any explicit engine budget — peak RSS may transiently exceed
+  `read_buffer_size × workers` because of them (documented; no absolute
+  process-RSS cap is promised).
+- **RSS/worker scaling** (measured, h1/32 MiB matrix, this host):
+  workers_1 → workers_8 peak RSS went 9.7 → 20.1 MiB after the per-worker
+  pool removal (was 9.4 → 29 MiB before) — roughly +1.3 MiB per extra
+  worker (task + lane + buffers), scaling linearly with the worker count.

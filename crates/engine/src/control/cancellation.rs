@@ -10,12 +10,28 @@ pub struct CancellationToken {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
     cancelled: AtomicBool,
     /// Separate pause flag: pause must stop network reads (§9.3) but is
     /// distinct from terminal cancellation.
     paused: AtomicBool,
+    /// Versioned state signal (task 7.2): 0 = running, 1 = paused,
+    /// 2 = cancelled. Published AFTER every flag change so parked waiters
+    /// wake on transitions without fixed-duration polling. The atomics stay
+    /// the synchronous fast path; the watch is the wake mechanism.
+    state_tx: tokio::sync::watch::Sender<u8>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        let (state_tx, _) = tokio::sync::watch::channel(0u8);
+        Self {
+            cancelled: AtomicBool::default(),
+            paused: AtomicBool::default(),
+            state_tx,
+        }
+    }
 }
 
 impl CancellationToken {
@@ -27,6 +43,13 @@ impl CancellationToken {
     /// Trigger cancellation; idempotent.
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.publish_state(2);
+    }
+
+    /// Publish the versioned state after a flag change (task 7.2): waiters
+    /// registered before the change are woken.
+    fn publish_state(&self, state: u8) {
+        let _ = self.inner.state_tx.send(state);
     }
 
     /// True once cancelled; latches forever.
@@ -38,11 +61,13 @@ impl CancellationToken {
     /// Request cooperative pause.
     pub fn pause(&self) {
         self.inner.paused.store(true, Ordering::SeqCst);
+        self.publish_state(1);
     }
 
     /// Lift a pause.
     pub fn unpause(&self) {
         self.inner.paused.store(false, Ordering::SeqCst);
+        self.publish_state(0);
     }
 
     #[must_use]
@@ -51,16 +76,74 @@ impl CancellationToken {
     }
 
     /// Resolve when cancelled (or paused, optionally) — async wait point
-    /// for workers between chunk reads/writes.
+    /// for workers between chunk reads/writes. Watches the versioned state
+    /// signal: register-before-check, then wait for the next transition —
+    /// no fixed-duration polling (task 7.2).
     pub async fn cancelled_or_paused(&self) -> CancellationReason {
+        let mut rx = self.inner.state_tx.subscribe();
         loop {
+            // Mark the current version seen FIRST, then check the
+            // authoritative atomics: a change between the two is published
+            // after this mark, so the wait below wakes immediately.
+            {
+                let _seen = rx.borrow_and_update();
+            } // guard dropped: the version is marked seen
             if self.is_cancelled() {
                 return CancellationReason::Cancelled;
             }
             if self.is_paused() {
                 return CancellationReason::Paused;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if rx.changed().await.is_err() {
+                // All senders gone (token dropped): recheck the atomics.
+                return if self.is_cancelled() {
+                    CancellationReason::Cancelled
+                } else {
+                    CancellationReason::Paused
+                };
+            }
+        }
+    }
+
+    /// Resolve only on terminal cancellation (not pause) — the parked-worker
+    /// wait (task 7.2): wakes via the versioned state signal, no polling.
+    pub async fn cancelled(&self) {
+        let mut rx = self.inner.state_tx.subscribe();
+        loop {
+            {
+                let _seen = rx.borrow_and_update();
+            }
+            if self.is_cancelled() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // Senders gone: settle on the atomic truth.
+                while !self.is_cancelled() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Wait until the pause lifts (`true`) or the token is cancelled
+    /// (`false`) — the parked-worker resume wait (task 7.2): wakes on
+    /// unpause/cancel via the versioned signal, never by fixed polling.
+    pub async fn wait_for_resume(&self) -> bool {
+        let mut rx = self.inner.state_tx.subscribe();
+        loop {
+            {
+                let _seen = rx.borrow_and_update();
+            } // guard dropped: the version is marked seen
+            if self.is_cancelled() {
+                return false;
+            }
+            if !self.is_paused() {
+                return true;
+            }
+            if rx.changed().await.is_err() {
+                return !self.is_paused() || self.is_cancelled();
+            }
         }
     }
 

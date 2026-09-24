@@ -7,6 +7,7 @@
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::DownloadError;
 use crate::io::publish::{self, PublishMode};
@@ -142,6 +143,10 @@ pub struct FileSink {
     destination: PathBuf,
     temp_path: PathBuf,
     preallocate: bool,
+    /// Opt-in physical reservation (task 11.1): attempt fallocate-style
+    /// space reservation after the logical `set_len`; unsupported
+    /// platforms/filesystems fall back to logical sizing.
+    physical: bool,
     /// When set, dropping without commit/finalize keeps the temp file
     /// (KeepPartial semantics and crash-resume preservation, §9.4/§15.1).
     keep_on_drop: bool,
@@ -149,7 +154,10 @@ pub struct FileSink {
     fail_next_write: bool,
     #[cfg(test)]
     fail_next_flush: bool,
-    file: Option<File>,
+    /// Shared immutable handle: positional writes need only `&File`, so the
+    /// handle is reference-counted and lent to write-only worker capabilities
+    /// while the owner keeps lifecycle authority (design D1, task 2.2).
+    file: Option<Arc<File>>,
     /// Bytes written so far (high-water mark) — informational.
     bytes_written: u64,
     finalized: bool,
@@ -166,6 +174,7 @@ impl FileSink {
         destination: &Path,
         spec: &TempFileSpec,
         preallocate: bool,
+        physical: bool,
     ) -> Result<Self, SinkError> {
         let temp_path = spec.temp_path_for(destination);
         let parent = temp_path
@@ -189,16 +198,23 @@ impl FileSink {
             destination: destination.to_path_buf(),
             temp_path,
             preallocate,
+            physical,
             keep_on_drop: false,
             #[cfg(test)]
             fail_next_write: false,
             #[cfg(test)]
             fail_next_flush: false,
-            file: Some(file),
+            file: Some(Arc::new(file)),
             bytes_written: 0,
             finalized: false,
             aborted: false,
         })
+    }
+
+    /// The shared immutable handle for lending write-only worker
+    /// capabilities (task 2.2): positional writes need only `&File`.
+    pub(crate) fn shared_handle(&self) -> Option<Arc<File>> {
+        self.file.clone()
     }
 
     /// The final destination this sink commits to.
@@ -207,8 +223,13 @@ impl FileSink {
         &self.destination
     }
 
-    /// Preallocate `size` bytes; unsupported filesystem ops are non-fatal
-    /// (§14.3). Returns whether preallocation happened.
+    /// Preallocate `size` bytes: portable logical sizing (`set_len`) plus,
+    /// when opted in, a physical reservation attempt (task 11.1).
+    /// Unsupported filesystem ops are non-fatal (§14.3) — the reservation
+    /// falls back to logical sizing without correctness changes. Real
+    /// errors (permission, out-of-space) surface as sink errors.
+    ///
+    /// Returns whether the logical sizing happened.
     ///
     /// # Errors
     /// Fatal only for real errors (permission, disk full).
@@ -216,16 +237,47 @@ impl FileSink {
         if !self.preallocate {
             return Ok(false);
         }
-        let Some(file) = self.file.as_mut() else {
+        let Some(file) = self.file.as_ref() else {
             return Err(SinkError(DownloadError::SinkOpen("sink closed".into())));
         };
         // set_len is the portable preallocation path; on Linux ext4/xfs it
         // also serves sparse purposes. FIEMAP/fallocate is a perf nicety,
         // not a correctness requirement (§14.3-14.4).
-        match file.set_len(size) {
-            Ok(()) => Ok(true),
-            Err(e) if e.raw_os_error() == Some(95) => Ok(false), // EOPNOTSUPP
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        let logical = match file.set_len(size) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(95) => false, // EOPNOTSUPP
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => false,
+            Err(e) => return Err(SinkError(DownloadError::from_io(&e))),
+        };
+        if self.physical {
+            // Real errors (ENOSPC, EPERM, ...) surface (task 11.2);
+            // unsupported operations/filesystems fall back silently.
+            self.reserve_physical(file, size)?;
+        }
+        Ok(logical)
+    }
+
+    /// Optional physical reservation (task 11.1, design D6): attempted only
+    /// where a portable binding exists (fs2 wraps fallocate on Unix and the
+    /// SetFileInformationByHandle path on Windows). Unsupported
+    /// operations/filesystems fall back silently — allocation is never a
+    /// correctness dependency — while ENOSPC and permission errors surface
+    /// as sink errors.
+    fn reserve_physical(&self, file: &std::fs::File, size: u64) -> Result<(), SinkError> {
+        use fs2::FileExt as _;
+        match file.allocate(size) {
+            Ok(()) => Ok(()),
+            // Unsupported operation/filesystem: fall back to logical sizing.
+            Err(e)
+                if e.raw_os_error() == Some(95)              // EOPNOTSUPP
+                    || e.raw_os_error() == Some(38)          // ENOSYS
+                    || e.raw_os_error() == Some(22)          // EINVAL (flags/fs)
+                    || e.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                tracing::debug!("physical preallocation unsupported; logical fallback");
+                Ok(())
+            }
+            // Real errors (ENOSPC, EPERM, ...) surface to the job.
             Err(e) => Err(SinkError(DownloadError::from_io(&e))),
         }
     }
@@ -313,6 +365,14 @@ impl Sink for FileSink {
         let Some(file) = self.file.as_mut() else {
             return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
         };
+        // Sequential fallback path (nonsegmented use, design D1): requires
+        // exclusive handle ownership; worker capabilities hold clones and
+        // use the positional adapter instead.
+        let Some(file) = Arc::get_mut(file) else {
+            return Err(SinkError(DownloadError::SinkWrite(
+                "sink handle is shared with write-only worker capabilities".into(),
+            )));
+        };
         // Positional write without a shared seek pointer (§14.2): seek to
         // the absolute offset then write; each call states its position
         // explicitly rather than relying on prior state.
@@ -329,15 +389,14 @@ impl Sink for FileSink {
                 "injected output-session flush failure".into(),
             )));
         }
-        let Some(file) = self.file.as_mut() else {
+        let Some(file) = self.file.as_ref() else {
             return Err(SinkError(DownloadError::SinkWrite("sink closed".into())));
         };
+        // std::fs::File has no userspace buffer: PageCache is a no-op and
+        // FsyncFile/FsyncDir synchronize through the shared handle.
         if matches!(level, FlushLevel::FsyncFile | FlushLevel::FsyncDir) {
-            file.flush()?;
             file.sync_all()
                 .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
-        } else {
-            file.flush()?;
         }
         Ok(())
     }
@@ -416,7 +475,7 @@ mod tests {
     fn write_read_commit_roundtrip() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
             sink.write_at(0, b"hello").expect("write");
             sink.write_at(5, b" world").expect("write at 5");
             assert_eq!(sink.size().expect("size"), 11);
@@ -433,7 +492,7 @@ mod tests {
     #[test]
     fn abort_removes_temp_only() {
         let (dir, dest) = tmpdir();
-        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
         sink.write_at(0, b"x").expect("write");
         assert_eq!(sink.abort().expect("abort"), AbortDisposition::TempDeleted);
         assert!(!sink.temp_path().exists());
@@ -445,7 +504,7 @@ mod tests {
     fn drop_without_commit_cleans_temp() {
         let (dir, dest) = tmpdir();
         {
-            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false).expect("open");
+            let mut sink = FileSink::open(&dest, &TempFileSpec::default(), false, false).expect("open");
             sink.write_at(0, b"partial").expect("write");
             // Dropped without finalize/commit/abort.
         }
@@ -457,7 +516,7 @@ mod tests {
     #[test]
     fn preallocate_sets_size() {
         let (dir, dest) = tmpdir();
-        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), true).expect("open");
+        let mut sink = FileSink::open(&dest, &TempFileSpec::default(), true, false).expect("open");
         sink.prepare(Some(1024)).expect("prepare");
         assert_eq!(sink.size().expect("size"), 1024);
         sink.abort().expect("abort");
@@ -473,7 +532,7 @@ mod tests {
         std::fs::create_dir(&orphan_dir).expect("mkdir");
         let orphan_dest = orphan_dir.join("x.bin");
         let temp = dir.path().join("explicit.part");
-        let mut sink = FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false)
+        let mut sink = FileSink::open(&orphan_dest, &TempFileSpec::Explicit(temp.clone()), false, false)
             .expect("open");
         sink.write_at(0, b"data").expect("write");
         sink.finalize().expect("finalize");

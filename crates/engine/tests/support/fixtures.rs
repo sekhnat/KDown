@@ -83,3 +83,32 @@ pub fn file_sha256(path: &std::path::Path) -> String {
     std::io::copy(&mut reader, &mut h).expect("hash fixture output");
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Synthetic per-block fixture constants shared with the process-isolated
+/// fixture server and the benchmark matrix (task 1.3/1.4).
+pub const SYNTHETIC_BLOCK: usize = 4096;
+
+/// One synthetic block: the canonical xorshift run seeded with `seed ^ i`.
+/// Any range of any size is derivable without whole-file memory.
+#[must_use]
+pub fn synthetic_block_bytes(block_index: u64, seed: u64) -> Vec<u8> {
+    deterministic_bytes(SYNTHETIC_BLOCK as u64, seed ^ block_index)
+}
+
+/// Expected SHA-256 of the synthetic fixture content: block-wise hashing
+/// with no whole-file allocation (parity reference for the isolated server).
+#[must_use]
+pub fn synthetic_expected_sha256(len: u64, seed: u64) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let mut block_index = 0u64;
+    let mut remaining = len;
+    while remaining > 0 {
+        let block = synthetic_block_bytes(block_index, seed);
+        let take = (block.len() as u64).min(remaining) as usize;
+        h.update(&block[..take]);
+        remaining -= take as u64;
+        block_index += 1;
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}

@@ -2,9 +2,14 @@
 //!
 //! Scenario set (§37.1-§37.3): localhost HTTP/1.1, localhost HTTP/2
 //! (ALPN over self-signed TLS, trusted via a custom CA bundle), varying
-//! worker counts, preallocation on/off. Records wall time, achieved
-//! throughput, process CPU time, peak RSS, connection count, and
-//! retransferred (`wasted`) bytes per scenario.
+//! worker counts, preallocation on/off.
+//!
+//! Every scenario emits a [`ResourceRecord`] built from the engine's real
+//! counters (task 1.1): unique completed bytes (useful goodput numerator),
+//! network wire bytes, reused checkpoint bytes and wasted/retransmitted
+//! bytes. Retransferred bytes are never derived from warning counts. The
+//! record verifies final size, content hash and atomic publication per run
+//! (task 1.2) and reports useful goodput and wire throughput separately.
 //!
 //! `criterion` provides the timing loop for the small end (throughput
 //! stability) and the harness also emits a §37.3 record per scenario run.
@@ -17,8 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{black_box, Criterion, Throughput};
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsConfig};
 use kdown_engine::http::transport::HttpTransport;
@@ -35,6 +39,11 @@ pub mod fixtures {
     // Fixture helpers for the bench harness (duplicated from tests/support
     // so benches stay independent of the tests tree).
     use std::path::Path;
+
+    /// Synthetic block size: content bytes are a pure function of the
+    /// block index, so arbitrary ranges (including multi-GiB matrices and a
+    /// process-isolated server) are servable without whole-file memory.
+    pub const SYNTHETIC_BLOCK: usize = 4096;
 
     /// Deterministic fixture bytes shared with integration tests
     /// (xorshift generator duplicated from tests/support so benches stay
@@ -55,6 +64,13 @@ pub mod fixtures {
         out
     }
 
+    /// One synthetic block (task 1.3): a xorshift run seeded by the block
+    /// index, deterministic across processes and runs.
+    #[must_use]
+    pub fn synthetic_block_bytes(block_index: u64, seed: u64) -> Vec<u8> {
+        deterministic_bytes(SYNTHETIC_BLOCK as u64, seed ^ block_index)
+    }
+
     /// SHA-256 hex of a completed file (baseline verification).
     #[must_use]
     pub fn file_sha256(path: &Path) -> String {
@@ -65,21 +81,111 @@ pub mod fixtures {
         std::io::copy(&mut r, &mut h).expect("hash");
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    /// SHA-256 hex of in-memory bytes (expected-hash computation for the
+    /// deterministic fixture).
+    #[must_use]
+    pub fn bytes_sha256(content: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(content);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Fixture content behind the bench servers: in-memory (small smoke
+    /// fixtures) or synthetic (block-derived; serves any range of any size
+    /// without allocating the whole file).
+    #[derive(Clone)]
+    pub enum ContentSource {
+        InMemory(std::sync::Arc<Vec<u8>>),
+        /// `len` bytes derived from per-block xorshift runs (`seed`).
+        Synthetic { len: u64, seed: u64 },
+    }
+
+    impl ContentSource {
+        /// Content length in bytes.
+        #[allow(clippy::len_without_is_empty)]
+        #[must_use]
+        pub fn len(&self) -> u64 {
+            match self {
+                Self::InMemory(v) => v.len() as u64,
+                Self::Synthetic { len, .. } => *len,
+            }
+        }
+
+        /// Read the inclusive byte range `[start, end]`.
+        #[must_use]
+        pub fn read_range(&self, start: u64, end: u64) -> Vec<u8> {
+            debug_assert!(end >= start);
+            match self {
+                Self::InMemory(v) => v[start as usize..=(end as usize)].to_vec(),
+                Self::Synthetic { seed, .. } => {
+                    let mut out = Vec::with_capacity((end - start + 1) as usize);
+                    let mut off = start;
+                    while off <= end {
+                        let block_index = off / SYNTHETIC_BLOCK as u64;
+                        let block = synthetic_block_bytes(block_index, *seed);
+                        let in_block = (off % SYNTHETIC_BLOCK as u64) as usize;
+                        let take = (SYNTHETIC_BLOCK - in_block)
+                            .min((end - off + 1) as usize);
+                        out.extend_from_slice(&block[in_block..in_block + take]);
+                        off += take as u64;
+                    }
+                    out
+                }
+            }
+        }
+
+        /// Expected SHA-256 of the full content, computed block-wise for
+        /// synthetic sources (no whole-file allocation).
+        #[must_use]
+        pub fn sha256(&self) -> String {
+            use sha2::{Digest, Sha256};
+            match self {
+                Self::InMemory(v) => bytes_sha256(v),
+                Self::Synthetic { len, seed } => {
+                    let mut h = Sha256::new();
+                    let mut block_index = 0u64;
+                    let mut remaining = *len;
+                    while remaining > 0 {
+                        let block = synthetic_block_bytes(block_index, *seed);
+                        let take = (block.len() as u64).min(remaining) as usize;
+                        h.update(&block[..take]);
+                        remaining -= take as u64;
+                        block_index += 1;
+                    }
+                    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+                }
+            }
+        }
+    }
 }
 
-use fixtures::deterministic_bytes as fixture_bytes;
+use fixtures::ContentSource;
 
-/// Deterministic fixture generator shared with integration tests.
-fn fixture() -> Arc<Vec<u8>> {
-    Arc::new(fixture_bytes(FIXTURE_BYTES, 0xBEEF))
+/// Deterministic in-memory fixture generator shared with integration tests.
+fn fixture() -> ContentSource {
+    ContentSource::InMemory(std::sync::Arc::new(fixtures::deterministic_bytes(
+        FIXTURE_BYTES,
+        0xBEEF,
+    )))
 }
+
+/// Deterministic synthetic fixture: any size, tiny resident cost (task 1.3).
+fn synthetic_fixture(len: u64) -> ContentSource {
+    ContentSource::Synthetic {
+        len,
+        seed: 0xBEEF,
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Benchmark HTTP servers
 // ---------------------------------------------------------------------------
 
 /// HTTP/1.1 plaintext fixture server: serves `/f.bin` with correct ranges.
-async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
+async fn start_h1_server(content: ContentSource) -> std::net::SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -105,25 +211,34 @@ async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
                     // one desyncs keep-alive connections and poisons pool
                     // reuse for the next request.
                     let is_head = req.starts_with("HEAD");
+                    // Header names are case-insensitive (RFC 9110 §5.1).
                     let range = req
                         .lines()
-                        .find_map(|l| l.strip_prefix("Range: bytes="))
-                        .and_then(parse_range);
-                    let (status, body, extra) = match range {
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            if !name.eq_ignore_ascii_case("range") {
+                                return None;
+                            }
+                            let value = value.trim().strip_prefix("bytes=")?;
+                            value.split_once('-')
+                        })
+                        .and_then(|(s, e)| {
+                            Some((s.trim().parse::<u64>().ok()?, e.trim().parse::<u64>().ok()?))
+                        });
+                    let (status, extra, range) = match range {
                         Some((s, e)) => {
-                            let s = s as usize;
-                            let end = (e as usize).min(content.len() - 1);
+                            let end = e.min(content.len() - 1);
                             (
                                 "206 Partial Content",
-                                content[s..=end].to_vec(),
                                 format!("content-range: bytes {s}-{end}/{}\r\n", content.len()),
+                                Some((s, end)),
                             )
                         }
-                        None => ("200 OK", (*content).clone(), String::new()),
+                        None => ("200 OK", String::new(), Some((0, content.len() - 1))),
                     };
+                    let body_len = range.map_or(0, |(s, e)| e - s + 1);
                     let head = format!(
-                        "HTTP/1.1 {status}\r\n{extra}etag: \"bench\"\r\naccept-ranges: bytes\r\ncontent-length: {}\r\n\r\n",
-                        body.len()
+                        "HTTP/1.1 {status}\r\n{extra}etag: \"bench\"\r\naccept-ranges: bytes\r\ncontent-length: {body_len}\r\n\r\n",
                     );
                     if socket.write_all(head.as_bytes()).await.is_err() {
                         return;
@@ -132,8 +247,21 @@ async fn start_h1_server(content: Arc<Vec<u8>>) -> std::net::SocketAddr {
                     if is_head {
                         continue;
                     }
-                    if socket.write_all(&body).await.is_err() {
-                        return;
+                    // Stream in bounded chunks (task 1.3): never materialize
+                    // the whole range server-side, whatever its size.
+                    if let Some((s, e)) = range {
+                        let mut off = s;
+                        while off <= e {
+                            let take = (e - off + 1).min(64 * 1024);
+                            if socket
+                                .write_all(&content.read_range(off, off + take - 1))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            off += take;
+                        }
                     }
                 }
             });
@@ -149,7 +277,16 @@ fn parse_range(v: &str) -> Option<(u64, u64)> {
 
 /// HTTPS/2 (or HTTP/1.1 via ALPN) fixture server with a self-signed
 /// certificate; returns `(addr, ca_pem)`.
-async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Vec<u8>) {
+async fn start_h2_tls_server(content: ContentSource) -> (std::net::SocketAddr, Vec<u8>) {
+    start_h2_tls_server_paced(content, None).await
+}
+
+/// Paced variant: optional per-64KiB-chunk delay (shaped comparisons,
+/// task 9.4).
+async fn start_h2_tls_server_paced(
+    content: ContentSource,
+    pacing: Option<Duration>,
+) -> (std::net::SocketAddr, Vec<u8>) {
     use tokio_rustls::rustls;
 
     let cert =
@@ -196,25 +333,57 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
                                     .get("range")
                                     .and_then(|v| v.to_str().ok())
                                     .and_then(parse_range);
-                                let (status, body, cr) = match range {
+                                let (status, range, cr) = match range {
                                     Some((s, e)) => {
-                                        let end = e.min(content.len() as u64 - 1);
+                                        let end = e.min(content.len() - 1);
                                         (
                                             206,
-                                            content[s as usize..=(end as usize)].to_vec(),
+                                            Some((s, end)),
                                             Some(format!("bytes {s}-{end}/{}", content.len())),
                                         )
                                     }
-                                    None => (200, (*content).clone(), None),
+                                    None => (200, Some((0, content.len() - 1)), None),
                                 };
+                                let body_len = range.map_or(0, |(s, e)| e - s + 1);
                                 let mut resp = hyper::Response::builder()
                                     .status(status)
-                                    .header("content-length", body.len())
+                                    .header("content-length", body_len)
                                     .header("etag", "\"bench-h2\"");
                                 if let Some(cr) = cr {
                                     resp = resp.header("content-range", cr);
                                 }
-                                resp.body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                // Stream in bounded chunks (task 1.3): never
+                                // materialize the whole range server-side.
+                                let (tx, rx) = tokio::sync::mpsc::channel::<Result<
+                                    hyper::body::Frame<hyper::body::Bytes>,
+                                    std::convert::Infallible,
+                                >>(4);
+                                tokio::spawn(async move {
+                                    if let Some((s, e)) = range {
+                                        let mut off = s;
+                                        while off <= e {
+                                            let take = (e - off + 1).min(64 * 1024);
+                                            if let Some(pacing) = pacing {
+                                                tokio::time::sleep(pacing).await;
+                                            }
+                                            let chunk = content.read_range(off, off + take - 1);
+                                            if tx
+                                                .send(Ok(hyper::body::Frame::data(
+                                                    hyper::body::Bytes::from(chunk),
+                                                )))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            off += take;
+                                        }
+                                    }
+                                });
+                                let body = http_body_util::StreamBody::new(
+                                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                                );
+                                resp.body(body)
                                     .map(Ok::<_, std::convert::Infallible>)
                                     .expect("response body")
                             }
@@ -230,18 +399,64 @@ async fn start_h2_tls_server(content: Arc<Vec<u8>>) -> (std::net::SocketAddr, Ve
 }
 
 // ---------------------------------------------------------------------------
-// Resource measurement (§37.3)
+// Resource measurement (§37.3) — real counter accounting (task 1.1)
 // ---------------------------------------------------------------------------
 
+/// Per-scenario resource record. Byte-labeled fields come from the engine's
+/// real `JobCounters` counters via [`DownloadResult`]; the warning count is
+/// never reported as bytes.
 #[derive(Debug, Clone)]
 struct ResourceRecord {
     wall: Duration,
-    bytes: u64,
-    throughput_mib_s: f64,
+    /// Unique newly completed file bytes — the useful-goodput numerator.
+    completed_bytes: u64,
+    /// Wire bytes received from the network (retries inflate this).
+    network_bytes: u64,
+    /// Bytes reused from a checkpoint (never counted as network bytes).
+    reused_bytes: u64,
+    /// Retransmitted/wasted network bytes (real counter, not warnings.len()).
+    retransferred_bytes: u64,
+    retries: u64,
     cpu_percent: f64,
     peak_rss_kib: u64,
-    retransferred_bytes: u64,
+    /// Context switches during the run (voluntary + nonvoluntary delta).
+    context_switches: u64,
     connections: Option<u64>,
+    /// Verification (task 1.2): atomic publication happened.
+    published: bool,
+    /// Verification: final size matches the fixture.
+    size_ok: bool,
+    /// Verification: final content hash matches the fixture.
+    hash_ok: bool,
+}
+
+impl ResourceRecord {
+    /// Useful goodput: unique completed bytes per second (MiB/s).
+    #[must_use]
+    pub fn useful_goodput_mib_s(&self) -> f64 {
+        self.completed_bytes as f64 / self.wall.as_secs_f64().max(f64::EPSILON) / (1024.0 * 1024.0)
+    }
+
+    /// Wire throughput: network bytes per second (MiB/s), including
+    /// retransmit overhead.
+    #[must_use]
+    pub fn wire_throughput_mib_s(&self) -> f64 {
+        self.network_bytes as f64 / self.wall.as_secs_f64().max(f64::EPSILON) / (1024.0 * 1024.0)
+    }
+
+    /// Verification status string: `ok` when published, size and hash all
+    /// match; otherwise lists what failed.
+    #[must_use]
+    pub fn verification(&self) -> String {
+        if self.published && self.size_ok && self.hash_ok {
+            "ok".to_string()
+        } else {
+            format!(
+                "published={} size_ok={} hash_ok={}",
+                self.published, self.size_ok, self.hash_ok
+            )
+        }
+    }
 }
 
 fn cpu_time() -> Duration {
@@ -256,6 +471,23 @@ fn cpu_time() -> Duration {
         })
         .unwrap_or(0);
     Duration::from_millis(ticks * 10) // assume 100 Hz
+}
+
+/// Cumulative voluntary + nonvoluntary context switches of this process
+/// (/proc/self/status). Callers take before/after deltas around a run.
+fn context_switches() -> u64 {
+    let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let voluntary = text
+        .lines()
+        .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let nonvoluntary = text
+        .lines()
+        .find_map(|l| l.strip_prefix("nonvoluntary_ctxt_switches:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    voluntary + nonvoluntary
 }
 
 fn peak_rss_kib() -> u64 {
@@ -275,18 +507,40 @@ fn clock_ticks_per_sec() -> f64 {
     100.0
 }
 
-/// Run one download and return the §37.3 record.
+/// Verify a completed download's size, hash and publication against the
+/// fixture (task 1.2).
+fn verify_output(
+    result: &DownloadResult,
+    expected_size: u64,
+    expected_hash: &str,
+) -> (bool, bool, bool) {
+    let published = result.status == ResultStatus::Completed && result.final_path.is_some();
+    let Some(path) = result.final_path.as_ref() else {
+        return (published, false, false);
+    };
+    let size_ok = std::fs::metadata(path)
+        .map(|m| m.len() == expected_size)
+        .unwrap_or(false);
+    let hash_ok = size_ok && fixtures::file_sha256(path) == expected_hash;
+    (published, size_ok, hash_ok)
+}
+
+/// Run one download and return the §37.3 record with real-counter byte
+/// accounting (task 1.1) and hash/size/publication verification (task 1.2).
 async fn measure_download(
     name: &str,
     cfg: &EngineConfig,
     url: String,
     dest_dir: &std::path::Path,
+    expected_size: u64,
+    expected_hash: &str,
     conn_probe: Option<&Arc<AtomicUsize>>,
 ) -> (DownloadResult, ResourceRecord) {
     let transport = HttpTransport::from_config(cfg).expect("transport");
     let controller = SingleStreamController::new(transport, cfg.clone());
     let dest = dest_dir.join(format!("{name}.bin"));
     let cpu0 = cpu_time();
+    let ctx0 = context_switches();
     let wall0 = Instant::now();
     let result = controller
         .run(DownloadRequest::new(url, dest))
@@ -295,41 +549,97 @@ async fn measure_download(
     let wall = wall0.elapsed();
     let cpu = cpu_time().saturating_sub(cpu0);
     let hz = clock_ticks_per_sec();
-    let bytes = result.bytes_downloaded_from_network;
+    let _ = hz;
+    let (published, size_ok, hash_ok) = verify_output(&result, expected_size, expected_hash);
     let record = ResourceRecord {
         wall,
-        bytes,
-        throughput_mib_s: if wall.as_secs_f64() > 0.0 {
-            bytes as f64 / wall.as_secs_f64() / (1024.0 * 1024.0)
-        } else {
-            0.0
-        },
+        // Real counters (task 1.1): unique completed, wire network, reused,
+        // wasted/retransferred bytes and retries. Never warnings.len().
+        completed_bytes: result.completed_bytes,
+        network_bytes: result.bytes_downloaded_from_network,
+        reused_bytes: result.bytes_reused_from_checkpoint,
+        retransferred_bytes: result.wasted_bytes,
+        retries: result.retries,
         cpu_percent: if wall.as_secs_f64() > 0.0 {
             (cpu.as_secs_f64() / wall.as_secs_f64()) * 100.0
         } else {
             0.0
         },
         peak_rss_kib: peak_rss_kib(),
-        retransferred_bytes: result.warnings.len() as u64,
+        context_switches: context_switches().saturating_sub(ctx0),
         connections: conn_probe.map(|c| c.load(Ordering::SeqCst) as u64),
+        published,
+        size_ok,
+        hash_ok,
     };
-    let _ = hz;
     (result, record)
 }
 
 fn fmt_record(name: &str, r: &ResourceRecord) -> String {
     format!(
-        "| {name} | {} | {:.2} | {:.2} | {:.1}% | {} KiB | {} | {:?} |",
-        r.bytes,
-        r.throughput_mib_s,
+        "| {name} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        r.useful_goodput_mib_s(),
+        r.wire_throughput_mib_s(),
+        r.completed_bytes,
+        r.network_bytes,
+        r.reused_bytes,
+        r.retransferred_bytes,
+        r.retries,
         r.wall.as_secs_f64(),
         r.cpu_percent,
         r.peak_rss_kib,
-        r.retransferred_bytes,
-        r.connections
+        r.context_switches,
+        r.connections.map_or_else(|| "n/r".into(), |c| c.to_string()),
+        r.verification()
     )
 }
 
+const RECORD_HEADER: &str = "| Scenario | Goodput (MiB/s) | Wire (MiB/s) | Completed | Network | Reused | Retransferred | Retries | Wall | CPU | Peak RSS | Ctx Switches | Connections | Verify |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
+
+/// Emit the scenario report to stderr (criterion captures stdout) and the
+/// results file so before/after comparisons (task 2.4) have an artifact.
+fn emit_report(group: &str, records: &[(String, ResourceRecord)]) {
+    let mut out = format!(
+        "# {group} resource records (task 1.1/1.2)\n\n{RECORD_HEADER}\n"
+    );
+    for (name, r) in records {
+        out.push_str(&fmt_record(name, r));
+        out.push('\n');
+    }
+    eprintln!("{out}");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/results")
+        .join(group);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("records.md"), &out);
+}
+
+/// Run one measured scenario download and return its record (task 1.1: real
+/// counters; task 1.2: hash/size/publication verification).
+fn record_scenario(
+    name: &str,
+    rt: &tokio::runtime::Runtime,
+    cfg: &EngineConfig,
+    url: &str,
+    expected_hash: &str,
+    conn_probe: Option<&Arc<AtomicUsize>>,
+) -> ResourceRecord {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (result, record) = rt.block_on(async {
+        measure_download(
+            name,
+            cfg,
+            url.to_string(),
+            dir.path(),
+            FIXTURE_BYTES,
+            expected_hash,
+            conn_probe,
+        )
+        .await
+    });
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    record
+}
 // ---------------------------------------------------------------------------
 // Criterion benchmarks
 // ---------------------------------------------------------------------------
@@ -341,6 +651,7 @@ fn bench_h1_throughput(c: &mut Criterion) {
         .build()
         .expect("runtime");
     let content = rt.block_on(async { fixture() });
+    let expected_hash = content.sha256();
     let addr = rt.block_on(start_h1_server(content.clone()));
     let url = format!("http://{addr}/f.bin");
 
@@ -348,6 +659,7 @@ fn bench_h1_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(FIXTURE_BYTES));
     group.sample_size(10);
 
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
     for workers in [1u32, 4] {
         let mut cfg = EngineConfig::default();
         cfg.transfer.segmentation_threshold = if workers > 1 { 1 } else { u64::MAX };
@@ -373,8 +685,13 @@ fn bench_h1_throughput(c: &mut Criterion) {
                 })
             });
         });
+        records.push((
+            format!("h1/workers_{workers}"),
+            record_scenario(&format!("workers_{workers}"), &rt, &cfg, &url, &expected_hash, None),
+        ));
     }
     group.finish();
+    emit_report("h1", &records);
 }
 
 fn bench_h2_throughput(c: &mut Criterion) {
@@ -384,6 +701,7 @@ fn bench_h2_throughput(c: &mut Criterion) {
         .build()
         .expect("runtime");
     let content = rt.block_on(async { fixture() });
+    let expected_hash = content.sha256();
     let (addr, ca_pem) = rt.block_on(start_h2_tls_server(content.clone()));
     let url = format!("https://localhost:{}/f.bin", addr.port());
 
@@ -395,6 +713,7 @@ fn bench_h2_throughput(c: &mut Criterion) {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, &ca_pem).expect("write ca");
 
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
     for workers in [1u32, 4] {
         let mut cfg = EngineConfig::default();
         cfg.tls.custom_ca_bundle = Some(ca_path.clone());
@@ -422,8 +741,13 @@ fn bench_h2_throughput(c: &mut Criterion) {
                 })
             });
         });
+        records.push((
+            format!("h2/workers_{workers}"),
+            record_scenario(&format!("workers_{workers}"), &rt, &cfg, &url, &expected_hash, None),
+        ));
     }
     group.finish();
+    emit_report("h2", &records);
 }
 
 fn bench_prealloc(c: &mut Criterion) {
@@ -433,6 +757,7 @@ fn bench_prealloc(c: &mut Criterion) {
         .build()
         .expect("runtime");
     let content = rt.block_on(async { fixture() });
+    let expected_hash = content.sha256();
     let addr = rt.block_on(start_h1_server(content.clone()));
     let url = format!("http://{addr}/f.bin");
 
@@ -440,6 +765,7 @@ fn bench_prealloc(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(FIXTURE_BYTES));
     group.sample_size(10);
 
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
     for prealloc in [true, false] {
         let mut cfg = EngineConfig::default();
         cfg.transfer.preallocate_output = prealloc;
@@ -463,8 +789,20 @@ fn bench_prealloc(c: &mut Criterion) {
                 })
             });
         });
+        records.push((
+            format!("prealloc_{prealloc}"),
+            record_scenario(
+                &format!("prealloc_{prealloc}"),
+                &rt,
+                &cfg,
+                &url,
+                &expected_hash,
+                None,
+            ),
+        ));
     }
     group.finish();
+    emit_report("prealloc", &records);
 }
 
 fn assert_completed(r: &DownloadResult) -> &DownloadResult {
@@ -472,42 +810,569 @@ fn assert_completed(r: &DownloadResult) -> &DownloadResult {
     r
 }
 
-criterion_group!(
-    benches,
-    bench_h1_throughput,
-    bench_h2_throughput,
-    bench_prealloc
-);
-criterion_main!(benches);
+// ---------------------------------------------------------------------------
+// Smoke vs manual scenario matrices (task 1.3)
+// ---------------------------------------------------------------------------
+
+/// Matrix protocol axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    H1,
+    H2,
+}
+
+impl Protocol {
+    fn label(self) -> &'static str {
+        match self {
+            Self::H1 => "h1",
+            Self::H2 => "h2",
+        }
+    }
+}
+
+/// Matrix mode: the smoke grid runs in CI-sized time (one measured run per
+/// scenario, synthetic fixture — no huge allocations); the manual grid adds
+/// multi-GiB sizes and 16-worker runs for workstation use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixMode {
+    Smoke,
+    Manual,
+}
+
+impl MatrixMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smoke => "matrix-smoke",
+            Self::Manual => "matrix-manual",
+        }
+    }
+}
+
+struct MatrixScenario {
+    size: u64,
+    protocol: Protocol,
+    workers: u32,
+}
+
+fn size_label(size: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if size % GIB == 0 {
+        format!("{}GiB", size / GIB)
+    } else {
+        format!("{}MiB", size / MIB)
+    }
+}
+
+/// Smoke grid: 32 MiB/256 MiB/1 GiB × H1/H2 × 1/2/4/8 workers.
+/// Manual grid: multi-GiB (2/4 GiB) × H1/H2 × 1/2/4/8/16 workers.
+fn matrix_scenarios(mode: MatrixMode) -> Vec<MatrixScenario> {
+    let mib = 1024u64 * 1024;
+    let gib = 1024 * mib;
+    let (sizes, workers): (&[u64], &[u32]) = match mode {
+        MatrixMode::Smoke => (&[32 * mib, 256 * mib, gib], &[1, 2, 4, 8]),
+        MatrixMode::Manual => (&[2 * gib, 4 * gib], &[1, 2, 4, 8, 16]),
+    };
+    let mut out = Vec::new();
+    for &size in sizes {
+        for &protocol in &[Protocol::H1, Protocol::H2] {
+            for &workers in workers {
+                out.push(MatrixScenario {
+                    size,
+                    protocol,
+                    workers,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Run one matrix end-to-end with a single measured (non-criterion) run per
+/// scenario, verifying size/hash/publication, and record the results file.
+fn run_matrix(mode: MatrixMode) {
+    // Enough executor threads for the largest worker count plus I/O lanes.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(12)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    let scenario_list: Vec<MatrixScenario> = matrix_scenarios(mode);
+    for s in scenario_list {
+        let label = format!(
+            "{}/{}/{}/workers_{}",
+            mode.label(),
+            s.protocol.label(),
+            size_label(s.size),
+            s.workers,
+        );
+        records.push((
+            label.clone(),
+            rt.block_on(async {
+                // Synthetic content: block-derived bytes, no whole-file
+                // allocation in either the server or the client.
+                let content = synthetic_fixture(s.size);
+                let expected_hash = content.sha256();
+                let mut cfg = EngineConfig::default();
+                if s.workers > 1 {
+                    cfg.transfer.segmentation_threshold = 1;
+                } else {
+                    cfg.transfer.segmentation_threshold = u64::MAX;
+                }
+                cfg.transfer.max_workers = s.workers;
+                cfg.transfer.min_workers = s.workers.min(2);
+                cfg.network.response_header_timeout = Duration::from_secs(30);
+                cfg.network.read_idle_timeout = Duration::from_secs(30);
+                let (url, _ca_dir) = if s.protocol == Protocol::H1 {
+                    let addr = start_h1_server(content.clone()).await;
+                    (format!("http://{addr}/f.bin"), None)
+                } else {
+                    let (addr, ca_pem) = start_h2_tls_server(content.clone()).await;
+                    let dir = tempfile::tempdir().expect("ca tmpdir");
+                    let ca_path = dir.path().join("ca.pem");
+                    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+                    cfg.tls.custom_ca_bundle = Some(ca_path);
+                    cfg.h2_policy = H2ConnectionPolicy::Single;
+                    (
+                        format!("https://localhost:{}/f.bin", addr.port()),
+                        Some(dir),
+                    )
+                };
+                let (result, record) = measure_download(
+                    "matrix",
+                    &cfg,
+                    url,
+                    // Destination on the default temp filesystem (tmpfs in CI).
+                    tempfile::tempdir().expect("dest tmpdir").path(),
+                    s.size,
+                    &expected_hash,
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    result.status,
+                    ResultStatus::Completed,
+                    "{label}: {:?}",
+                    result.error
+                );
+                assert!(
+                    record.published && record.size_ok && record.hash_ok,
+                    "{label}: verification failed: {}",
+                    record.verification()
+                );
+                record
+            }),
+        ));
+    }
+    emit_report(mode.label(), &records);
+}
+
+fn main() {
+    // Matrix modes (task 1.3) intercept the criterion CLI: opt-in via
+    // `--matrix-smoke` (CI-bounded grid) or `--matrix-manual` (multi-GiB and
+    // 16-worker runs). Default remains the criterion smoke scenarios.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--matrix-smoke") {
+        run_matrix(MatrixMode::Smoke);
+        return;
+    }
+    if args.iter().any(|a| a == "--matrix-manual") {
+        run_matrix(MatrixMode::Manual);
+        return;
+    }
+    // Fixed vs opt-in adaptive comparison (task 9.4): shaped and
+    // unconstrained server cases on H1/H2.
+    if args.iter().any(|a| a == "--adaptive-compare") {
+        run_adaptive_compare();
+        return;
+    }
+    // Target-sizing sweep (task 6.3): explicit initial sizes × automatic
+    // oversubscription factors × H1/H2, recording useful goodput and
+    // request/retry overhead to benches/results/sweep/records.md.
+    if args.iter().any(|a| a == "--sweep") {
+        run_sweep();
+        return;
+    }
+    // Client-only mode against a process-isolated fixture server (task 1.4):
+    // the server runs as a separate process, so CPU/RSS/connections recorded
+    // here are the client's alone. Usage:
+    //   throughput --isolated 127.0.0.1:PORT --isolated-size 1GiB \
+    //     [--isolated-seed 0] [--isolated-workers 4] [--isolated-label name]
+    if let Some(addr) = args.iter().position(|a| a == "--isolated").map(|i| args[i + 1].clone()) {
+        run_isolated_client(
+            addr,
+            arg_value(&args, "--isolated-size"),
+            arg_value(&args, "--isolated-seed")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            arg_value(&args, "--isolated-workers")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            arg_value(&args, "--isolated-label")
+                .unwrap_or_else(|| "isolated".to_string()),
+        );
+        return;
+    }
+    let mut criterion = criterion::Criterion::default().configure_from_args();
+    bench_h1_throughput(&mut criterion);
+    bench_h2_throughput(&mut criterion);
+    bench_prealloc(&mut criterion);
+    criterion.final_summary();
+}
+
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Run one client download against a running isolated fixture server and
+/// record client-only resources (task 1.4).
+fn run_isolated_client(addr: String, size: Option<String>, seed: u64, workers: u32, label: String) {
+    let Some(size_str) = size else {
+        eprintln!("--isolated requires --isolated-size (e.g. 1GiB)");
+        std::process::exit(2);
+    };
+    let Some(size) = parse_size_arg(&size_str) else {
+        eprintln!("--isolated-size must parse (e.g. 32MiB, 1GiB): {size_str}");
+        std::process::exit(2);
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let record = rt.block_on(async {
+        // Same generator as the isolated server: the client derives the
+        // expected digest locally and verifies the received file.
+        let expected_hash = fixtures::ContentSource::Synthetic { len: size, seed }.sha256();
+        let mut cfg = EngineConfig::default();
+        if workers > 1 {
+            cfg.transfer.segmentation_threshold = 1;
+        } else {
+            cfg.transfer.segmentation_threshold = u64::MAX;
+        }
+        cfg.transfer.max_workers = workers;
+        cfg.transfer.min_workers = workers.min(2);
+        cfg.network.response_header_timeout = Duration::from_secs(30);
+        cfg.network.read_idle_timeout = Duration::from_secs(30);
+        let dir = tempfile::tempdir().expect("dest tmpdir");
+        let (result, record) = measure_download(
+            "isolated",
+            &cfg,
+            format!("http://{addr}/f.bin"),
+            dir.path(),
+            size,
+            &expected_hash,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+        assert!(
+            record.published && record.size_ok && record.hash_ok,
+            "isolated client verification failed: {}",
+            record.verification()
+        );
+        record
+    });
+    emit_report(&format!("isolated/{label}"), &[(format!("isolated/{label}"), record)]);
+}
+
+/// Target-sizing sweep (task 6.3): one measured run per configuration over
+/// explicit initial sizes {4, 8, 16} MiB and automatic oversubscription
+/// {2, 3, 4} at 4 workers, on H1 and H2, 256 MiB fixture. Records useful
+/// goodput, wire bytes (duplication overhead proxy) and retries.
+fn run_sweep() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let fixture_size = 256 * mib;
+    let workers = 4u32;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for &target_mib in &[4u64, 8, 16] {
+            records.push((
+                format!("sweep/{protocol}/explicit-{target_mib}MiB"),
+                sweep_run(
+                    &rt, protocol, fixture_size, workers,
+                    Some(target_mib * mib), 0,
+                ),
+            ));
+        }
+        for &factor in &[2u64, 3, 4] {
+            records.push((
+                format!("sweep/{protocol}/auto-x{factor}"),
+                sweep_run(&rt, protocol, fixture_size, workers, None, factor),
+            ));
+        }
+    }
+    emit_report("sweep", &records);
+}
+
+/// Fixed vs opt-in adaptive concurrency (task 9.4): one measured run per
+/// configuration over {unconstrained, shaped (per-connection 16 MiB/s
+/// pacing)} × {h1, h2} × {fixed-4, adaptive(1-4)}. Records useful goodput,
+/// wire overhead and worker stability to benches/results/adaptive-compare/.
+fn run_adaptive_compare() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 256 * mib;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for shaped in [false, true] {
+            let shape_label = if shaped { "shaped" } else { "unshaped" };
+            records.push((
+                format!("compare/{protocol}/{shape_label}/fixed-4"),
+                compare_run(&rt, protocol, size, shaped, false),
+            ));
+            records.push((
+                format!("compare/{protocol}/{shape_label}/adaptive-1-4"),
+                compare_run(&rt, protocol, size, shaped, true),
+            ));
+        }
+    }
+    emit_report("adaptive-compare", &records);
+}
+
+/// One comparison run; adaptive mode probes 1..=4 workers on useful goodput.
+fn compare_run(
+    rt: &tokio::runtime::Runtime,
+    protocol: &str,
+    size: u64,
+    shaped: bool,
+    adaptive: bool,
+) -> ResourceRecord {
+    rt.block_on(async {
+        let content = synthetic_fixture(size);
+        let expected_hash = content.sha256();
+        let mut cfg = EngineConfig::default();
+        cfg.transfer.segmentation_threshold = 1;
+        cfg.transfer.max_workers = 4;
+        cfg.transfer.min_workers = 1;
+        cfg.transfer.max_segment_size = 8 * 1024 * 1024;
+        if adaptive {
+            cfg.transfer.concurrency_mode =
+                kdown_engine::config::ConcurrencyMode::Adaptive;
+        }
+        cfg.network.response_header_timeout = Duration::from_secs(30);
+        cfg.network.read_idle_timeout = Duration::from_secs(30);
+        // Per-connection pacing shapes the server (16 MiB/s per 64 KiB chunk
+        // delay ≈ the isolated server's throttle behavior).
+        let pacing = if shaped {
+            Some(Duration::from_micros(4_000))
+        } else {
+            None
+        };
+        let (url, _ca) = if protocol == "h1" {
+            let addr = start_h1_server_paced(content.clone(), pacing).await;
+            (format!("http://{addr}/f.bin"), None)
+        } else {
+            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing).await;
+            let dir = tempfile::tempdir().expect("ca tmpdir");
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::write(&ca_path, &ca_pem).expect("write ca");
+            cfg.tls.custom_ca_bundle = Some(ca_path);
+            cfg.h2_policy = H2ConnectionPolicy::Single;
+            (
+                format!("https://localhost:{}/f.bin", addr.port()),
+                Some(dir),
+            )
+        };
+        let dir = tempfile::tempdir().expect("dest tmpdir");
+        let (result, record) = measure_download(
+            "compare",
+            &cfg,
+            url,
+            dir.path(),
+            size,
+            &expected_hash,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+        assert!(
+            record.published && record.size_ok && record.hash_ok,
+            "adaptive-compare verification failed: {}",
+            record.verification()
+        );
+        record
+    })
+}
+
+/// HTTP/1.1 fixture server with optional per-chunk pacing (shaped cases).
+async fn start_h1_server_paced(content: ContentSource, pacing: Option<Duration>) -> std::net::SocketAddr {
+    // Reuse the unpaced server when no shaping is requested.
+    let Some(pacing) = pacing else {
+        return start_h1_server(content).await;
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let content = content.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_head = req.starts_with("HEAD");
+                    let range = req
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            if !name.eq_ignore_ascii_case("range") {
+                                return None;
+                            }
+                            let value = value.trim().strip_prefix("bytes=")?;
+                            value.split_once('-')
+                        })
+                        .and_then(|(s, e)| {
+                            Some((s.trim().parse::<u64>().ok()?, e.trim().parse::<u64>().ok()?))
+                        });
+                    let (status, extra, range) = match range {
+                        Some((s, e)) => {
+                            let end = e.min(content.len() - 1);
+                            (
+                                "206 Partial Content",
+                                format!("content-range: bytes {s}-{end}/{}\r\n", content.len()),
+                                Some((s, end)),
+                            )
+                        }
+                        None => ("200 OK", String::new(), Some((0, content.len() - 1))),
+                    };
+                    let body_len = range.map_or(0, |(s, e)| e - s + 1);
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\n{extra}etag: \"bench-paced\"\r\naccept-ranges: bytes\r\ncontent-length: {body_len}\r\n\r\n",
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if is_head {
+                        continue;
+                    }
+                    if let Some((s, e)) = range {
+                        let mut off = s;
+                        while off <= e {
+                            let take = (e - off + 1).min(64 * 1024);
+                            tokio::time::sleep(pacing).await;
+                            if socket
+                                .write_all(&content.read_range(off, off + take - 1))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            off += take;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// One sweep run; `explicit_target_bytes` set → Explicit sizing, otherwise
+/// `oversubscription` drives Automatic sizing.
+#[allow(clippy::too_many_arguments)]
+fn sweep_run(
+    rt: &tokio::runtime::Runtime,
+    protocol: &str,
+    size: u64,
+    workers: u32,
+    explicit_target_bytes: Option<u64>,
+    oversubscription: u64,
+) -> ResourceRecord {
+    rt.block_on(async {
+        let content = synthetic_fixture(size);
+        let expected_hash = content.sha256();
+        let mut cfg = EngineConfig::default();
+        cfg.transfer.segmentation_threshold = 1;
+        cfg.transfer.max_workers = workers;
+        cfg.transfer.min_workers = workers.min(2);
+        if let Some(target) = explicit_target_bytes {
+            cfg.transfer.segment_sizing =
+                kdown_engine::config::SegmentSizing::Explicit;
+            cfg.transfer.initial_segment_size = target.clamp(
+                cfg.transfer.min_segment_size,
+                cfg.transfer.max_segment_size,
+            );
+        } else {
+            cfg.transfer.segment_sizing =
+                kdown_engine::config::SegmentSizing::Automatic;
+            cfg.transfer.auto_oversubscription = oversubscription;
+        }
+        cfg.network.response_header_timeout = Duration::from_secs(30);
+        cfg.network.read_idle_timeout = Duration::from_secs(30);
+        let (url, _ca) = if protocol == "h1" {
+            let addr = start_h1_server(content.clone()).await;
+            (format!("http://{addr}/f.bin"), None)
+        } else {
+            let (addr, ca_pem) = start_h2_tls_server(content.clone()).await;
+            let dir = tempfile::tempdir().expect("ca tmpdir");
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::write(&ca_path, &ca_pem).expect("write ca");
+            cfg.tls.custom_ca_bundle = Some(ca_path);
+            cfg.h2_policy = H2ConnectionPolicy::Single;
+            (
+                format!("https://localhost:{}/f.bin", addr.port()),
+                Some(dir),
+            )
+        };
+        let dir = tempfile::tempdir().expect("dest tmpdir");
+        let (result, record) = measure_download(
+            "sweep",
+            &cfg,
+            url,
+            dir.path(),
+            size,
+            &expected_hash,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+        assert!(
+            record.published && record.size_ok && record.hash_ok,
+            "sweep verification failed: {}",
+            record.verification()
+        );
+        record
+    })
+}
+
+/// Size parsing for the client mode (mirrors the server binary).
+fn parse_size_arg(v: &str) -> Option<u64> {
+    let lower = v.trim().to_ascii_lowercase();
+    let (num, unit): (&str, u64) = if let Some(n) = lower.strip_suffix("kib") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix("mib") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("gib") {
+        (n, 1024 * 1024 * 1024)
+    } else {
+        (lower.as_str(), 1)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * unit)
+}
 
 // Keep unused-import warnings away: ProxyConfig and TlsConfig are part of
 // the scenario matrix documented for §37 (proxy/TLS scenarios land with
 // their hardening tasks).
 #[allow(unused)]
 fn _scenario_docs(_p: ProxyConfig, _t: TlsConfig) {}
-
-#[allow(unused)]
-fn _fmt_record_alive() -> String {
-    fmt_record(
-        "x",
-        &ResourceRecord {
-            wall: Duration::ZERO,
-            bytes: 0,
-            throughput_mib_s: 0.0,
-            cpu_percent: 0.0,
-            peak_rss_kib: 0,
-            retransferred_bytes: 0,
-            connections: None,
-        },
-    )
-}
-
-#[allow(unused)]
-fn _measure_alive(cfg: &EngineConfig, url: String, dir: &std::path::Path) {
-    std::mem::drop(measure_download("x", cfg, url, dir, None));
-}
-
-#[allow(unused)]
-fn _bytes_alive(b: &Bytes) -> usize {
-    b.len()
-}

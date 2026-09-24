@@ -1,15 +1,25 @@
 //! Crate-private owner for one temporary output's open handle and partial-file policy.
+//!
+//! The session is the sole lifecycle owner of the temp file (design D1,
+//! task 2.2): it prepares, synchronizes, aborts and publishes. During
+//! segmented transfer it lends bounded, cloneable **write-only** capabilities
+//! over the shared immutable file handle — each capability writes complete
+//! buffers at absolute offsets through the checked positional adapter, with
+//! no shared cursor, no output-wide lock and no flush authority. The owner
+//! cannot reclaim, close or publish until every writer capability has been
+//! dropped (`reclaim_exclusive` fails closed otherwise).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Mutex as AsyncMutex;
-
-#[cfg(test)]
-use super::fault_script::{self, OutputFaultScript, OutputOperation};
+use super::positional::write_all_at;
 use super::sink::{AbortDisposition, FileSink, FlushLevel, Sink, SinkError, TempFileSpec};
 use crate::error::DownloadError;
 use crate::io::publish::PublishMode;
+
+#[cfg(test)]
+use super::fault_script::{self, OutputFaultScript, OutputOperation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PartialArtifactDisposition {
@@ -21,23 +31,98 @@ enum PartialArtifactDisposition {
 ///
 /// A fresh session removes its partial file on drop. A reopened session keeps
 /// existing bytes unless the caller explicitly aborts it. During segmented
-/// transfer it lends bounded, cloneable write handles to the configured worker
-/// set, then regains exclusive access after all handles have been joined.
+/// transfer it lends write-only capabilities to the configured worker set,
+/// then regains exclusive access after all capabilities have been dropped.
 pub(crate) struct OutputSession {
     sink: Option<FileSink>,
-    shared_sink: Option<Arc<AsyncMutex<FileSink>>>,
+    /// Present while write-only capabilities are outstanding. Blocks every
+    /// exclusive operation until `reclaim_exclusive` observes zero writers.
+    shared: Option<SharedOutput>,
     temp_path: PathBuf,
     disposition: PartialArtifactDisposition,
     #[cfg(test)]
     script: Option<Arc<OutputFaultScript>>,
 }
 
-/// A worker-scoped, serialized write capability. Worker count and the transfer
-/// buffer budget bound outstanding writers and their in-flight payloads.
+/// Lend-state: the live-writer counter gates exclusive operations until
+/// every capability is dropped.
+struct SharedOutput {
+    writers_alive: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for SharedOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedOutput")
+            .field("writers_alive", &self.writers_alive.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+/// A worker-scoped, clonable write-only capability over the shared handle
+/// (task 2.2). It can positionally write complete buffers at absolute
+/// offsets; it cannot flush, synchronize, resize, abort or publish.
+/// Dropping the capability releases its lease on the handle.
 pub(crate) struct OutputWriteHandle {
-    sink: Arc<AsyncMutex<FileSink>>,
+    file: Arc<std::fs::File>,
+    writers_alive: Arc<AtomicUsize>,
     #[cfg(test)]
     script: Option<Arc<OutputFaultScript>>,
+}
+
+impl Drop for OutputWriteHandle {
+    fn drop(&mut self) {
+        self.writers_alive.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl OutputWriteHandle {
+    /// Synchronous positional write used by blocking writer lanes (task 2.3).
+    /// Scripted output faults apply at this capability boundary.
+    ///
+    /// # Errors
+    /// Structured sink error on write failure.
+    pub(crate) fn write_blocking(&self, offset: u64, bytes: &[u8]) -> Result<(), SinkError> {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            script.check(OutputOperation::Write).map_err(SinkError)?;
+        }
+        write_all_at(self.file.as_ref(), offset, bytes).map_err(SinkError::from)
+    }
+}
+
+/// Synchronization capability over the shared output file (task 3.3).
+/// Does not move any cursor and does not require exclusivity: concurrent
+/// positional writers keep writing while the sync flushes everything
+/// acknowledged so far.
+#[derive(Clone)]
+pub(crate) struct OutputSyncCapability {
+    file: Arc<std::fs::File>,
+    #[cfg(test)]
+    script: Option<Arc<OutputFaultScript>>,
+}
+
+impl std::fmt::Debug for OutputSyncCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputSyncCapability").finish_non_exhaustive()
+    }
+}
+
+impl OutputSyncCapability {
+    /// Synchronize the output file data (`sync_all`, matching the durable
+    /// `FlushLevel::FsyncFile` semantics of the sequential path).
+    ///
+    /// # Errors
+    /// Structured sink error when the synchronization fails; the caller must
+    /// not persist checkpoint coverage of unsynchronized data.
+    pub(crate) fn sync_data(&self) -> Result<(), SinkError> {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            script.check(OutputOperation::Flush).map_err(SinkError)?;
+        }
+        self.file
+            .sync_all()
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))
+    }
 }
 
 pub(crate) trait PartialArtifactOwner {
@@ -62,6 +147,7 @@ impl OutputSession {
         destination: &Path,
         spec: &TempFileSpec,
         preallocate: bool,
+        physical: bool,
         total_size: Option<u64>,
     ) -> Result<Self, SinkError> {
         let temp_path = spec.temp_path_for(destination);
@@ -71,11 +157,11 @@ impl OutputSession {
         if let Some(script) = &script {
             script.check(OutputOperation::Open).map_err(SinkError)?;
         }
-        let mut sink = FileSink::open(destination, spec, preallocate)?;
+        let mut sink = FileSink::open(destination, spec, preallocate, physical)?;
         sink.prepare(total_size)?;
         Ok(Self {
             sink: Some(sink),
-            shared_sink: None,
+            shared: None,
             temp_path,
             disposition: PartialArtifactDisposition::DeleteOnDrop,
             #[cfg(test)]
@@ -92,15 +178,29 @@ impl OutputSession {
         if let Some(script) = &script {
             script.check(OutputOperation::Open).map_err(SinkError)?;
         }
-        let mut sink = FileSink::open(destination, spec, false)?;
+        let mut sink = FileSink::open(destination, spec, false, false)?;
         sink.set_keep_on_drop(true);
         Ok(Self {
             sink: Some(sink),
-            shared_sink: None,
+            shared: None,
             temp_path,
             disposition: PartialArtifactDisposition::PreserveOnDrop,
             #[cfg(test)]
             script,
+        })
+    }
+
+    /// A durable-mode data-sync capability over the output file (design D1:
+    /// the owner keeps synchronization authority; during segmented transfer
+    /// the job coordinator holds this capability for pre-checkpoint syncs).
+    /// Syncs are safe while writers are live — `sync_all` flushes exactly the
+    /// writes acknowledged before the call.
+    pub(crate) fn sync_capability(&self) -> Result<OutputSyncCapability, SinkError> {
+        let sink = self.sink.as_ref().ok_or_else(shared_session_error)?;
+        Ok(OutputSyncCapability {
+            file: sink.shared_handle().ok_or_else(shared_session_error)?,
+            #[cfg(test)]
+            script: self.script.clone(),
         })
     }
 
@@ -112,49 +212,54 @@ impl OutputSession {
         }
     }
 
-    /// Lend the output to segmented workers. The session retains the owner token
-    /// and cannot perform synchronous I/O or finalize until it reclaims it.
+    /// Lend write-only capabilities to segmented workers (task 2.2). The
+    /// session retains lifecycle/sync ownership and cannot finalize, abort,
+    /// resize or publish until `reclaim_exclusive` succeeds.
     pub(crate) fn share_write_handles(
         &mut self,
         worker_count: usize,
     ) -> Result<Vec<OutputWriteHandle>, SinkError> {
-        if worker_count == 0 || self.shared_sink.is_some() {
+        if worker_count == 0 || self.shared.is_some() {
             return Err(shared_session_error());
         }
-        let Some(mut sink) = self.sink.take() else {
+        let Some(sink) = self.sink.as_ref() else {
             return Err(shared_session_error());
         };
-        sink.set_keep_on_drop(self.disposition == PartialArtifactDisposition::PreserveOnDrop);
-        let shared = Arc::new(AsyncMutex::new(sink));
-        self.shared_sink = Some(shared.clone());
+        let file = sink.shared_handle().ok_or_else(shared_session_error)?;
+        let writers_alive = Arc::new(AtomicUsize::new(0));
+        self.shared = Some(SharedOutput {
+            writers_alive: writers_alive.clone(),
+        });
         Ok((0..worker_count)
-            .map(|_| OutputWriteHandle {
-                sink: shared.clone(),
-                #[cfg(test)]
-                script: self.script.clone(),
+            .map(|_| {
+                writers_alive.fetch_add(1, Ordering::SeqCst);
+                OutputWriteHandle {
+                    file: file.clone(),
+                    writers_alive: writers_alive.clone(),
+                    #[cfg(test)]
+                    script: self.script.clone(),
+                }
             })
             .collect())
     }
 
-    /// Regain exclusive access. Fails closed while any worker still owns a
-    /// write handle, so callers cannot finalize an output during active writes.
+    /// Regain exclusive access. Fails closed while any writer capability is
+    /// still alive, so callers cannot finalize an output during active writes.
     pub(crate) fn reclaim_exclusive(&mut self) -> Result<(), SinkError> {
-        let Some(shared) = self.shared_sink.take() else {
+        let Some(shared) = self.shared.take() else {
             return Ok(());
         };
-        match Arc::try_unwrap(shared) {
-            Ok(sink) => {
-                self.sink = Some(sink.into_inner());
-                Ok(())
-            }
-            Err(shared) => {
-                self.shared_sink = Some(shared);
-                Err(shared_session_error())
-            }
+        if shared.writers_alive.load(Ordering::SeqCst) > 0 {
+            self.shared = Some(shared);
+            return Err(shared_session_error());
         }
+        Ok(())
     }
 
     fn sink_mut(&mut self) -> Result<&mut FileSink, SinkError> {
+        if self.shared.is_some() {
+            return Err(shared_session_error());
+        }
         self.sink.as_mut().ok_or_else(shared_session_error)
     }
 
@@ -200,24 +305,6 @@ impl OutputSession {
         self.sink_mut()
             .expect("session is exclusive")
             .fail_next_flush();
-    }
-}
-
-impl OutputWriteHandle {
-    pub(crate) async fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), SinkError> {
-        #[cfg(test)]
-        if let Some(script) = &self.script {
-            script.check(OutputOperation::Write).map_err(SinkError)?;
-        }
-        self.sink.lock().await.write_at(offset, bytes)
-    }
-
-    pub(crate) async fn flush(&self, level: FlushLevel) -> Result<(), SinkError> {
-        #[cfg(test)]
-        if let Some(script) = &self.script {
-            script.check(OutputOperation::Flush).map_err(SinkError)?;
-        }
-        self.sink.lock().await.flush(level)
     }
 }
 
@@ -300,7 +387,7 @@ mod tests {
         let destination = destination(&directory);
         let temp = temp_path(&destination);
         let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), true, Some(32))
+            OutputSession::create(&destination, &TempFileSpec::default(), true, false, Some(32))
                 .expect("fresh session");
 
         assert_eq!(session.size().expect("preallocated size"), 32);
@@ -321,7 +408,7 @@ mod tests {
         std::fs::write(&temp, b"prior").expect("seed partial");
 
         let mut session =
-            OutputSession::reopen(&destination, &TempFileSpec::default()).expect("reopen session");
+            shol_open(&destination).expect("reopen session");
         assert_eq!(session.size().expect("reopened size"), 5);
         session.write_at(5, b" resume").expect("append by offset");
         session.flush(FlushLevel::PageCache).expect("flush");
@@ -333,13 +420,17 @@ mod tests {
         );
     }
 
+    fn shol_open(destination: &Path) -> Result<OutputSession, SinkError> {
+        OutputSession::reopen(destination, &TempFileSpec::default())
+    }
+
     #[test]
     fn write_failure_uses_structured_error_and_fresh_drop_disposition() {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = destination(&directory);
         let temp = temp_path(&destination);
         let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, None)
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
                 .expect("fresh session");
         session.fail_next_write();
 
@@ -357,7 +448,7 @@ mod tests {
         let destination = destination(&directory);
         let temp = temp_path(&destination);
         let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, None)
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
                 .expect("fresh session");
         session.write_at(0, b"data").expect("write");
         session.fail_next_flush();
@@ -377,8 +468,7 @@ mod tests {
         let temp = temp_path(&destination);
         std::fs::write(&temp, b"prior").expect("seed partial");
 
-        let mut session =
-            OutputSession::reopen(&destination, &TempFileSpec::default()).expect("reopen session");
+        let mut session = shol_open(&destination).expect("reopen session");
         session.fail_next_write();
         let error = session
             .write_at(5, b"data")
@@ -389,20 +479,23 @@ mod tests {
         assert_eq!(std::fs::read(&temp).expect("preserved partial"), b"prior");
     }
 
+    /// Exclusive operations are blocked while any writer capability is alive;
+    /// dropping all capabilities restores reclaim/finalize/publish (task 2.2).
     #[tokio::test]
-    async fn worker_handles_must_be_released_before_session_can_finalize() {
+    async fn cannot_publish_while_writers_live() {
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = destination(&directory);
         let temp = temp_path(&destination);
         let mut session =
-            OutputSession::create(&destination, &TempFileSpec::default(), false, None)
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
                 .expect("fresh session");
         session.preserve_partial();
 
         let mut writers = session.share_write_handles(2).expect("share session");
-        let writer = writers.pop().expect("first worker handle");
-        let held_by_worker = writers.pop().expect("second worker handle");
-        writer.write_at(0, b"first").await.expect("worker write");
+        let second = writers.pop().expect("first worker handle");
+        let first = writers.pop().expect("second worker handle");
+
+        // Exclusive operations fail while writers are alive.
         assert!(session
             .finalize()
             .expect_err("cannot finalize while shared")
@@ -410,15 +503,71 @@ mod tests {
             .to_string()
             .contains("shared with worker handles"));
         assert!(session.reclaim_exclusive().is_err());
+        assert!(session.size().is_err());
+        assert!(session.flush(FlushLevel::PageCache).is_err());
 
-        held_by_worker
-            .write_at(5, b"-last")
-            .await
-            .expect("worker remains able to write");
-        drop(held_by_worker);
-        drop(writer);
-        session.reclaim_exclusive().expect("all workers joined");
+        // Both capabilities can write concurrently at disjoint offsets
+        // through their blocking writer lanes (task 2.3).
+        let lane1 = super::super::writer_lane::WriterLane::spawn(first);
+        let lane2 = super::super::writer_lane::WriterLane::spawn(second);
+        let (h1, h2) = (lane1.handle(), lane2.handle());
+        let (r1, r2) = tokio::join!(
+            h1.write(0, bytes::Bytes::from_static(b"first")),
+            h2.write(5, bytes::Bytes::from_static(b"-last")),
+        );
+        r1.expect("worker write 1");
+        r2.expect("worker write 2");
+        drop(h1);
+        drop(h2);
+
+        // Reclaim still fails while only ONE lane (capability) is alive.
+        lane1.shutdown().await.expect("join lane 1");
+        assert!(session.reclaim_exclusive().is_err(), "one writer remains");
+
+        lane2.shutdown().await.expect("join lane 2");
+        session.reclaim_exclusive().expect("all writers joined");
         session.finalize().expect("finalize after reclaim");
-        assert_eq!(std::fs::read(&temp).expect("assembled temp"), b"first-last");
+        assert_eq!(
+            std::fs::read(&temp).expect("assembled temp"),
+            b"first-last"
+        );
+    }
+
+    /// Write-only capabilities expose no flush/sync/size/abort authority:
+    /// the type simply has no such methods (compile-time separation), and
+    /// out-of-order disjoint positional writes land exactly (task 2.2/2.3).
+    #[tokio::test]
+    async fn capabilities_write_out_of_order_at_disjoint_offsets() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = destination(&directory);
+        let temp = temp_path(&destination);
+        let mut session =
+            OutputSession::create(&destination, &TempFileSpec::default(), false, false, None)
+                .expect("fresh session");
+        let mut writers = session.share_write_handles(3).expect("share session");
+        let lane_c = super::super::writer_lane::WriterLane::spawn(writers.pop().expect("cap c"));
+        let lane_b = super::super::writer_lane::WriterLane::spawn(writers.pop().expect("cap b"));
+        let lane_a = super::super::writer_lane::WriterLane::spawn(writers.pop().expect("cap a"));
+        // Out of order, unaligned, disjoint.
+        let (hc, hb, ha) = (lane_c.handle(), lane_b.handle(), lane_a.handle());
+        let (rc, rb, ra) = tokio::join!(
+            hc.write(11, bytes::Bytes::from_static(b"segment-c")),
+            hb.write(5, bytes::Bytes::from_static(b"-seg-b")),
+            ha.write(0, bytes::Bytes::from_static(b"seg-a")),
+        );
+        rc.expect("c");
+        rb.expect("b");
+        ra.expect("a");
+        drop(hc);
+        drop(hb);
+        drop(ha);
+        lane_a.shutdown().await.expect("join a");
+        lane_b.shutdown().await.expect("join b");
+        lane_c.shutdown().await.expect("join c");
+        session.reclaim_exclusive().expect("reclaim");
+        assert_eq!(
+            std::fs::read(&temp).expect("assembled"),
+            b"seg-a-seg-bsegment-c"
+        );
     }
 }

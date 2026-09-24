@@ -15,21 +15,101 @@ use crate::resume::checkpoint::ByteRange;
 use crate::scheduler::interval_set::IntervalSet;
 use crate::scheduler::lease::{LeaseId, SegmentLease};
 
-/// Scheduler shaping parameters (§12.2-§12.3).
+/// How initial lease sizes are chosen (task 6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSelector {
+    /// No target: carve up to `max_segment_size` (pre-change carving; used
+    /// by direct policy construction without sizing configuration).
+    None,
+    /// Explicit target: honor the configured `initial_segment_size`
+    /// (design D5: fix the ignored behavior; clamped to [min, max]).
+    Explicit(u64),
+    /// Opt-in automatic target (task 6.1, spec: initial candidate is
+    /// `ceil(remaining / (initial workers × oversubscription))` clamped to
+    /// bounds; remaining computed from validated intervals, not total).
+    Automatic {
+        initial_workers: u64,
+        oversubscription: u64,
+    },
+}
+
+/// Scheduler shaping parameters (§12.2-§12.3, task 6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerPolicy {
     pub min_segment_size: u64,
     pub max_segment_size: u64,
+    /// Initial-lease target selector (task 6.1).
+    pub target: TargetSelector,
+    /// Minimum tail worth splitting (task 6.2): scheduler-owned split
+    /// policy replaces the worker's hard-coded 256 KiB constant.
+    pub split_threshold: u64,
 }
 
 impl SchedulerPolicy {
+    /// Legacy constructor: no target (carve up to `max_segment_size`), the
+    /// 256 KiB split threshold.
     #[must_use]
     pub fn new(min_segment_size: u64, max_segment_size: u64) -> Self {
         let min = min_segment_size.max(1);
         Self {
             min_segment_size: min,
             max_segment_size: max_segment_size.max(min),
+            target: TargetSelector::None,
+            split_threshold: 256 * 1024,
         }
+    }
+
+    /// Full policy (task 6.1): explicit/automatic target plus split
+    /// threshold, clamped safely.
+    #[must_use]
+    pub fn with_target(
+        min_segment_size: u64,
+        max_segment_size: u64,
+        target: TargetSelector,
+        split_threshold: u64,
+    ) -> Self {
+        let mut policy = Self::new(min_segment_size, max_segment_size);
+        policy.target = target;
+        policy.split_threshold = split_threshold.max(1);
+        policy
+    }
+
+    /// The resolved target for a selector against `pending_bytes` of
+    /// remaining coverage (task 6.1). Computed once at initialization: the
+    /// automatic target derives from the INITIAL remaining (validated
+    /// intervals — including resumed state), never the total length.
+    #[must_use]
+    pub fn resolve_target(
+        min_segment_size: u64,
+        max_segment_size: u64,
+        target: &TargetSelector,
+        pending_bytes: u64,
+    ) -> Option<u64> {
+        let raw = match target {
+            TargetSelector::None => return None,
+            TargetSelector::Explicit(size) => *size,
+            TargetSelector::Automatic {
+                initial_workers,
+                oversubscription,
+            } => {
+                let workers = (*initial_workers)
+                    .max(1)
+                    .saturating_mul((*oversubscription).max(1));
+                // ceil(remaining / workers).
+                pending_bytes.max(1).div_ceil(workers.max(1))
+            }
+        };
+        Some(raw.clamp(min_segment_size, max_segment_size))
+    }
+
+    /// The target lease length for the next carve from a gap of `gap_len`
+    /// bytes (task 6.1): the resolved target clamped to the gap.
+    #[must_use]
+    fn target_len(&self, gap_len: u64, resolved_target: Option<u64>) -> u64 {
+        let raw = resolved_target.unwrap_or(self.max_segment_size);
+        raw.clamp(self.min_segment_size.min(gap_len), self.max_segment_size)
+            .min(gap_len)
+            .max(self.min_segment_size.min(gap_len))
     }
 }
 
@@ -46,6 +126,9 @@ pub struct SegmentScheduler {
     next_lease: LeaseId,
     generation: u64,
     policy: SchedulerPolicy,
+    /// The target resolved once at initialization (task 6.1); `None` =
+    /// carve up to max (legacy behavior).
+    resolved_target: Option<u64>,
 }
 
 impl SegmentScheduler {
@@ -69,6 +152,12 @@ impl SegmentScheduler {
         } else {
             IntervalSet::from_ranges(&completed.complement_within(total_size))
         };
+        let resolved_target = SchedulerPolicy::resolve_target(
+            policy.min_segment_size,
+            policy.max_segment_size,
+            &policy.target,
+            pending.len(),
+        );
         Self {
             total_size,
             pending,
@@ -77,6 +166,7 @@ impl SegmentScheduler {
             next_lease: 1,
             generation: 1,
             policy,
+            resolved_target,
         }
     }
 
@@ -101,12 +191,9 @@ impl SegmentScheduler {
     pub fn acquire(&mut self) -> Option<SegmentLease> {
         let gap = *self.pending.ranges().first()?;
         let gap_len = gap.1 - gap.0 + 1;
-        // Segment length: bounded by policy; the whole gap when small.
-        let want = self
-            .policy
-            .max_segment_size
-            .min(gap_len)
-            .max(self.policy.min_segment_size.min(gap_len));
+        // Segment length: the policy target (explicit or automatic, task
+        // 6.1), bounded by policy and the whole gap when small.
+        let want = self.policy.target_len(gap_len, self.resolved_target);
         let end = gap.0.saturating_add(want).saturating_sub(1).min(gap.1);
         let id = self.next_lease;
         self.next_lease += 1;
@@ -149,14 +236,38 @@ impl SegmentScheduler {
     /// durable_through)` with atomics on the chunk path; this pulls those
     /// into the scheduler at lease-boundary moments (complete/fail/split,
     /// checkpoint cadence). Cells for unknown/expired leases are skipped.
-    pub fn absorb_worker_progress(&mut self, cells: &[Arc<crate::job::segmented::LeaseProgress>]) {
-        for cell in cells {
-            let (id, generation, through) = cell.snapshot();
-            if id == 0 {
-                continue;
-            }
-            let _ = self.report_progress(id, generation, through);
-        }
+    pub fn absorb_worker_progress(
+        &mut self,
+        cells: &[Arc<crate::job::segmented::LeaseProgress>],
+    ) -> Vec<u64> {
+        cells
+            .iter()
+            .map(|cell| {
+                // One coherent record per cell (task 3.2): id, generation and
+                // written-through always come from the same publication.
+                let Some(record) = cell.snapshot() else {
+                    return 0;
+                };
+                let Some(before) = self.lease_next_offset(record.lease_id) else {
+                    return 0; // unknown/expired lease: skipped
+                };
+                if !self.report_progress(
+                    record.lease_id,
+                    record.generation,
+                    record.written_through,
+                ) {
+                    return 0; // stale generation: rejected, no coverage
+                }
+                let after = self
+                    .lease_next_offset(record.lease_id)
+                    .unwrap_or(before);
+                // The accepted delta (task 5.4): only bytes the scheduler
+                // ACCEPTED within the validated lease count as unique
+                // completed coverage — writes beyond a shrunk (split) lease
+                // end are clamped away here, never double-counted.
+                after.saturating_sub(before)
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -278,6 +389,39 @@ impl SegmentScheduler {
             }
         }
         self.generation
+    }
+
+    /// The live acknowledged frontier of an active lease (task 5.4: the
+    /// reconciliation's accepted-delta accounting needs the before/after).
+    #[must_use]
+    pub fn lease_next_offset(&self, lease_id: LeaseId) -> Option<u64> {
+        self.active.get(&lease_id).map(|l| l.next_offset)
+    }
+
+    /// Whether any lease is active — a direct state query that allocates
+    /// nothing (task 6.2; replaces `active_leases().is_empty()` idle checks).
+    #[must_use]
+    pub fn has_active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    /// Whether the scheduler is finished: no pending bytes and no active
+    /// leases (task 6.2, direct query).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.pending.is_empty() && self.active.is_empty()
+    }
+
+    /// The largest active lease whose tail exceeds `min_tail` — the direct
+    /// split-eligibility query (task 6.2): no allocating vector, no
+    /// worker-side max_by_key.
+    #[must_use]
+    pub fn largest_splittable(&self, min_tail: u64) -> Option<SegmentLease> {
+        self.active
+            .values()
+            .filter(|l| l.remaining() > min_tail.max(1))
+            .copied()
+            .max_by_key(SegmentLease::remaining)
     }
 
     /// All active leases (§31 active_ranges).
@@ -644,5 +788,186 @@ mod tests {
             .expect("lease");
         assert_eq!(after.next_offset, l.end + 1);
         assert_eq!(after.remaining(), 0);
+    }
+}
+
+#[cfg(test)]
+mod target_policy_tests {
+    use super::*;
+
+    /// Explicit target (task 6.1): the configured initial segment size is
+    /// honored — not silently replaced by max_segment_size.
+    #[test]
+    fn explicit_target_is_honored() {
+        let mib = 1024u64 * 1024;
+        let mut s = SegmentScheduler::initialize(
+            100 * mib,
+            &[],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Explicit(8 * mib),
+                256 * 1024,
+            ),
+        );
+        let lease = s.acquire().expect("lease");
+        assert_eq!(
+            lease.end - lease.start + 1,
+            8 * mib,
+            "initial leases use the explicit target, not max"
+        );
+        // A shorter remaining gap takes the whole gap.
+        let mut s2 = SegmentScheduler::initialize(
+            4 * mib,
+            &[],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Explicit(8 * mib),
+                256 * 1024,
+            ),
+        );
+        let l2 = s2.acquire().expect("lease");
+        assert_eq!(l2.end - l2.start + 1, 4 * mib, "short gap: whole gap");
+    }
+
+    /// Automatic target (task 6.1): ceil(remaining / (workers ×
+    /// oversubscription)), clamped to bounds, computed from validated
+    /// remaining intervals — enabling multiple work units per worker.
+    #[test]
+    fn automatic_target_derives_from_remaining_and_workers() {
+        let mib = 1024u64 * 1024;
+        // 40 MiB remaining, 4 workers × 3 oversubscription → ceil(40/12) ≈ 3.4 MiB.
+        let mut s = SegmentScheduler::initialize(
+            40 * mib,
+            &[],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Automatic {
+                    initial_workers: 4,
+                    oversubscription: 3,
+                },
+                256 * 1024,
+            ),
+        );
+        let lease = s.acquire().expect("lease");
+        let len = lease.end - lease.start + 1;
+        assert!(
+            len >= 3 * mib && len <= 4 * mib,
+            "target ≈ ceil(40 MiB / 12) = 3.4 MiB, got {len}"
+        );
+        // Multiple work units per active worker: 40 MiB / 3.4 MiB ≈ 12 leases.
+        let mut count = 1u64;
+        while s.acquire().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 12, "oversubscription enables multiple units/worker");
+    }
+
+    /// Automatic target on a resumed job derives from the REMAINING
+    /// intervals, not the total length (task 6.1, spec: validated intervals).
+    #[test]
+    fn automatic_target_uses_remaining_after_resume() {
+        let mib = 1024u64 * 1024;
+        // 100 MiB job, first 50 MiB already completed (resumed): remaining 50 MiB.
+        let mut s = SegmentScheduler::initialize(
+            100 * mib,
+            &[(0, 50 * mib - 1)],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Automatic {
+                    initial_workers: 4,
+                    oversubscription: 3,
+                },
+                256 * 1024,
+            ),
+        );
+        let lease = s.acquire().expect("lease");
+        let len = lease.end - lease.start + 1;
+        // ceil(50 MiB / 12) ≈ 4.27 MiB — NOT ceil(100/12) ≈ 8.7 MiB.
+        assert!(
+            len > 4 * mib && len < 5 * mib,
+            "target derives from remaining 50 MiB, got {len}"
+        );
+    }
+
+    /// Automatic target clamps to the segment bounds for tiny and huge jobs.
+    #[test]
+    fn automatic_target_clamps_to_bounds() {
+        let mib = 1024u64 * 1024;
+        // Tiny job: derived target < min → clamped up to min.
+        let mut small = SegmentScheduler::initialize(
+            2 * mib,
+            &[],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Automatic {
+                    initial_workers: 8,
+                    oversubscription: 3,
+                },
+                256 * 1024,
+            ),
+        );
+        let l = small.acquire().expect("lease");
+        assert_eq!(
+            l.end - l.start + 1,
+            mib,
+            "tiny job: derived target < min clamps up to min (bounds respected)"
+        );
+        // Huge job: derived target > max → clamped down to max.
+        let mut huge = SegmentScheduler::initialize(
+            1000 * mib,
+            &[],
+            SchedulerPolicy::with_target(
+                mib,
+                64 * mib,
+                TargetSelector::Automatic {
+                    initial_workers: 1,
+                    oversubscription: 3,
+                },
+                256 * 1024,
+            ),
+        );
+        let h = huge.acquire().expect("lease");
+        assert_eq!(h.end - h.start + 1, 64 * mib, "huge job: clamped to max");
+    }
+
+    /// Split eligibility is a scheduler-owned direct query (task 6.2): the
+    /// largest splittable lease respects the policy threshold without
+    /// allocating lease vectors.
+    #[test]
+    fn largest_splittable_respects_policy_threshold() {
+        let mut s = SegmentScheduler::initialize(10_000, &[], SchedulerPolicy::new(1, 4_000));
+        let lease = s.acquire().expect("lease");
+        // Tail ≤ threshold: not splittable.
+        assert!(s.largest_splittable(lease.remaining()).is_none());
+        assert!(s.largest_splittable(lease.remaining() - 1).is_some());
+        // The query returns the lease with the most remaining bytes.
+        let other = s.acquire().expect("second lease");
+        s.report_progress(other.id, other.generation, other.end - 100);
+        let biggest = s.largest_splittable(1).expect("splittable");
+        assert_eq!(
+            biggest.id, lease.id,
+            "the untouched lease has more remaining"
+        );
+    }
+
+    /// is_finished (task 6.2): no pending and no active — the direct idle
+    /// exit condition.
+    #[test]
+    fn is_finished_tracks_completion() {
+        let mut s = SegmentScheduler::initialize(1000, &[], SchedulerPolicy::new(1, 400));
+        assert!(!s.is_finished());
+        let lease = s.acquire().expect("lease");
+        assert!(!s.is_finished(), "active lease + pending");
+        s.complete(lease.id, lease.generation);
+        assert!(!s.is_finished(), "pending work remains");
+        while let Some(l) = s.acquire() {
+            s.complete(l.id, l.generation);
+        }
+        assert!(s.is_finished(), "all done");
     }
 }

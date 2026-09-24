@@ -77,3 +77,41 @@ RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
 See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
 mapping and [`crates/engine/benches/results/baseline.md`](crates/engine/benches/results/baseline.md)
 for the loopback benchmark baseline.
+
+## Segmented transfer tuning and durability
+
+Defaults are production-safe and unchanged from earlier releases:
+
+- **Checkpoint cadence** — one job-level coordinator saves acknowledged
+  progress every `checkpoint_flush_interval` (2 s default) and at pause
+  boundaries; saves are coalesced (unchanged snapshots are skipped) and
+  never run on the network chunk path.
+- **Durability boundaries** — `transfer.durability = Performance` (default)
+  records page-cache-acknowledged writes; `Durable` synchronizes the output
+  file BEFORE the corresponding ranges are persisted (a failed sync never
+  advances the checkpoint). Checkpoint coverage never leads the promised
+  durability.
+- **Segment sizing** — `transfer.segment_sizing = Explicit` (default) honors
+  `initial_segment_size` (8 MiB default) for initial leases, clamped to
+  `[min_segment_size, max_segment_size]`; opt-in
+  `segment_sizing = Automatic` derives the target from remaining coverage
+  divided by (initial workers × `auto_oversubscription`, default 3).
+- **Concurrency** — `transfer.concurrency_mode = Fixed` (default) keeps the
+  configured fixed worker count; opt-in `Adaptive` starts at `min_workers`
+  and probes upward on useful (unique-byte) goodput with hysteresis and
+  cooldown. Manual `set_concurrency` (clamped to
+  `[min_workers, max_workers]`) overrides the controller for the job's
+  remainder. HTTP/2 connection policy is independent of stream-worker
+  concurrency.
+- **Memory** — the transfer path writes received Hyper `Bytes` straight to
+  positional writes (one outstanding frame per worker, no pooled copies).
+  `buffer_pool_max_bytes` bounds the public `BufferPool` only, NOT Hyper's
+  internal ingress buffers.
+- **Preallocation** — `preallocate_output` sizes the temp file logically
+  (`set_len`); opt-in `preallocate_physical` attempts an fallocate-style
+  reservation where supported and falls back silently elsewhere. Real
+  out-of-space/permission failures always surface as errors; allocation is
+  never required for correctness.
+
+See `docs/benchmark-profiling.md` for benchmark/profiling procedures and
+recorded results.

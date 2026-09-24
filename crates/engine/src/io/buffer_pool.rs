@@ -94,32 +94,40 @@ impl BufferPool {
         self.outstanding() * self.buffer_size
     }
 
-    /// Try to take a buffer without blocking.
+    /// Try to take a buffer WITHOUT blocking (task 10.2): `None` when the
+    /// pool is at its byte budget with nothing idle — the caller decides
+    /// how to wait. Never allocates beyond the budget, never blocks.
     #[must_use]
     pub fn try_acquire(self: &Arc<Self>) -> Option<PooledBuffer> {
         let mut st = self.state.lock().expect("pool lock");
+        // Genuine exhaustion: at hard budget with an empty park.
+        if st.idle.is_empty() && st.allocated >= self.max_buffers {
+            return None;
+        }
         Some(self.acquire_inner(&mut st))
     }
 
-    /// Take a buffer, blocking until one is available.
+    /// Take a buffer, waiting async-safely when the pool is exhausted
+    /// (task 10.2): the wait happens in ONE blocking task on the condvar —
+    /// never a polling loop on the async executor.
     pub async fn acquire(self: &Arc<Self>) -> PooledBuffer {
-        // Async-friendly: typical path is instant; when the pool is at
-        // budget and empty, wait via a short blocking sleep loop on a
-        // background thread.
-        loop {
-            {
-                let mut st = self.state.lock().expect("pool lock");
-                if st.allocated < self.max_buffers || !st.idle.is_empty() {
-                    return self.acquire_inner(&mut st);
-                }
+        // Fast path: available right now (no extra task).
+        {
+            let mut st = self.state.lock().expect("pool lock");
+            if st.allocated < self.max_buffers || !st.idle.is_empty() {
+                return self.acquire_inner(&mut st);
             }
-            tokio::task::spawn_blocking({
-                let pool = Arc::clone(self);
-                move || pool.block_until_available()
-            })
-            .await
-            .expect("blocking task");
         }
+        // Exhausted: wait on the condvar in ONE blocking task (async-safe —
+        // the executor thread never blocks), then take the woken buffer.
+        tokio::task::spawn_blocking({
+            let pool = Arc::clone(self);
+            move || pool.block_until_available()
+        })
+        .await
+        .expect("blocking task");
+        let mut st = self.state.lock().expect("pool lock");
+        self.acquire_inner(&mut st)
     }
 
     fn block_until_available(&self) {
@@ -137,10 +145,8 @@ impl BufferPool {
         let buf = match st.idle.pop() {
             Some(b) => b,
             None => {
-                // Fresh allocation; hard budget check.
-                if st.allocated >= self.max_buffers {
-                    return PooledBuffer::exhausted();
-                }
+                // Fresh allocation; the hard budget was checked by the
+                // caller (try_acquire/acquire never call here exhausted).
                 st.allocated += 1;
                 BytesMut::with_capacity(self.buffer_size)
             }
@@ -165,15 +171,6 @@ impl BufferPool {
 }
 
 impl PooledBuffer {
-    /// Sentinel handed out when the pool is at hard budget with nothing
-    /// idle; `len() == 0`, writing to it panics, and it holds no pool.
-    fn exhausted() -> PooledBuffer {
-        PooledBuffer {
-            pool: None,
-            buf: None,
-        }
-    }
-
     fn attach(mut self, pool: &Arc<BufferPool>) -> PooledBuffer {
         self.pool = Some(BufferPoolGuard(pool.clone()));
         self
@@ -229,11 +226,13 @@ mod tests {
         }
         assert_eq!(pool.outstanding(), 8);
         assert_eq!(pool.bytes_outstanding(), 1024 * 1024);
-        // Budget exhausted: fresh acquisition returns the exhausted
-        // sentinel (no buffer allocated).
-        let sentinel = pool.try_acquire().expect("try_acquire always yields");
-        assert_eq!(sentinel.len(), 0);
-        assert_eq!(pool.outstanding(), 8, "sentinel allocates nothing");
+        // Budget exhausted: try_acquire is GENUINELY nonblocking and
+        // returns None (task 10.2) — no sentinel, no wait.
+        assert!(
+            pool.try_acquire().is_none(),
+            "exhausted pool reports None immediately"
+        );
+        assert_eq!(pool.outstanding(), 8, "exhaustion allocates nothing");
 
         // Release one -> immediately reusable, still within budget.
         held.pop().expect("held");
@@ -241,8 +240,8 @@ mod tests {
         let again = pool.try_acquire().expect("reuse after release");
         assert!(again.is_empty() || again.len() <= pool.buffer_size());
         assert_eq!(pool.outstanding(), 8);
-        let sentinel2 = pool.try_acquire().expect("sentinel when exhausted");
-        assert_eq!(sentinel2.len(), 0);
+        // Budget exhausted again: None (never blocks).
+        assert!(pool.try_acquire().is_none(), "re-exhausted pool: None");
         assert_eq!(pool.outstanding(), 8);
     }
 
