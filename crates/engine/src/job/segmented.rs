@@ -85,9 +85,17 @@ pub struct SegmentedJob {
     /// Throttle events (429/503-style responses) observed by any worker
     /// (task 9.2's controller sampling).
     throttle_events: AtomicU64,
-    /// Last positional-write acknowledgment latency, in microseconds
-    /// (task 9.2's controller sampling).
-    write_latency_us: AtomicU64,
+    /// Writer acknowledgement-latency histogram (task 4.1): per-window
+    /// p50/p95 for the adaptive controller instead of a last-value sample.
+    ack_latency: crate::metrics::histogram::LatencyHistogram,
+    /// Outstanding-write depth histogram sampled at submit time (task 4.1).
+    queue_depth: crate::metrics::histogram::DepthHistogram,
+    /// Worker time blocked waiting for write-byte budget, in microseconds
+    /// (task 4.1).
+    budget_wait_us: AtomicU64,
+    /// Test-only capture of adaptive controller window samples (task 4.1).
+    #[cfg(test)]
+    adaptive_samples: std::sync::Mutex<Vec<crate::control::adaptive::WindowSample>>,
     /// Live-tail split events observed by this job (task 0.4 observability):
     /// every successful `split_tail` increments this counter.
     splits: AtomicU64,
@@ -348,17 +356,77 @@ impl SegmentedJob {
         self.ready_work_factor.max(1).saturating_mul(desired.max(1))
     }
 
-    /// Worker idle ratio over the currently desired workers (task 9.2):
-    /// the fraction holding no lease right now.
-    fn worker_idle_ratio(&self) -> f64 {
-        let desired = self.desired_workers().max(1) as usize;
-        let idle = self
-            .worker_progress
-            .iter()
-            .take(desired)
-            .filter(|cell| cell.snapshot().is_none())
-            .count();
-        idle as f64 / desired as f64
+    /// Actual active/idle worker counts (task 4.1): active workers hold a
+    /// lease right now; idle workers are provisioned and parked without one.
+    /// Dormant workers above the desired count hold no capacity and are not
+    /// counted. The controller weights these counts by interval so a
+    /// momentary sample cannot stand in for a whole window.
+    fn worker_activity_counts(&self) -> (u64, u64) {
+        let mut active = 0u64;
+        let mut idle = 0u64;
+        for state in &self.worker_states {
+            match state.load(Ordering::Relaxed) {
+                2 => active += 1,
+                1 => idle += 1,
+                _ => {}
+            }
+        }
+        (active, idle)
+    }
+
+    /// Record one writer acknowledgement-latency sample (task 4.1).
+    fn record_ack_latency(&self, latency: Duration) {
+        self.ack_latency
+            .record_us(u64::try_from(latency.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    /// Record the outstanding-write depth observed at submit time (task 4.1).
+    fn record_queue_depth(&self, depth: u64) {
+        self.queue_depth.record(depth);
+    }
+
+    /// Accumulate worker time blocked on write-byte budget (task 4.1).
+    fn add_budget_wait(&self, wait: Duration) {
+        let us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
+        self.budget_wait_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Total worker microseconds blocked on write-byte budget (task 4.1).
+    #[must_use]
+    pub fn budget_wait_us(&self) -> u64 {
+        self.budget_wait_us.load(Ordering::Relaxed)
+    }
+
+    /// Writer acknowledgement-latency samples recorded so far (task 4.1).
+    #[must_use]
+    pub fn ack_latency_samples(&self) -> u64 {
+        self.ack_latency.samples()
+    }
+
+    /// Outstanding-write depth samples recorded so far (task 4.1).
+    #[must_use]
+    pub fn queue_depth_samples(&self) -> u64 {
+        self.queue_depth.samples()
+    }
+
+    /// Test-only capture of the controller's window samples (task 4.1): lets
+    /// in-module tests assert the inputs the controller actually saw.
+    #[cfg(test)]
+    pub(crate) fn adaptive_sample_log(&self) -> Vec<crate::control::adaptive::WindowSample> {
+        self.adaptive_samples
+            .lock()
+            .map(|samples| samples.clone())
+            .unwrap_or_default()
+    }
+
+    /// Cumulative acknowledgement-latency bucket snapshot (task 4.1).
+    fn ack_latency_snapshot(&self) -> crate::metrics::histogram::BucketSnapshot {
+        self.ack_latency.snapshot()
+    }
+
+    /// Cumulative outstanding-depth bucket snapshot (task 4.1).
+    fn queue_depth_snapshot(&self) -> crate::metrics::histogram::BucketSnapshot {
+        self.queue_depth.snapshot()
     }
 
     /// Whether a manual override is active (task 9.3).
@@ -662,7 +730,11 @@ pub(crate) async fn run_segmented(
         desired_workers: AtomicU64::new(desired),
         manual_override: AtomicBool::new(false),
         throttle_events: AtomicU64::new(0),
-        write_latency_us: AtomicU64::new(0),
+        ack_latency: crate::metrics::histogram::LatencyHistogram::new(),
+        queue_depth: crate::metrics::histogram::DepthHistogram::new(),
+        budget_wait_us: AtomicU64::new(0),
+        #[cfg(test)]
+        adaptive_samples: std::sync::Mutex::new(Vec::new()),
         splits: AtomicU64::new(0),
         segment_requests: AtomicU64::new(0),
         last_checkpoint_save_us: AtomicU64::new(0),
@@ -1696,11 +1768,12 @@ async fn consume_legacy_body(
                 lane.write(abs_offset, owned.clone())
                     .await
                     .map_err(|se| WorkerError::Fatal(se.0))?;
-                // Write-ack latency for the controller's sampling (task 9.2).
-                job.write_latency_us.store(
-                    u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
+                // Write-ack latency and submit-time queue depth for the
+                // controller's window sampling (task 4.1). The legacy lane
+                // holds exactly one outstanding payload per worker, so its
+                // observed depth is 1 by construction.
+                job.record_ack_latency(write_started.elapsed());
+                job.record_queue_depth(1);
                 in_range_offset += owned.len() as u64;
 
                 // Hot-path progress (§13.3, task 6.3): publish the
@@ -1803,12 +1876,10 @@ async fn settle_completion(
         success,
     ) {
         CompletionStatus::Acknowledged { through } => {
-            // Write-ack latency for the controller's sampling (task 9.2).
+            // Write-ack latency for the controller's window sampling
+            // (task 4.1): every acknowledged write contributes one sample.
             if let Some(elapsed) = latency {
-                job.write_latency_us.store(
-                    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
+                job.record_ack_latency(elapsed);
             }
             // Hot-path progress (§13.3): publish the acknowledged
             // contiguous frontier as one coherent record (task 3.2) —
@@ -1930,6 +2001,9 @@ async fn consume_pipelined_body(
         // the next frame BEFORE polling the body, bounded by the worker
         // read-ahead so a fast connection cannot outrun a slow sink.
         if reservation.is_none() {
+            // Byte-budget wait (task 4.1): the read-ahead wait loop plus the
+            // reservation acquisition, both of which are storage backpressure.
+            let wait_started = Instant::now();
             let quantum = writer.frame_quantum;
             loop {
                 let held: u64 = writer
@@ -1967,6 +2041,7 @@ async fn consume_pipelined_body(
                 }
             }
             reservation = Some(writer.budget.reserve(quantum).await);
+            job.add_budget_wait(wait_started.elapsed());
         }
 
         let event = tokio::select! {
@@ -2082,6 +2157,8 @@ async fn consume_pipelined_body(
                 writer
                     .reservations
                     .insert((lease.id, abs_offset), (frame, std::time::Instant::now()));
+                // Outstanding depth at submit time (task 4.1).
+                job.record_queue_depth(writer.reservations.len() as u64);
                 in_range_offset += chunk_len;
                 if spanned_boundary {
                     // The chunk was truncated at the inclusive lease end:
@@ -2269,10 +2346,74 @@ async fn coordinator_loop(
     }
 }
 
+/// Counter deltas for one adaptive window (task 4.1): unique newly
+/// completed bytes (checkpoint-reused bytes are never part of
+/// `completed_bytes`), wire receipts, waste and retries. Duplicate write
+/// submissions are not wire bytes — the network delta counts receipts only —
+/// so re-submitting a write cannot inflate it.
+fn window_counter_deltas(
+    previous: &crate::metrics::ProgressSnapshot,
+    current: &crate::metrics::ProgressSnapshot,
+) -> (u64, u64, u64, u64) {
+    (
+        current
+            .completed_bytes
+            .saturating_sub(previous.completed_bytes),
+        current.network_bytes.saturating_sub(previous.network_bytes),
+        current.wasted_bytes.saturating_sub(previous.wasted_bytes),
+        current.retries.saturating_sub(previous.retries),
+    )
+}
+
+/// One window's inputs (task 4.1) folded into the controller's sample: the
+/// conversion computes the interval-weighted idle share, so the controller
+/// never sees a raw instantaneous count.
+struct WindowInputs {
+    completed_bytes: u64,
+    network_bytes: u64,
+    wasted_bytes: u64,
+    retries: u64,
+    throttled: u64,
+    active_worker_ms: u64,
+    idle_worker_ms: u64,
+    ack_p50_ms: Option<f64>,
+    ack_p95_ms: Option<f64>,
+    queue_p50: Option<f64>,
+    queue_p95: Option<f64>,
+    budget_wait_ms: u64,
+    elapsed: Duration,
+}
+
+impl WindowInputs {
+    fn into_sample(self) -> crate::control::adaptive::WindowSample {
+        crate::control::adaptive::WindowSample {
+            completed_bytes: self.completed_bytes,
+            network_bytes: self.network_bytes,
+            wasted_bytes: self.wasted_bytes,
+            retries: self.retries,
+            throttled: self.throttled,
+            active_worker_ms: self.active_worker_ms,
+            idle_worker_ms: self.idle_worker_ms,
+            worker_idle_ratio: crate::control::adaptive::WorkerActivity::idle_ratio(
+                self.active_worker_ms,
+                self.idle_worker_ms,
+            ),
+            writer_ack_p50_ms: self.ack_p50_ms,
+            writer_ack_p95_ms: self.ack_p95_ms,
+            writer_queue_p50: self.queue_p50,
+            writer_queue_p95: self.queue_p95,
+            budget_wait_ms: self.budget_wait_ms,
+            elapsed: self.elapsed,
+        }
+    }
+}
+
 /// The adaptive range-concurrency controller loop (tasks 9.1-9.3, design
-/// D6): every `window`, sample the counter deltas (unique completed =
-/// useful goodput — resumed bytes excluded — plus network/wasted, retries,
-/// throttle events, worker idle ratio and write latency), decide, and apply
+/// D6, extended by task 4.1): sample the actual worker activity at
+/// sub-intervals, and every `window` fold the counter deltas (unique
+/// completed = useful goodput — resumed bytes excluded — plus network/wasted,
+/// retries, throttle events, interval-weighted active/idle worker-time and
+/// writer queue/ack percentiles plus byte-budget wait), decide, and apply
 /// within strict bounds. Manual override suspends the loop for the job's
 /// remainder.
 async fn adaptive_controller_loop(
@@ -2283,8 +2424,15 @@ async fn adaptive_controller_loop(
     let config = crate::control::adaptive::AdaptiveConfig::default();
     let mut controller =
         crate::control::adaptive::AdaptiveController::new(config, job.min_workers, job.max_workers);
+    // Sub-interval activity sampling (task 4.1): the window's active/idle
+    // inputs are interval-weighted worker-time, not one instantaneous count.
+    let sample_interval = (config.window / 8).max(Duration::from_millis(1));
+    let mut activity = crate::control::adaptive::WorkerActivity::default();
     let mut previous = counters.fold();
     let mut previous_throttled = job.throttle_events();
+    let mut previous_ack = job.ack_latency_snapshot();
+    let mut previous_queue = job.queue_depth_snapshot();
+    let mut previous_budget_us = job.budget_wait_us();
     let mut last = Instant::now();
     loop {
         // Task 1.5: the controller exits promptly on the job shutdown
@@ -2292,7 +2440,7 @@ async fn adaptive_controller_loop(
         // run_segmented joins it before computing the outcome, so no late
         // decision can race the terminal record.
         tokio::select! {
-            _ = tokio::time::sleep(config.window) => {}
+            _ = tokio::time::sleep(sample_interval) => {}
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     return;
@@ -2309,24 +2457,48 @@ async fn adaptive_controller_loop(
             return;
         }
         let now = Instant::now();
+        // Weight the actual active/idle counts by the interval they were in
+        // effect for (task 4.1) before deciding whether a window ended.
+        let (active, idle) = job.worker_activity_counts();
+        activity.observe(active, idle, now);
+        if now.saturating_duration_since(last) < config.window {
+            continue;
+        }
         let fold = counters.fold();
-        // Throttle events: window diff (task 9.2).
         let now_throttled = job.throttle_events();
-        let throttled = now_throttled.saturating_sub(previous_throttled);
-        previous_throttled = now_throttled;
-        let sample = crate::control::adaptive::WindowSample {
-            completed_bytes: fold
-                .completed_bytes
-                .saturating_sub(previous.completed_bytes),
-            network_bytes: fold.network_bytes.saturating_sub(previous.network_bytes),
-            wasted_bytes: fold.wasted_bytes.saturating_sub(previous.wasted_bytes),
-            retries: fold.retries.saturating_sub(previous.retries),
-            throttled,
-            worker_idle_ratio: job.worker_idle_ratio(),
+        let ack = job.ack_latency_snapshot();
+        let queue = job.queue_depth_snapshot();
+        let budget_us = job.budget_wait_us();
+        let (active_ms, idle_ms) = activity.take();
+        let (completed, network, wasted, retries) = window_counter_deltas(&previous, &fold);
+        let ack_delta = previous_ack.delta(&ack);
+        let queue_delta = previous_queue.delta(&queue);
+        let sample = WindowInputs {
+            completed_bytes: completed,
+            network_bytes: network,
+            wasted_bytes: wasted,
+            retries,
+            throttled: now_throttled.saturating_sub(previous_throttled),
+            active_worker_ms: active_ms,
+            idle_worker_ms: idle_ms,
+            ack_p50_ms: ack_delta.latency_percentile_us(0.50).map(|us| us / 1000.0),
+            ack_p95_ms: ack_delta.latency_percentile_us(0.95).map(|us| us / 1000.0),
+            queue_p50: queue_delta.depth_percentile(0.50),
+            queue_p95: queue_delta.depth_percentile(0.95),
+            budget_wait_ms: budget_us.saturating_sub(previous_budget_us) / 1000,
             elapsed: now.saturating_duration_since(last),
-        };
+        }
+        .into_sample();
         previous = fold;
+        previous_throttled = now_throttled;
+        previous_ack = ack;
+        previous_queue = queue;
+        previous_budget_us = budget_us;
         last = now;
+        #[cfg(test)]
+        if let Ok(mut samples) = job.adaptive_samples.lock() {
+            samples.push(sample);
+        }
         let current = job.desired_workers();
         let decision = controller.decide(sample, current);
         if decision != crate::control::adaptive::Decision::Hold {
@@ -2537,7 +2709,11 @@ mod durability_tests {
             desired_workers: AtomicU64::new(1),
             manual_override: AtomicBool::new(false),
             throttle_events: AtomicU64::new(0),
-            write_latency_us: AtomicU64::new(0),
+            ack_latency: crate::metrics::histogram::LatencyHistogram::new(),
+            queue_depth: crate::metrics::histogram::DepthHistogram::new(),
+            budget_wait_us: AtomicU64::new(0),
+            #[cfg(test)]
+            adaptive_samples: std::sync::Mutex::new(Vec::new()),
             splits: AtomicU64::new(0),
             segment_requests: AtomicU64::new(0),
             last_checkpoint_save_us: AtomicU64::new(0),
@@ -2874,6 +3050,160 @@ mod write_pipeline_tests {
         // Read-ahead in whole frame quanta (the reservation unit).
         config.write_budget.worker_read_ahead_bytes = read_ahead_frames * 4096;
         config
+    }
+
+    /// Task 4.1: window deltas exclude checkpoint-resumed bytes and count
+    /// wire receipts once, so neither resumed coverage nor a re-submitted
+    /// write can inflate useful goodput. The weighted activity converts to
+    /// the interval idle share.
+    #[test]
+    fn window_deltas_exclude_resumed_bytes_and_duplicate_submissions() {
+        let previous = crate::metrics::ProgressSnapshot {
+            network_bytes: 1_000,
+            completed_bytes: 1_000,
+            reused_bytes: 4_000,
+            retries: 0,
+            wasted_bytes: 0,
+            elapsed: Duration::from_millis(10),
+        };
+        // One window later: 500 newly completed bytes and 500 further wire
+        // bytes (one receipt) although two writes were submitted for the
+        // same payload, plus 5_000 more reused checkpoint bytes.
+        let current = crate::metrics::ProgressSnapshot {
+            network_bytes: 1_500,
+            completed_bytes: 1_500,
+            reused_bytes: 9_000,
+            retries: 0,
+            wasted_bytes: 0,
+            elapsed: Duration::from_millis(20),
+        };
+        let (completed, network, wasted, retries) = window_counter_deltas(&previous, &current);
+        assert_eq!(
+            completed, 500,
+            "reused checkpoint bytes never inflate useful goodput"
+        );
+        assert_eq!(
+            network, 500,
+            "wire receipts are counted once, not once per submission"
+        );
+        assert_eq!((wasted, retries), (0, 0));
+        let sample = WindowInputs {
+            completed_bytes: completed,
+            network_bytes: network,
+            wasted_bytes: wasted,
+            retries,
+            throttled: 0,
+            active_worker_ms: 300,
+            idle_worker_ms: 100,
+            ack_p50_ms: Some(2.0),
+            ack_p95_ms: Some(8.0),
+            queue_p50: Some(1.0),
+            queue_p95: Some(2.0),
+            budget_wait_ms: 5,
+            elapsed: Duration::from_millis(20),
+        }
+        .into_sample();
+        assert_eq!(
+            sample.worker_idle_ratio, 0.25,
+            "interval-weighted idle share"
+        );
+        assert_eq!(sample.active_worker_ms, 300);
+        assert_eq!(sample.idle_worker_ms, 100);
+        assert_eq!(sample.writer_ack_p50_ms, Some(2.0));
+        assert_eq!(sample.writer_queue_p95, Some(2.0));
+        assert_eq!(sample.budget_wait_ms, 5);
+    }
+
+    /// Task 4.1: the live controller records interval-weighted activity plus
+    /// writer queue/ack percentiles and never lets one receipt inflate the
+    /// wire delta (two chunks received, two writes submitted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn adaptive_window_carries_weighted_activity_and_writer_instrumentation() {
+        let content = content();
+        let scripted = pipeline_http(&content);
+        let dir = tempfile::tempdir().expect("tmp");
+        let dest = dir.path().join("adaptive-window.bin");
+        let mut config = pipeline_config(true, 4);
+        config.transfer.concurrency_mode = crate::config::ConcurrencyMode::Adaptive;
+        config.transfer.min_workers = 1;
+        config.transfer.max_workers = 1;
+        config.write_executor.writer_threads = 2;
+        // Hold the FIRST write: the job stays alive across whole controller
+        // windows while the second write still acknowledges.
+        let script = OutputFaultScript::register(&dest);
+        let gate = script.script().hold_next(OutputOperation::Write);
+        let controller = SingleStreamController::with_execution(
+            crate::http::execution::HttpExecution::from_adapter(scripted),
+            config,
+        );
+        let (handle, task) = controller.start(DownloadRequest::new(
+            "https://example.test/adaptive-window.bin",
+            dest.clone(),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while handle
+            .segmented_job()
+            .is_none_or(|job| job.adaptive_sample_log().len() < 2)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controller recorded fewer than two windows"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let samples = handle
+            .segmented_job()
+            .expect("live job")
+            .adaptive_sample_log();
+        for sample in &samples {
+            assert!(
+                sample.active_worker_ms + sample.idle_worker_ms > 0,
+                "interval-weighted worker time observed: {sample:?}"
+            );
+            let expected = crate::control::adaptive::WorkerActivity::idle_ratio(
+                sample.active_worker_ms,
+                sample.idle_worker_ms,
+            );
+            assert!((sample.worker_idle_ratio - expected).abs() < 1e-9);
+            if let (Some(p50), Some(p95)) = (sample.writer_ack_p50_ms, sample.writer_ack_p95_ms) {
+                assert!(p50 <= p95, "ack p50 <= p95: {sample:?}");
+            }
+            if let (Some(p50), Some(p95)) = (sample.writer_queue_p50, sample.writer_queue_p95) {
+                assert!(p50 <= p95, "queue p50 <= p95: {sample:?}");
+            }
+            assert!(
+                sample.completed_bytes <= sample.network_bytes,
+                "unique completion never exceeds wire bytes: {sample:?}"
+            );
+        }
+        assert!(
+            samples.iter().any(|s| s.writer_ack_p50_ms.is_some()),
+            "an acknowledged write must appear as a latency percentile: {samples:?}"
+        );
+        assert!(
+            samples.iter().any(|s| s.writer_queue_p50.is_some()),
+            "submitted writes must appear as queue-depth percentiles: {samples:?}"
+        );
+        // Window deltas partition the receipts exactly once: two chunks
+        // received and two writes submitted add up to the payload total.
+        let total_network: u64 = samples.iter().map(|s| s.network_bytes).sum();
+        assert_eq!(
+            total_network, TOTAL,
+            "wire receipts counted once across windows: {samples:?}"
+        );
+        gate.release();
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("no hang")
+            .expect("join")
+            .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(result.completed_bytes, TOTAL);
+        assert_eq!(
+            result.bytes_downloaded_from_network, TOTAL,
+            "two submitted writes, two receipts — no duplicate-wire inflation"
+        );
+        assert_eq!(std::fs::read(&dest).expect("content"), content);
     }
 
     fn wait_for(predicate: impl Fn() -> bool, timeout: Duration, label: &'static str) {

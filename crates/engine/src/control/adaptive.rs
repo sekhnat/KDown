@@ -57,8 +57,32 @@ pub struct WindowSample {
     pub retries: u64,
     /// Throttling responses (429/503) over the window.
     pub throttled: u64,
-    /// Fraction of active workers idle (parked, no lease) during the window.
+    /// Interval-weighted worker time spent holding a lease (task 4.1):
+    /// worker-milliseconds accumulated by sub-interval sampling, never an
+    /// instantaneous count.
+    pub active_worker_ms: u64,
+    /// Interval-weighted worker time spent provisioned and parked without a
+    /// lease (task 4.1). Dormant workers above the desired count are not
+    /// counted — they hold no capacity.
+    pub idle_worker_ms: u64,
+    /// Interval-weighted idle share (task 4.1):
+    /// `idle_worker_ms / (active_worker_ms + idle_worker_ms)`; `0.0` when no
+    /// worker time was observed. Replaces the previous instantaneous cell
+    /// sample.
     pub worker_idle_ratio: f64,
+    /// Writer acknowledgement-latency percentiles over the window (ms);
+    /// `None` when no acknowledgement completed in the window.
+    pub writer_ack_p50_ms: Option<f64>,
+    /// Writer acknowledgement-latency p95 over the window (ms).
+    pub writer_ack_p95_ms: Option<f64>,
+    /// Outstanding-write queue-depth percentiles over the window (sampled at
+    /// submit time); `None` when no write was submitted.
+    pub writer_queue_p50: Option<f64>,
+    /// Outstanding-write queue-depth p95 over the window.
+    pub writer_queue_p95: Option<f64>,
+    /// Worker time blocked waiting for write-byte budget over the window
+    /// (ms); `0` on the legacy writer-lane path (no byte budget).
+    pub budget_wait_ms: u64,
     /// Window length (real elapsed).
     pub elapsed: Duration,
 }
@@ -79,6 +103,58 @@ impl WindowSample {
             || self.wasted_bytes > 0
                 && self.wasted_bytes >= self.completed_bytes
                 && self.completed_bytes > 0
+    }
+}
+
+/// Interval-weighted worker activity (task 4.1): converts point samples of
+/// the actual active/idle worker counts into worker-time, so one slow
+/// observation cannot masquerade as a whole window of idleness.
+#[derive(Debug, Default)]
+pub struct WorkerActivity {
+    active_ms: u64,
+    idle_ms: u64,
+    last: Option<Instant>,
+    last_active: u64,
+    last_idle: u64,
+}
+
+impl WorkerActivity {
+    /// Observe the current actual counts. The time since the previous
+    /// observation is credited to the counts that were in effect at the
+    /// START of that interval; the first observation only establishes state.
+    pub fn observe(&mut self, active: u64, idle: u64, now: Instant) {
+        if let Some(last) = self.last {
+            let elapsed_ms =
+                u64::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(u64::MAX);
+            self.active_ms = self
+                .active_ms
+                .saturating_add(elapsed_ms.saturating_mul(self.last_active));
+            self.idle_ms = self
+                .idle_ms
+                .saturating_add(elapsed_ms.saturating_mul(self.last_idle));
+        }
+        self.last = Some(now);
+        self.last_active = active;
+        self.last_idle = idle;
+    }
+
+    /// Fold the accumulated worker-time and reset the accumulators. The last
+    /// observed state is retained so window boundaries lose no time.
+    pub fn take(&mut self) -> (u64, u64) {
+        let active = std::mem::take(&mut self.active_ms);
+        let idle = std::mem::take(&mut self.idle_ms);
+        (active, idle)
+    }
+
+    /// Interval-weighted idle share for accumulated worker-time.
+    #[must_use]
+    pub fn idle_ratio(active_ms: u64, idle_ms: u64) -> f64 {
+        let total = active_ms.saturating_add(idle_ms);
+        if total == 0 {
+            0.0
+        } else {
+            idle_ms as f64 / total as f64
+        }
     }
 }
 
@@ -269,7 +345,14 @@ mod tests {
             wasted_bytes: 0,
             retries: 0,
             throttled: 0,
+            active_worker_ms: 0,
+            idle_worker_ms: 0,
             worker_idle_ratio: 0.0,
+            writer_ack_p50_ms: None,
+            writer_ack_p95_ms: None,
+            writer_queue_p50: None,
+            writer_queue_p95: None,
+            budget_wait_ms: 0,
             elapsed: Duration::from_millis(window_ms),
         }
     }
@@ -404,10 +487,69 @@ mod tests {
             wasted_bytes: 0,
             retries: 0,
             throttled: 0,
+            active_worker_ms: 0,
+            idle_worker_ms: 0,
             worker_idle_ratio: 0.0,
+            writer_ack_p50_ms: None,
+            writer_ack_p95_ms: None,
+            writer_queue_p50: None,
+            writer_queue_p95: None,
+            budget_wait_ms: 0,
             elapsed: Duration::from_secs(1),
         };
         assert_eq!(sample.useful_goodput(), 1000.0);
+    }
+
+    /// Interval weighting (task 4.1): the elapsed interval is credited to the
+    /// counts in effect at its start, so one slow observation cannot
+    /// masquerade as a whole window of idleness.
+    #[test]
+    fn worker_activity_weights_intervals_not_instants() {
+        let start = Instant::now();
+        let mut activity = WorkerActivity::default();
+        // First observation only establishes state.
+        activity.observe(2, 2, start);
+        assert_eq!(activity.take(), (0, 0));
+        // The interval [start, start+100ms) was spent with 2 active/2 idle.
+        activity.observe(3, 1, start + Duration::from_millis(100));
+        assert_eq!(activity.take(), (200, 200));
+        // The next interval credits the state that was in effect.
+        activity.observe(0, 4, start + Duration::from_millis(200));
+        assert_eq!(activity.take(), (300, 100));
+        // A take() empties the accumulators without losing the boundary.
+        assert_eq!(activity.take(), (0, 0));
+        assert_eq!(activity.take(), (0, 0));
+    }
+
+    /// A momentary idle sample inside a busy window must not read as a mostly
+    /// idle window (the instantaneous-sample failure mode of task 4.1).
+    #[test]
+    fn momentary_idle_does_not_dominate_the_window() {
+        let start = Instant::now();
+        let mut activity = WorkerActivity::default();
+        activity.observe(4, 0, start);
+        for step in 1..=9u64 {
+            activity.observe(4, 0, start + Duration::from_millis(step * 10));
+        }
+        // One 10ms blip with all workers idle, then busy again.
+        activity.observe(0, 4, start + Duration::from_millis(100));
+        activity.observe(4, 0, start + Duration::from_millis(110));
+        let (active, idle) = activity.take();
+        assert_eq!(active, 4 * 100, "active worker-ms {active}");
+        assert_eq!(idle, 4 * 10, "idle worker-ms {idle}");
+        let ratio = WorkerActivity::idle_ratio(active, idle);
+        assert!(
+            ratio < 0.1,
+            "interval-weighted idle share {ratio} must stay small"
+        );
+    }
+
+    /// The idle ratio is defined (zero) when no worker time was observed.
+    #[test]
+    fn idle_ratio_is_zero_without_worker_time() {
+        assert_eq!(WorkerActivity::idle_ratio(0, 0), 0.0);
+        assert_eq!(WorkerActivity::idle_ratio(100, 0), 0.0);
+        assert_eq!(WorkerActivity::idle_ratio(0, 100), 1.0);
     }
 
     /// Strict bounds (task 9.3): apply never leaves [min, max].
