@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::resume::checkpoint::ByteRange;
 use crate::scheduler::interval_set::IntervalSet;
@@ -31,6 +32,14 @@ pub enum TargetSelector {
         initial_workers: u64,
         oversubscription: u64,
     },
+    /// Opt-in duration-informed target (task 3.4, design D4): each new
+    /// lease aims to hold the connection for about `duration_ms`, sized
+    /// from the smoothed per-lease unique goodput the scheduler itself
+    /// samples at acquire/complete. Until enough samples stabilize the
+    /// estimate, `seed_size` (the explicit initial size) is used; the
+    /// sample window includes request setup, so RTT/request cost is part
+    /// of the measured service time (no separate RTT model needed).
+    Duration { duration_ms: u64, seed_size: u64 },
 }
 
 /// Scheduler shaping parameters (§12.2-§12.3, task 6.1).
@@ -108,6 +117,9 @@ impl SchedulerPolicy {
                 // ceil(remaining / workers).
                 pending_bytes.max(1).div_ceil(workers.max(1))
             }
+            // Duration mode seeds from the explicit size until per-lease
+            // samples stabilize (task 3.4).
+            TargetSelector::Duration { seed_size, .. } => *seed_size,
         };
         Some(raw.clamp(min_segment_size, max_segment_size))
     }
@@ -120,25 +132,33 @@ impl SchedulerPolicy {
     #[must_use]
     fn target_len(&self, gap_len: u64, resolved_target: Option<u64>) -> u64 {
         let raw = resolved_target.unwrap_or(self.max_segment_size);
-        let mut want = raw
+        let want = raw
             .clamp(self.min_segment_size.min(gap_len), self.max_segment_size)
             .min(gap_len)
             .max(self.min_segment_size.min(gap_len));
-        if self.ready_work_divisor > 0 {
-            // Reserve roughly (divisor - 1) minimum-sized unclaimed leases
-            // behind this carve while the gap permits (design D4): workers
-            // acquire pending ranges instead of splitting live tails.
-            let min_in_gap = self.min_segment_size.min(gap_len).max(1);
-            let reserve = self
-                .ready_work_divisor
-                .saturating_sub(1)
-                .saturating_mul(min_in_gap);
-            if gap_len > reserve {
-                let ready_cap = gap_len.saturating_sub(reserve).max(min_in_gap);
-                want = want.min(ready_cap);
-            }
+        self.apply_ready_work_cap(want, gap_len)
+    }
+
+    /// Ready-work cap (task 3.3): reserve roughly (divisor - 1)
+    /// minimum-sized unclaimed leases behind a carve while the gap permits
+    /// (design D4) — workers acquire pending ranges instead of splitting
+    /// live tails.
+    #[must_use]
+    pub fn apply_ready_work_cap(&self, want: u64, gap_len: u64) -> u64 {
+        if self.ready_work_divisor == 0 {
+            return want;
         }
-        want
+        let min_in_gap = self.min_segment_size.min(gap_len).max(1);
+        let reserve = self
+            .ready_work_divisor
+            .saturating_sub(1)
+            .saturating_mul(min_in_gap);
+        if gap_len > reserve {
+            let ready_cap = gap_len.saturating_sub(reserve).max(min_in_gap);
+            want.min(ready_cap)
+        } else {
+            want
+        }
     }
 }
 
@@ -158,6 +178,96 @@ pub struct SegmentScheduler {
     /// The target resolved once at initialization (task 6.1); `None` =
     /// carve up to max (legacy behavior).
     resolved_target: Option<u64>,
+    /// Duration-target state (task 3.4): EWMA of observed per-lease unique
+    /// goodput (bytes/ms) plus the last allocation size for the bounded
+    /// step change. `None` when the selector is not duration-informed.
+    duration_target: Option<DurationTarget>,
+    /// When each active lease was acquired (or last resized by a split) —
+    /// the duration sampler's denominator (task 3.4).
+    acquired_at: HashMap<LeaseId, std::time::Instant>,
+}
+
+/// EWMA state for the duration-informed selector (task 3.4). Samples are
+/// per-lease: unique accepted bytes divided by the wall time the lease was
+/// held (acquire/resize → complete), which includes the HTTP request setup
+/// — the RTT/request-cost guard falls out of the measurement instead of a
+/// separate model.
+#[derive(Debug, Clone, Copy)]
+struct DurationTarget {
+    duration_ms: u64,
+    seed_size: u64,
+    /// Smoothed goodput in bytes per millisecond.
+    ewma_bytes_per_ms: f64,
+    /// Completed-lease samples folded into the EWMA so far.
+    samples: u64,
+    /// The last allocated size (bytes) for the bounded step change.
+    last_alloc: u64,
+}
+
+/// Sample count after which the EWMA is considered stable enough to drive
+/// allocations (design D4: initialized from the explicit target until
+/// sufficiently stable).
+const DURATION_STABLE_SAMPLES: u64 = 3;
+
+/// EWMA smoothing weight for the newest sample (1/4 — one outlier moves the
+/// estimate by at most 25%, no oscillation on a single fast/slow sample).
+const DURATION_EWMA_WEIGHT: f64 = 0.25;
+
+impl DurationTarget {
+    fn new(duration_ms: u64, seed_size: u64) -> Self {
+        Self {
+            duration_ms: duration_ms.max(1),
+            seed_size,
+            ewma_bytes_per_ms: 0.0,
+            samples: 0,
+            last_alloc: seed_size,
+        }
+    }
+
+    /// Fold one completed lease: `bytes` unique accepted bytes over
+    /// `held_ms` wall time (both positive; degenerate samples are skipped).
+    fn observe(&mut self, bytes: u64, held_ms: u64) {
+        if bytes == 0 || held_ms == 0 {
+            return;
+        }
+        let sample = bytes as f64 / held_ms as f64;
+        self.ewma_bytes_per_ms = if self.samples == 0 {
+            sample
+        } else {
+            self.ewma_bytes_per_ms * (1.0 - DURATION_EWMA_WEIGHT) + sample * DURATION_EWMA_WEIGHT
+        };
+        self.samples += 1;
+    }
+
+    /// The next allocation size (bytes), clamped to `[min, max]` and to a
+    /// 2× step change from the previous allocation (design D4).
+    fn next_size(&self, min: u64, max: u64, gap_len: u64) -> u64 {
+        if self.samples < DURATION_STABLE_SAMPLES {
+            // Not stabilized: fall back to the explicit seed size.
+            return self
+                .seed_size
+                .clamp(min.min(gap_len), max)
+                .min(gap_len)
+                .max(1);
+        }
+        let raw = self.ewma_bytes_per_ms * self.duration_ms as f64;
+        let stepped = if raw > self.last_alloc as f64 * 2.0 {
+            self.last_alloc * 2
+        } else if raw < self.last_alloc as f64 / 2.0 {
+            (self.last_alloc / 2).max(1)
+        } else {
+            raw.max(1.0) as u64
+        };
+        stepped
+            .clamp(min.min(gap_len), max)
+            .min(gap_len)
+            .max(min_in_gap(min, gap_len))
+    }
+}
+
+/// The minimum carve inside a gap (shared helper for the duration target).
+fn min_in_gap(min: u64, gap_len: u64) -> u64 {
+    min.min(gap_len).max(1)
 }
 
 impl SegmentScheduler {
@@ -187,6 +297,13 @@ impl SegmentScheduler {
             &policy.target,
             pending.len(),
         );
+        let duration_target = match policy.target {
+            TargetSelector::Duration {
+                duration_ms,
+                seed_size,
+            } => Some(DurationTarget::new(duration_ms, seed_size)),
+            _ => None,
+        };
         Self {
             total_size,
             pending,
@@ -196,6 +313,8 @@ impl SegmentScheduler {
             generation: 1,
             policy,
             resolved_target,
+            duration_target,
+            acquired_at: HashMap::new(),
         }
     }
 
@@ -214,6 +333,23 @@ impl SegmentScheduler {
         self.generation
     }
 
+    /// The target lease length for the next carve (task 3.4): the
+    /// duration-informed allocation when enabled, otherwise the resolved
+    /// policy target — both then bounded by the ready-work cap (task 3.3).
+    #[must_use]
+    fn target_len_for_gap(&self, gap_len: u64) -> u64 {
+        let want = if let Some(duration_target) = &self.duration_target {
+            duration_target.next_size(
+                self.policy.min_segment_size,
+                self.policy.max_segment_size,
+                gap_len,
+            )
+        } else {
+            self.policy.target_len(gap_len, self.resolved_target)
+        };
+        self.policy.apply_ready_work_cap(want, gap_len)
+    }
+
     /// Acquire a pending segment lease (§12.2): carve a slice of at most
     /// `max_segment_size` from the first pending range. `None` when no
     /// pending work remains.
@@ -222,7 +358,7 @@ impl SegmentScheduler {
         let gap_len = gap.1 - gap.0 + 1;
         // Segment length: the policy target (explicit or automatic, task
         // 6.1), bounded by policy and the whole gap when small.
-        let want = self.policy.target_len(gap_len, self.resolved_target);
+        let want = self.target_len_for_gap(gap_len);
         let end = gap.0.saturating_add(want).saturating_sub(1).min(gap.1);
         let id = self.next_lease;
         self.next_lease += 1;
@@ -235,6 +371,7 @@ impl SegmentScheduler {
         };
         self.pending.subtract(gap.0, end);
         self.active.insert(id, lease);
+        self.acquired_at.insert(id, std::time::Instant::now());
         Some(lease)
     }
 
@@ -317,8 +454,26 @@ impl SegmentScheduler {
             self.active.insert(lease_id, lease);
             return false;
         }
+        self.observe_duration_sample(&lease, lease.end - lease.start + 1);
+        self.acquired_at.remove(&lease_id);
         self.completed.insert(lease.start, lease.end);
         true
+    }
+
+    /// Fold one settled lease into the duration sampler (task 3.4): unique
+    /// accepted bytes over the wall time the lease was held. Completion
+    /// samples the full span; a failed lease samples only its acknowledged
+    /// prefix (re-receiving the tail is not useful goodput).
+    fn observe_duration_sample(&mut self, lease: &SegmentLease, settled_bytes: u64) {
+        if let Some(duration_target) = self.duration_target.as_mut() {
+            let held = self
+                .acquired_at
+                .get(&lease.id)
+                .map_or(Duration::from_millis(1), |at| at.elapsed());
+            let held_ms = held.as_millis() as u64;
+            duration_target.observe(settled_bytes, held_ms);
+            duration_target.last_alloc = settled_bytes.max(1);
+        }
     }
 
     /// Fail a lease: requeue only the unfinished tail (§17.3); the consumed
@@ -331,6 +486,8 @@ impl SegmentScheduler {
             self.active.insert(lease_id, lease);
             return false;
         }
+        self.observe_duration_sample(&lease, lease.next_offset.saturating_sub(lease.start));
+        self.acquired_at.remove(&lease_id);
         if lease.next_offset <= lease.end {
             self.pending.insert(lease.next_offset, lease.end);
         }
@@ -346,6 +503,7 @@ impl SegmentScheduler {
         let Some(lease) = self.active.remove(&lease_id) else {
             return false;
         };
+        self.acquired_at.remove(&lease_id);
         if lease.generation != generation {
             self.active.insert(lease_id, lease);
             return false;
@@ -386,9 +544,16 @@ impl SegmentScheduler {
         }
         let take = (tail_len / 2).clamp(1, tail_len - 1);
         let new_start = lease.end - take + 1;
-        // Shrink the original lease in place.
+        // Shrink the original lease in place; its duration clock restarts
+        // (the shrunk remainder is a fresh allocation for the sampler).
         let original = self.active.get_mut(&lease_id)?;
         original.end = new_start - 1;
+        if let Some(duration_target) = self.duration_target.as_mut() {
+            duration_target.last_alloc = original.end - original.start + 1;
+        }
+        if let Some(at) = self.acquired_at.get_mut(&lease_id) {
+            *at = std::time::Instant::now();
+        }
         let id = self.next_lease;
         self.next_lease += 1;
         let split = SegmentLease {
@@ -399,6 +564,7 @@ impl SegmentScheduler {
             next_offset: new_start,
         };
         self.active.insert(id, split);
+        self.acquired_at.insert(id, std::time::Instant::now());
         Some(split)
     }
 

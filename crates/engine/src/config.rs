@@ -97,6 +97,13 @@ pub enum SegmentSizing {
     /// workers × `auto_oversubscription`))`, clamped to the segment bounds.
     /// Remaining coverage comes from validated intervals, not total length.
     Automatic,
+    /// Opt-in duration-informed sizing (task 3.4, design D4): each new
+    /// lease aims to hold its request for about `duration_ms`, sized from
+    /// the scheduler's smoothed per-lease unique-goodput samples (request
+    /// setup included in the measured service time). Allocations are
+    /// clamped to the segment bounds, bounded to a 2× step change, and
+    /// seeded from `initial_segment_size` until samples stabilize.
+    Duration { duration_ms: u64 },
 }
 
 /// Integrity verification requirements for a job (§16).

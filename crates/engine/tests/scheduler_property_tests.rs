@@ -491,3 +491,156 @@ fn ready_work_leaves_unclaimed_pending() {
     );
     assert!(small.invariants_hold());
 }
+
+/// Duration-informed sizing (task 3.4, design D4): seeded from the explicit
+/// size until samples stabilize, driven by smoothed per-lease unique
+/// goodput afterwards, bounded to [min, max], a 2× step change, and exact
+/// coverage over checkpoint-resumed gaps.
+mod duration_sizing_tests {
+    use super::*;
+    use kdown_engine::scheduler::core::TargetSelector;
+    use std::time::Duration;
+
+    fn duration_scheduler(total: u64, duration_ms: u64) -> SegmentScheduler {
+        SegmentScheduler::initialize(
+            total,
+            &[],
+            SchedulerPolicy::with_target(
+                64 * 1024,
+                32 * 1024 * 1024,
+                TargetSelector::Duration {
+                    duration_ms,
+                    seed_size: 1024 * 1024,
+                },
+                256 * 1024,
+            ),
+        )
+    }
+
+    /// Fast/slow scripted samples: a fast lease (many bytes, short hold)
+    /// grows the next allocation; a slow lease (few bytes, long hold)
+    /// shrinks it — in the right direction, within bounds, without
+    /// oscillating on one outlier (EWMA + 2× step bound).
+    #[test]
+    fn duration_sizing_follows_scripted_service_rates() {
+        let mut s = duration_scheduler(256 * 1024 * 1024, 1_000);
+
+        // Seeded from the explicit size until samples stabilize.
+        let first = s.acquire().expect("first lease");
+        assert_eq!(
+            first.end - first.start + 1,
+            1024 * 1024,
+            "seed allocation is the explicit size"
+        );
+        // Fast sample: 4 MiB in 500 ms (8 bytes/ms) completes quickly.
+        assert!(s.report_progress(first.id, first.generation, first.end + 1));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(s.complete(first.id, first.generation));
+        // Two more quick samples stabilize the EWMA high.
+        for _ in 0..2 {
+            let l = s.acquire().expect("lease");
+            assert!(s.report_progress(l.id, l.generation, l.end + 1));
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(s.complete(l.id, l.generation));
+        }
+        let fast = s.acquire().expect("post-fast lease");
+        let fast_size = fast.end - fast.start + 1;
+        assert!(
+            fast_size > 1024 * 1024,
+            "fast service grows the allocation: {fast_size}"
+        );
+        assert!(
+            fast_size <= 2 * 1024 * 1024,
+            "step change bounded to 2x the previous allocation: {fast_size}"
+        );
+
+        // Slow service: several held-long leases with tiny acknowledged
+        // prefixes decay the EWMA (one outlier must NOT collapse it —
+        // design D4 hysteresis).
+        for _ in 0..3 {
+            let slow = s.acquire().expect("slow lease");
+            assert!(s.report_progress(slow.id, slow.generation, slow.start + 64 * 1024));
+            std::thread::sleep(Duration::from_millis(120));
+            assert!(s.fail(slow.id, slow.generation));
+        }
+        // The estimate has decayed; the next allocation shrinks (the 2x
+        // step bound halves per allocation, so the decay is gradual).
+        let after_slow = s.acquire().expect("post-slow lease");
+        let after_slow_size = after_slow.end - after_slow.start + 1;
+        assert!(
+            after_slow_size <= fast_size / 2,
+            "sustained slow service shrinks the allocation: {after_slow_size} <= {}/2",
+            fast_size
+        );
+        assert!(s.invariants_hold());
+    }
+
+    /// Min/max bounds: an extreme sample cannot push the allocation outside
+    /// the configured segment bounds.
+    #[test]
+    fn duration_sizing_respects_bounds() {
+        let mut s = duration_scheduler(256 * 1024 * 1024, 10_000);
+        // Very fast samples (huge bytes/ms) cannot exceed max_segment.
+        for _ in 0..4 {
+            let l = s.acquire().expect("lease");
+            assert!(s.report_progress(l.id, l.generation, l.end + 1));
+            assert!(s.complete(l.id, l.generation));
+        }
+        let l = s.acquire().expect("lease");
+        assert!(l.end - l.start < 32 * 1024 * 1024, "max segment bound");
+        // A tiny-gap scheduler: the allocation never exceeds the gap.
+        let mut small = duration_scheduler(128 * 1024, 1_000);
+        for _ in 0..4 {
+            if let Some(l) = small.acquire() {
+                assert!(small.report_progress(l.id, l.generation, l.end + 1));
+                assert!(small.complete(l.id, l.generation));
+            }
+        }
+        if let Some(l) = small.acquire() {
+            assert!(
+                l.end - l.start < 128 * 1024,
+                "allocation clamped to the gap"
+            );
+        }
+        assert!(small.invariants_hold());
+    }
+
+    /// Checkpoint resume gaps: with a resumed completed prefix, duration
+    /// sizing allocates only from the remaining gap, the final partial
+    /// range is exact, and the drain covers the domain exactly once.
+    #[test]
+    fn duration_sizing_over_resumed_gaps_is_exact() {
+        let total: u64 = 8 * 1024 * 1024;
+        let resumed_end: u64 = 3 * 1024 * 1024 - 1;
+        let mut s = SegmentScheduler::initialize(
+            total,
+            &[(0, resumed_end)],
+            SchedulerPolicy::with_target(
+                64 * 1024,
+                32 * 1024 * 1024,
+                TargetSelector::Duration {
+                    duration_ms: 1_000,
+                    seed_size: 1024 * 1024,
+                },
+                256 * 1024,
+            ),
+        );
+        // The first allocation starts exactly at the resumed gap.
+        let first = s.acquire().expect("first lease over the gap");
+        assert_eq!(first.start, resumed_end + 1);
+        assert!(s.report_progress(first.id, first.generation, first.end + 1));
+        assert!(s.complete(first.id, first.generation));
+        // Drain with samples along the way; the union stays exact.
+        while let Some(l) = s.acquire() {
+            assert!(s.report_progress(l.id, l.generation, l.end + 1));
+            assert!(s.complete(l.id, l.generation));
+            assert!(s.invariants_hold());
+        }
+        assert!(s.is_complete());
+        assert_eq!(
+            s.completed_ranges(),
+            vec![(0u64, total - 1)] as Vec<ByteRange>,
+            "resumed + duration-sized coverage is exact"
+        );
+    }
+}

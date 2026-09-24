@@ -560,6 +560,10 @@ pub(crate) async fn run_segmented(
             initial_workers: u64::from(config.transfer.max_workers.max(1)),
             oversubscription: config.transfer.auto_oversubscription,
         },
+        crate::config::SegmentSizing::Duration { duration_ms } => TargetSelector::Duration {
+            duration_ms,
+            seed_size: config.transfer.initial_segment_size,
+        },
     };
     let mut policy = SchedulerPolicy::with_target(
         config.transfer.min_segment_size,
@@ -581,7 +585,10 @@ pub(crate) async fn run_segmented(
     // tails. Explicit sizing keeps its configured meaning (no ready-work
     // cap). The initial divisor seeds the policy; workers refresh it under
     // their acquire lock as the desired count changes.
-    if config.transfer.segment_sizing == crate::config::SegmentSizing::Automatic {
+    if matches!(
+        config.transfer.segment_sizing,
+        crate::config::SegmentSizing::Automatic | crate::config::SegmentSizing::Duration { .. }
+    ) {
         policy.ready_work_divisor = config
             .transfer
             .auto_oversubscription
@@ -648,8 +655,10 @@ pub(crate) async fn run_segmented(
             .collect(),
         min_workers: u64::from(config.transfer.min_workers.max(1)),
         max_workers: u64::from(config.transfer.max_workers.max(1)),
-        ready_work_sizing: config.transfer.segment_sizing
-            == crate::config::SegmentSizing::Automatic,
+        ready_work_sizing: matches!(
+            config.transfer.segment_sizing,
+            crate::config::SegmentSizing::Automatic | crate::config::SegmentSizing::Duration { .. }
+        ),
         ready_work_factor: config.transfer.auto_oversubscription.max(1),
         applied_ready_divisor: AtomicU64::new(u64::MAX),
         worker_progress,
