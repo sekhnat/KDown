@@ -493,3 +493,129 @@ async fn real_process_crash_releases_lock_and_resumes_partial_output() {
         "the unlocked lockfile remains reusable after resume"
     );
 }
+
+/// Task 2.7: the pipelined write path survives a server-side connection
+/// kill mid-segment exactly like the legacy lanes — outstanding executor
+/// writes settle, the retry resumes from the acknowledged prefix, and the
+/// download completes byte-exactly.
+#[tokio::test]
+async fn pipelined_kill_during_segment_write_then_resume() {
+    let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 41_001));
+    let server = crashy("/crash-pipelined.bin", content.clone(), 2)
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("crash-pipelined.bin");
+    let expected_crash = content.clone();
+
+    let mut cfg = fast_config();
+    cfg.write_executor.pipeline_writes = true;
+    cfg.write_executor.writer_threads = 2;
+    // Tiny read-ahead churns executor reservations across retries, so any
+    // permit leak would stall the pipeline instead of completing.
+    cfg.write_budget.worker_read_ahead_bytes = 2 * u64::from(cfg.read_buffer_size);
+    let c = SingleStreamController::new(
+        HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+        cfg,
+    );
+    let r1 = tokio::time::timeout(
+        Duration::from_secs(60),
+        c.run(DownloadRequest::new(
+            server.url("/crash-pipelined.bin"),
+            dest.clone(),
+        )),
+    )
+    .await
+    .expect("no hang")
+    .expect("terminal");
+    assert_eq!(r1.status, ResultStatus::Completed, "{r1:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected_crash);
+}
+
+/// Task 2.7: pause with queued executor writes, then simulate process
+/// death; a fresh controller resumes from the checkpoint byte-exactly.
+/// The pipelined pause drains queued writes before the coordinator save,
+/// so the checkpoint holds only acknowledged coverage (durable and
+/// performance modes).
+#[tokio::test]
+async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
+    for durability in [
+        kdown_engine::config::DurabilityMode::Performance,
+        kdown_engine::config::DurabilityMode::Durable,
+    ] {
+        let content = Arc::new(vec![7u8; 2_400_000]);
+        let expected = content.clone();
+        let server = TestServer::new()
+            .serve_handler("/pipelined-pause.bin", move |req| {
+                let total = (*content).len() as u64;
+                let base = if let (Some((s, _e)), false) = (req.range, req.method == "HEAD") {
+                    let body = (*content)[s as usize..].to_vec();
+                    ScriptedResponse::new(206)
+                        .with_body(body)
+                        .with_header("content-range", &format!("bytes {s}-{}/{total}", total - 1))
+                } else {
+                    ScriptedResponse::ok((*content).clone())
+                };
+                base.chunked(Duration::from_millis(20))
+            })
+            .start()
+            .await
+            .expect("start");
+        let dir = tempfile::tempdir().expect("tmp");
+        let dest = dir.path().join("pipelined-pause.bin");
+
+        let mut cfg = fast_config();
+        cfg.transfer.durability = durability;
+        cfg.write_executor.pipeline_writes = true;
+        cfg.write_executor.writer_threads = 2;
+        {
+            let c = SingleStreamController::new(
+                HttpTransport::new(kdown_engine::config::NetworkPolicy::default())
+                    .expect("transport"),
+                cfg.clone(),
+            );
+            let (handle, join) = c.start(DownloadRequest::new(
+                server.url("/pipelined-pause.bin"),
+                dest.clone(),
+            ));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(
+                handle.snapshot().completed_bytes > 0,
+                "{durability:?}: acknowledged coverage before pause"
+            );
+            handle.pause();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            // The pipelined workers drained their queued writes; the
+            // coordinator saved the acknowledged prefix before the pause
+            // boundary settled.
+            let identity = job_identity(&server.url("/pipelined-pause.bin"), &dest);
+            let sidecar = dir.path().join(format!("{identity}.kdown"));
+            assert!(
+                sidecar.exists(),
+                "{durability:?}: checkpoint persisted at the pause boundary"
+            );
+            // Simulated process death: abort the run task without a
+            // terminal transition (SIGKILL semantics).
+            join.abort();
+        }
+        assert!(!dest.exists(), "{durability:?}: no published output");
+
+        let c = SingleStreamController::new(
+            HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
+            cfg,
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            c.run(DownloadRequest::new(
+                server.url("/pipelined-pause.bin"),
+                dest.clone(),
+            )),
+        )
+        .await
+        .expect("no hang")
+        .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
+    }
+}

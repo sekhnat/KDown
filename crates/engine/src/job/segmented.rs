@@ -1608,6 +1608,104 @@ async fn consume_legacy_body(
     Ok(())
 }
 
+/// Handle one completion: release its reservation, fold it into the
+/// frontier and publish one coherent record when the contiguous
+/// acknowledged frontier advanced. Stale generations are ignored — they can
+/// never credit the live lease (design D3).
+async fn settle_completion(
+    job: &Arc<SegmentedJob>,
+    worker_idx: usize,
+    writer: &mut PipelinedWriter,
+    frontier: &mut LeaseFrontier,
+    completion: WriteCompletion,
+) -> Result<(), WorkerError> {
+    let latency = writer
+        .reservations
+        .remove(&(completion.lease_id, completion.offset))
+        .map(|(reservation, submitted_at)| {
+            drop(reservation); // release queued+executing budget bytes
+            submitted_at.elapsed()
+        });
+    let success = matches!(completion.outcome, WriteOutcome::Completed);
+    match frontier.record_completion(
+        completion.lease_id,
+        completion.generation,
+        completion.offset,
+        completion.len,
+        success,
+    ) {
+        CompletionStatus::Acknowledged { through } => {
+            // Write-ack latency for the controller's sampling (task 9.2).
+            if let Some(elapsed) = latency {
+                job.write_latency_us.store(
+                    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            // Hot-path progress (§13.3): publish the acknowledged
+            // contiguous frontier as one coherent record (task 3.2) —
+            // no scheduler lock on the completion path.
+            job.worker_progress[worker_idx].publish(LeaseRecord {
+                lease_id: frontier.lease_id(),
+                generation: frontier.generation(),
+                lease_start: frontier.start(),
+                written_through: through,
+            });
+            Ok(())
+        }
+        CompletionStatus::Failed => {
+            // A failed write blocks the frontier and is fatal for the
+            // job, matching the legacy lane-error semantics (§14.5).
+            match completion.outcome {
+                WriteOutcome::Failed(error) => Err(WorkerError::Fatal(error.0)),
+                _ => Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                    "write was discarded before execution".into(),
+                ))),
+            }
+        }
+        CompletionStatus::StaleGeneration => Ok(()),
+    }
+}
+
+/// Drain every outstanding write of the frontier (task 2.7): completions
+/// settle (or fail fatally) until nothing is queued or executing, leaving
+/// the published frontier at the contiguous acknowledged prefix. Used at
+/// end-of-body, pause boundaries and before retryable-error requeue so a
+/// retry resumes from settled coverage only.
+async fn drain_outstanding_writes(
+    job: &Arc<SegmentedJob>,
+    worker_idx: usize,
+    writer: &mut PipelinedWriter,
+    frontier: &mut LeaseFrontier,
+    revisions: &mut tokio::sync::watch::Receiver<u64>,
+) -> Result<(), WorkerError> {
+    while frontier.has_outstanding() {
+        tokio::select! {
+            completion = writer.completions.recv() => {
+                match completion {
+                    Some(completion) => {
+                        settle_completion(job, worker_idx, writer, frontier, completion).await?;
+                    }
+                    None => {
+                        return Err(WorkerError::Fatal(DownloadError::SinkWrite(
+                            "write executor shut down mid-transfer".into(),
+                        )));
+                    }
+                }
+            }
+            changed = revisions.changed() => {
+                if changed.is_err() || job.fatal.is_fatal() {
+                    return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                }
+            }
+            _ = job.cancel.cancelled() => {
+                return Err(WorkerError::Fatal(DownloadError::Cancelled));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pipelined write path (design D2/D3, task 2.5): the worker reserves byte
 /// budget BEFORE polling the next chunk, submits writes to the shared
 /// executor without awaiting them, and keeps receiving while earlier writes
@@ -1634,65 +1732,6 @@ async fn consume_pipelined_body(
     // The pre-read reservation (design D2): held across the body poll and
     // reconciled to the actual frame size after receipt.
     let mut reservation: Option<ByteReservation> = None;
-
-    // Handle one completion: release its reservation, fold it into the
-    // frontier and publish one coherent record when the contiguous
-    // acknowledged frontier advanced. Stale generations are ignored here —
-    // they can never credit the live lease (design D3).
-    async fn settle(
-        job: &Arc<SegmentedJob>,
-        worker_idx: usize,
-        writer: &mut PipelinedWriter,
-        frontier: &mut LeaseFrontier,
-        completion: WriteCompletion,
-    ) -> Result<(), WorkerError> {
-        let latency = writer
-            .reservations
-            .remove(&(completion.lease_id, completion.offset))
-            .map(|(reservation, submitted_at)| {
-                drop(reservation); // release queued+executing budget bytes
-                submitted_at.elapsed()
-            });
-        let success = matches!(completion.outcome, WriteOutcome::Completed);
-        match frontier.record_completion(
-            completion.lease_id,
-            completion.generation,
-            completion.offset,
-            completion.len,
-            success,
-        ) {
-            CompletionStatus::Acknowledged { through } => {
-                // Write-ack latency for the controller's sampling (task 9.2).
-                if let Some(elapsed) = latency {
-                    job.write_latency_us.store(
-                        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                }
-                // Hot-path progress (§13.3): publish the acknowledged
-                // contiguous frontier as one coherent record (task 3.2) —
-                // no scheduler lock on the completion path.
-                job.worker_progress[worker_idx].publish(LeaseRecord {
-                    lease_id: frontier.lease_id(),
-                    generation: frontier.generation(),
-                    lease_start: frontier.start(),
-                    written_through: through,
-                });
-                Ok(())
-            }
-            CompletionStatus::Failed => {
-                // A failed write blocks the frontier and is fatal for the
-                // job, matching the legacy lane-error semantics (§14.5).
-                match completion.outcome {
-                    WriteOutcome::Failed(error) => Err(WorkerError::Fatal(error.0)),
-                    _ => Err(WorkerError::Fatal(DownloadError::SinkWrite(
-                        "write was discarded before execution".into(),
-                    ))),
-                }
-            }
-            CompletionStatus::StaleGeneration => Ok(()),
-        }
-    }
 
     loop {
         // Register the current revision BEFORE the read (task 7.1): a fatal
@@ -1729,7 +1768,7 @@ async fn consume_pipelined_body(
                     completion = writer.completions.recv() => {
                         match completion {
                             Some(completion) => {
-                                settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                                settle_completion(job, worker_idx, writer, &mut frontier, completion).await?;
                             }
                             None => {
                                 return Err(WorkerError::Fatal(DownloadError::SinkWrite(
@@ -1757,7 +1796,7 @@ async fn consume_pipelined_body(
             completion = writer.completions.recv() => {
                 match completion {
                     Some(completion) => {
-                        settle(job, worker_idx, writer, &mut frontier, completion).await?;
+                        settle_completion(job, worker_idx, writer, &mut frontier, completion).await?;
                     }
                     None => {
                         return Err(WorkerError::Fatal(DownloadError::SinkWrite(
@@ -1829,30 +1868,7 @@ async fn consume_pipelined_body(
                 // lease: completions may arrive out of order, and the
                 // frontier publishes only the contiguous acknowledged
                 // prefix (design D3).
-                while frontier.has_outstanding() {
-                    tokio::select! {
-                        completion = writer.completions.recv() => {
-                            match completion {
-                                Some(completion) => {
-                                    settle(job, worker_idx, writer, &mut frontier, completion).await?;
-                                }
-                                None => {
-                                    return Err(WorkerError::Fatal(DownloadError::SinkWrite(
-                                        "write executor shut down mid-transfer".into(),
-                                    )));
-                                }
-                            }
-                        }
-                        changed = revisions.changed() => {
-                            if changed.is_err() || job.fatal.is_fatal() {
-                                return Err(WorkerError::Fatal(DownloadError::Cancelled));
-                            }
-                        }
-                        _ = job.cancel.cancelled() => {
-                            return Err(WorkerError::Fatal(DownloadError::Cancelled));
-                        }
-                    }
-                }
+                drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions).await?;
                 if frontier.acknowledged_through() != validated_start + accepted_len {
                     return Err(WorkerError::Fatal(DownloadError::SinkWrite(
                         "write pipeline settled below the validated range".into(),
@@ -1866,30 +1882,10 @@ async fn consume_pipelined_body(
                 // coordinator settles covers everything already received
                 // (task 2.5; dispositions are formalized in task 2.7).
                 drop(reservation.take());
-                while frontier.has_outstanding() {
-                    tokio::select! {
-                        completion = writer.completions.recv() => {
-                            match completion {
-                                Some(completion) => {
-                                    settle(job, worker_idx, writer, &mut frontier, completion).await?;
-                                }
-                                None => {
-                                    return Err(WorkerError::Fatal(DownloadError::SinkWrite(
-                                        "write executor shut down mid-transfer".into(),
-                                    )));
-                                }
-                            }
-                        }
-                        changed = revisions.changed() => {
-                            if changed.is_err() || job.fatal.is_fatal() {
-                                return Err(WorkerError::Fatal(DownloadError::Cancelled));
-                            }
-                        }
-                        _ = job.cancel.cancelled() => {
-                            return Err(WorkerError::Fatal(DownloadError::Cancelled));
-                        }
-                    }
-                }
+                // Settle outstanding writes BEFORE the pause save so the
+                // checkpoint captures exactly the acknowledged prefix
+                // (task 2.7: drain before coordinator_loop save).
+                drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions).await?;
                 // The coordinator settles the acknowledged snapshot
                 // (task 4.3) and the worker waits for the save result
                 // before reporting resumability. A save failure is fatal:
@@ -1922,17 +1918,30 @@ async fn consume_pipelined_body(
             Err(e) => {
                 // Body faults (reset, truncation, idle timeout, overrun)
                 // arrive classified (§32); the worker maps them onto the
-                // shared retry/coordination policy. Bytes received past the
-                // acknowledged frontier are lost with the attempt: count
-                // them as wasted at this lease boundary (task 5.4) — the
-                // frontier separates the receipt high-watermark from the
-                // acknowledged prefix, so re-received payload is never
-                // conflated with unique coverage.
+                // shared retry/coordination policy. Task 2.7: retryable
+                // errors DRAIN the outstanding writes first so the retry
+                // requeues from the settled acknowledged prefix — never
+                // past a gap. Fatal and generation-change errors return
+                // immediately; worker exit hygiene (detach + discard)
+                // settles their queued work before reclaim.
                 drop(reservation.take());
-                let wasted = frontier
-                    .received_high_water()
-                    .saturating_sub(frontier.acknowledged_through());
-                return Err(worker_error_from_failure(e, None, classifier, wasted));
+                match worker_error_from_failure(e, None, classifier, 0) {
+                    WorkerError::Retryable {
+                        error, retry_after, ..
+                    } => {
+                        drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions)
+                            .await?;
+                        let wasted = frontier
+                            .received_high_water()
+                            .saturating_sub(frontier.acknowledged_through());
+                        return Err(WorkerError::Retryable {
+                            error,
+                            retry_after,
+                            wasted,
+                        });
+                    }
+                    other => return Err(other),
+                }
             }
         }
     }
@@ -2775,6 +2784,294 @@ mod write_pipeline_tests {
             content,
             "backpressured pipeline still produces byte-exact output"
         );
+    }
+
+    /// Task 2.7 (retry): a retryable body fault DRAINS the outstanding
+    /// writes before the lease requeues, so the retry resumes from the
+    /// settled acknowledged prefix — here exactly [1000, 1999] — and the
+    /// union stays byte-exact with no double-credited coverage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_retry_after_body_fault_resumes_from_the_settled_prefix() {
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let scripted = ScriptedHttp::new()
+            .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+                status: 200,
+                total_size: Some(TOTAL),
+                accept_ranges: true,
+                range_verified: true,
+                ..ProbeMetadata::default()
+            }))
+            .expect_unordered_ranges(
+                "pipelined-retry",
+                vec![
+                    // First attempt: chunk 1 delivered, then the connection
+                    // dies (retryable). Chunk 1's write settles during the
+                    // drain before the retry.
+                    TransferStep::new()
+                        .range((0, TOTAL - 1))
+                        .ok(TransferOk::new()
+                            .range(0, TOTAL - 1)
+                            .total(TOTAL)
+                            .chunk(content[..1000].to_vec())
+                            .fault(DownloadError::Connection("scripted reset".into()))),
+                    // The retry must request exactly the unsettled tail.
+                    TransferStep::new()
+                        .range((1000, TOTAL - 1))
+                        .ok(TransferOk::new()
+                            .range(1000, TOTAL - 1)
+                            .total(TOTAL)
+                            .chunk(content[1000..].to_vec())),
+                ],
+            );
+        let mut config = pipeline_config(true, 2);
+        config.retry.base_delay = Duration::from_millis(5);
+        config.retry.max_delay = Duration::from_millis(10);
+        let controller =
+            SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config);
+        let result = controller
+            .run(DownloadRequest::new(
+                "https://scripted/retry",
+                destination.clone(),
+            ))
+            .await
+            .expect("terminal");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(
+            std::fs::read(&destination).expect("content"),
+            content,
+            "retry from the settled prefix must complete byte-exactly"
+        );
+        assert_eq!(result.completed_bytes, TOTAL, "unique coverage once");
+        assert!(
+            result.bytes_downloaded_from_network >= TOTAL,
+            "wire bytes cover the payload (any waste is accounted separately)"
+        );
+    }
+
+    /// Task 2.7 (pause + durable sync-before-save): pausing mid-transfer
+    /// with queued writes drains them first; the coordinator persists the
+    /// acknowledged prefix (durable mode synchronizes first) and the pause
+    /// cannot settle while a write is still blocked on the slow sink.
+    /// After resume the unsettled tail is re-requested exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_pause_drains_queued_writes_before_the_checkpoint_save() {
+        use crate::config::DurabilityMode;
+        use crate::resume::job_identity;
+
+        let content = content();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("output.bin");
+        let registration = OutputFaultScript::register(&destination);
+        let gate = registration.script().hold_next(OutputOperation::Write);
+
+        // One lease [0, 1999]: chunk 1, then a body that only wakes on
+        // cancellation (pause is observed by the engine's body wrapper).
+        // The resumed tail arrives through a second scripted range step,
+        // which the paused-and-drained attempt re-requests deterministically.
+        let scripted = ScriptedHttp::new()
+            .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+                status: 200,
+                total_size: Some(TOTAL),
+                accept_ranges: true,
+                range_verified: true,
+                ..ProbeMetadata::default()
+            }))
+            .expect_unordered_ranges(
+                "pipelined-pause",
+                vec![
+                    TransferStep::new()
+                        .range((0, TOTAL - 1))
+                        .ok(TransferOk::new()
+                            .range(0, TOTAL - 1)
+                            .total(TOTAL)
+                            .chunk(content[..1000].to_vec())
+                            .wait_for_cancellation()),
+                    TransferStep::new()
+                        .range((1000, TOTAL - 1))
+                        .ok(TransferOk::new()
+                            .range(1000, TOTAL - 1)
+                            .total(TOTAL)
+                            .chunk(content[1000..].to_vec())),
+                ],
+            );
+
+        let mut config = pipeline_config(true, 2);
+        config.transfer.durability = DurabilityMode::Durable;
+        // The parked body read times out quickly after resume, ending the
+        // attempt with its acknowledged prefix; the retry then fetches the
+        // exact tail (engine semantics for a stalled connection).
+        let scripted = scripted.with_read_idle_timeout(Duration::from_millis(500));
+        config.retry.base_delay = Duration::from_millis(5);
+        config.retry.max_delay = Duration::from_millis(10);
+        let controller =
+            SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config);
+        let (handle, task) = controller.start(DownloadRequest::new(
+            "https://scripted/pause-drain",
+            destination.clone(),
+        ));
+        let gate = tokio::task::spawn_blocking(move || {
+            gate.wait_until_entered();
+            gate
+        })
+        .await
+        .expect("gate waiter");
+
+        // Chunk 1 was received and its write is blocked on the slow sink.
+        wait_for(
+            || handle.snapshot().network_bytes >= 1000,
+            Duration::from_secs(5),
+            "first chunk received and write gated",
+        );
+
+        handle.pause();
+        // The pause must NOT settle (save) while the drain is blocked on
+        // the slow sink: the job stays operational and nothing publishes
+        // past the blocked write.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handle.state().is_terminal(),
+            "drain must gate the pause boundary"
+        );
+        assert_eq!(
+            handle.snapshot().completed_bytes,
+            0,
+            "no acknowledged coverage exists while the write is blocked"
+        );
+
+        // Releasing the sink lets the drain finish; the coordinator then
+        // runs the durable sync-before-save for the acknowledged prefix.
+        gate.release();
+        let identity = job_identity("https://scripted/pause-drain", &destination);
+        let sidecar = directory.path().join(format!("{identity}.kdown"));
+        wait_for(
+            || sidecar.exists(),
+            Duration::from_secs(10),
+            "durable checkpoint saved after the drained pause",
+        );
+
+        // Resume: the stalled attempt ends at its acknowledged prefix and
+        // the tail is re-fetched; the job completes byte-exactly.
+        handle.resume_now();
+        let result = task.await.expect("job task").expect("job completes");
+        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert_eq!(
+            std::fs::read(&destination).expect("content"),
+            content,
+            "resume after drained pause completes byte-exactly"
+        );
+        assert_eq!(result.completed_bytes, TOTAL, "unique coverage once");
+    }
+
+    /// Task 2.7 (cancellation): cancelling with queued writes converges
+    /// deterministically — delete-partial removes the artifact, keep-partial
+    /// preserves it; neither hangs on queued writes or leaks budget permits
+    /// (a leak would deadlock the drain and trip the timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_cancellation_with_queued_writes_converges_without_leaks() {
+        use crate::job::controller::CancelMode;
+        for mode in [CancelMode::DeletePartial, CancelMode::KeepPartial] {
+            let content = content();
+            let directory = tempfile::tempdir().expect("tempdir");
+            let destination = directory.path().join("output.bin");
+            let registration = OutputFaultScript::register(&destination);
+            let gate = registration.script().hold_next(OutputOperation::Write);
+
+            let controller = SingleStreamController::with_execution(
+                HttpExecution::from_adapter(pipeline_http(&content)),
+                pipeline_config(true, 2),
+            );
+            let (handle, task) = controller.start(DownloadRequest::new(
+                "https://scripted/cancel",
+                destination.clone(),
+            ));
+            let gate = tokio::task::spawn_blocking(move || {
+                gate.wait_until_entered();
+                gate
+            })
+            .await
+            .expect("gate waiter");
+            wait_for(
+                || handle.snapshot().network_bytes == TOTAL,
+                Duration::from_secs(5),
+                "queued writes exist at cancel time",
+            );
+
+            handle.cancel_with(mode);
+            // The in-flight write always completes (a real sink never
+            // blocks forever); release the test gate so it settles.
+            gate.release();
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("cancellation must converge without deadlock")
+                .expect("terminal")
+                .expect("job task");
+            assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+
+            let partial = directory.path().join("output.bin.part");
+            match mode {
+                CancelMode::DeletePartial => {
+                    assert!(!partial.exists(), "delete-partial removes the artifact");
+                    assert!(!destination.exists(), "no published output on cancel");
+                }
+                CancelMode::KeepPartial => {
+                    assert!(partial.exists(), "keep-partial preserves the artifact");
+                    assert!(!destination.exists(), "cancel never publishes");
+                }
+                CancelMode::KeepFileDiscardCheckpoint => unreachable!(),
+            }
+        }
+    }
+
+    /// Task 2.7 (fatal write errors): ENOSPC and permission-denied surface
+    /// as structured failures, publish nothing, and the job terminates
+    /// promptly — no permit leak can deadlock the pipeline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_write_failures_fail_closed_without_leaks() {
+        for (kind, reason) in [
+            ("disk-full", "scripted ENOSPC"),
+            ("permission", "scripted EACCES"),
+        ] {
+            let expected = if kind == "disk-full" {
+                DownloadError::DiskFull(reason.into())
+            } else {
+                DownloadError::PermissionDenied(reason.into())
+            };
+            let content = content();
+            let directory = tempfile::tempdir().expect("tempdir");
+            let destination = directory.path().join("output.bin");
+            let registration = OutputFaultScript::register(&destination);
+            let expected_category = expected.category();
+            registration
+                .script()
+                .fail_next(OutputOperation::Write, expected);
+
+            let controller = SingleStreamController::with_execution(
+                HttpExecution::from_adapter(pipeline_http(&content)),
+                pipeline_config(true, 2),
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                controller.run(DownloadRequest::new(
+                    "https://scripted/fail",
+                    destination.clone(),
+                )),
+            )
+            .await
+            .expect("write failure must terminate without deadlock")
+            .expect("terminal");
+            assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+            assert_eq!(
+                result.error.as_ref().map(DownloadError::category),
+                Some(expected_category),
+                "structured sink error surfaces"
+            );
+            assert!(
+                !destination.exists(),
+                "a failed job never publishes unverified bytes"
+            );
+        }
     }
 
     /// The legacy path (default) is unaffected by the switch: identical
