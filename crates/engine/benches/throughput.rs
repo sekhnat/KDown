@@ -434,6 +434,10 @@ struct ResourceRecord {
     size_ok: bool,
     /// Verification: final content hash matches the fixture.
     hash_ok: bool,
+    /// Process thread-count delta around the run (write-path gate, task
+    /// 2.8): legacy lanes shut down (≈0), the pipelined executor keeps its
+    /// configured pool (+writer_threads). `None` when not sampled.
+    threads_delta: Option<i64>,
 }
 
 impl ResourceRecord {
@@ -580,13 +584,14 @@ async fn measure_download(
         published,
         size_ok,
         hash_ok,
+        threads_delta: None,
     };
     (result, record)
 }
 
 fn fmt_record(name: &str, r: &ResourceRecord) -> String {
     format!(
-        "| {name} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {name} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}  | {} |",
         r.useful_goodput_mib_s(),
         r.wire_throughput_mib_s(),
         r.completed_bytes,
@@ -608,7 +613,9 @@ fn fmt_record(name: &str, r: &ResourceRecord) -> String {
                 r.server_connections.unwrap_or(0),
                 r.server_requests.unwrap_or(0)
             ),
-        )
+        ),
+        r.threads_delta
+            .map_or_else(|| "n/r".into(), |t| format!("{t:+}")),
     )
 }
 
@@ -1017,6 +1024,12 @@ fn main() {
         run_adaptive_compare();
         return;
     }
+    // Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
+    // executor across H1/H2 and shaped/unshaped shapes.
+    if args.iter().any(|a| a == "--write-path-compare") {
+        run_write_path_compare();
+        return;
+    }
     // Target-sizing sweep (task 6.3): explicit initial sizes × automatic
     // oversubscription factors × H1/H2, recording useful goodput and
     // request/retry overhead to benches/results/sweep/records.md.
@@ -1027,7 +1040,11 @@ fn main() {
     // Multi-job contention harness (task 0.3): one-job baseline,
     // same-origin contention and multi-origin isolation, in-process.
     if args.iter().any(|a| a == "--jobs-smoke") {
-        run_jobs_matrix();
+        run_jobs_matrix(false);
+        return;
+    }
+    if args.iter().any(|a| a == "--jobs-pipeline") {
+        run_jobs_matrix(true);
         return;
     }
     // Client-only mode against a process-isolated fixture server (task 1.4):
@@ -1052,6 +1069,7 @@ fn main() {
             arg_value(&args, "--isolated-label").unwrap_or_else(|| "isolated".to_string()),
             arg_value(&args, "--isolated-ca"),
             arg_value(&args, "--isolated-dest"),
+            args.iter().any(|a| a == "--isolated-pipeline"),
         );
         return;
     }
@@ -1081,6 +1099,7 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 /// record client-only resources (task 1.4). With `ca` (PEM path) the URL
 /// becomes https and the CA bundle is trusted — the isolated fixture then
 /// speaks TLS/H2 via `--tls-cert`/`--tls-key` (task 0.2).
+#[allow(clippy::too_many_arguments)]
 fn run_isolated_client(
     addr: String,
     size: Option<String>,
@@ -1089,6 +1108,7 @@ fn run_isolated_client(
     label: String,
     ca: Option<String>,
     dest_dir: Option<String>,
+    pipeline: bool,
 ) {
     let Some(size_str) = size else {
         eprintln!("--isolated requires --isolated-size (e.g. 1GiB)");
@@ -1098,6 +1118,7 @@ fn run_isolated_client(
         eprintln!("--isolated-size must parse (e.g. 32MiB, 1GiB): {size_str}");
         std::process::exit(2);
     };
+    let threads_before = process_thread_count();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .enable_all()
@@ -1117,6 +1138,7 @@ fn run_isolated_client(
         cfg.transfer.min_workers = workers.min(2);
         cfg.network.response_header_timeout = Duration::from_secs(30);
         cfg.network.read_idle_timeout = Duration::from_secs(30);
+        cfg.write_executor.pipeline_writes = pipeline;
         let scheme = if let Some(ca) = &ca {
             cfg.tls.custom_ca_bundle = Some(std::path::PathBuf::from(ca));
             "https"
@@ -1168,6 +1190,15 @@ fn run_isolated_client(
         }
         record
     });
+    let record = ResourceRecord {
+        threads_delta: Some(process_thread_count() as i64 - threads_before as i64),
+        ..record
+    };
+    let label = if pipeline {
+        format!("{label}-pipelined")
+    } else {
+        label
+    };
     emit_report(
         &format!("isolated/{label}"),
         &[(format!("isolated/{label}"), record)],
@@ -1179,7 +1210,7 @@ fn run_isolated_client(
 /// servers), on H1 and H2. One measured run per configuration; per-job rows
 /// plus an aggregate row (total bytes / batch wall). CPU/RSS are process-wide
 /// and therefore shared across concurrent jobs (noted in the report).
-fn run_jobs_matrix() {
+fn run_jobs_matrix(pipeline: bool) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(16)
         .enable_all()
@@ -1211,6 +1242,7 @@ fn run_jobs_matrix() {
                     cfg.transfer.segmentation_threshold = 1;
                     cfg.transfer.max_workers = workers;
                     cfg.transfer.min_workers = workers.min(2);
+                    cfg.write_executor.pipeline_writes = pipeline;
                     cfg.network.response_header_timeout = Duration::from_secs(30);
                     cfg.network.read_idle_timeout = Duration::from_secs(30);
                     let url = if protocol == "h1" {
@@ -1358,6 +1390,37 @@ fn run_sweep() {
 /// configuration over {unconstrained, shaped (per-connection 16 MiB/s
 /// pacing)} × {h1, h2} × {fixed-4, adaptive(1-4)}. Records useful goodput,
 /// wire overhead and worker stability to benches/results/adaptive-compare/.
+/// Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
+/// executor across H1/H2, shaped/unshaped, with repetitions and process
+/// thread-count deltas (writer-thread scaling evidence).
+fn run_write_path_compare() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let reps = 3;
+    let mut records: Vec<(String, ResourceRecord)> = Vec::new();
+    for protocol in ["h1", "h2"] {
+        for shaped in [false, true] {
+            let shape_label = if shaped { "shaped" } else { "unshaped" };
+            // Shaped runs are slow; use a smaller fixture there.
+            let size = if shaped { 64 * mib } else { 256 * mib };
+            for pipeline in [false, true] {
+                let path_label = if pipeline { "pipelined" } else { "legacy" };
+                for rep in 0..reps {
+                    records.push((
+                        format!("write-path/{protocol}/{shape_label}/{path_label}/rep{rep}"),
+                        compare_run(&rt, protocol, size, shaped, false, pipeline),
+                    ));
+                }
+            }
+        }
+    }
+    emit_report("write-path-compare", &records);
+}
+
 fn run_adaptive_compare() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
@@ -1372,11 +1435,11 @@ fn run_adaptive_compare() {
             let shape_label = if shaped { "shaped" } else { "unshaped" };
             records.push((
                 format!("compare/{protocol}/{shape_label}/fixed-4"),
-                compare_run(&rt, protocol, size, shaped, false),
+                compare_run(&rt, protocol, size, shaped, false, false),
             ));
             records.push((
                 format!("compare/{protocol}/{shape_label}/adaptive-1-4"),
-                compare_run(&rt, protocol, size, shaped, true),
+                compare_run(&rt, protocol, size, shaped, true, false),
             ));
         }
     }
@@ -1384,14 +1447,17 @@ fn run_adaptive_compare() {
 }
 
 /// One comparison run; adaptive mode probes 1..=4 workers on useful goodput.
+#[allow(clippy::too_many_arguments)]
 fn compare_run(
     rt: &tokio::runtime::Runtime,
     protocol: &str,
     size: u64,
     shaped: bool,
     adaptive: bool,
+    pipeline: bool,
 ) -> ResourceRecord {
-    rt.block_on(async {
+    let threads_before = process_thread_count();
+    let record = rt.block_on(async {
         let content = synthetic_fixture(size);
         let expected_hash = content.sha256();
         let mut cfg = EngineConfig::default();
@@ -1402,6 +1468,7 @@ fn compare_run(
         if adaptive {
             cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
         }
+        cfg.write_executor.pipeline_writes = pipeline;
         cfg.network.response_header_timeout = Duration::from_secs(30);
         cfg.network.read_idle_timeout = Duration::from_secs(30);
         // Per-connection pacing shapes the server (16 MiB/s per 64 KiB chunk
@@ -1432,11 +1499,28 @@ fn compare_run(
         assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
-            "adaptive-compare verification failed: {}",
+            "compare verification failed: {}",
             record.verification()
         );
         record
-    })
+    });
+    ResourceRecord {
+        threads_delta: Some(process_thread_count() as i64 - threads_before as i64),
+        ..record
+    }
+}
+
+/// Process thread count from /proc/self/status (`Threads:`).
+fn process_thread_count() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// HTTP/1.1 fixture server with optional per-chunk pacing (shaped cases).
