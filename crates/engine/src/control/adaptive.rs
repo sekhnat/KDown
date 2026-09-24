@@ -27,6 +27,25 @@ pub struct AdaptiveConfig {
     pub max_retries_per_window: u64,
     /// Maximum tolerated throttle responses (429/503) per window.
     pub max_throttled_per_window: u64,
+    /// Storage-pressure veto (task 4.2): outstanding-write depth p95 at or
+    /// above which growth is suppressed even when raw network goodput rises.
+    /// Provisional until the phase-4 gate records measured thresholds.
+    pub writer_queue_p95_ceiling: f64,
+    /// Acknowledgement-latency p95 (ms) at or above which growth is
+    /// suppressed — a sink that acknowledges slowly must not be fed harder.
+    pub writer_ack_p95_ceiling_ms: f64,
+    /// Byte-budget wait (ms per window) at or above which growth is
+    /// suppressed (workers blocked on the write-byte budget).
+    pub budget_wait_ceiling_ms: u64,
+    /// Process RSS ceiling in bytes above which growth is suppressed.
+    pub rss_ceiling_bytes: u64,
+    /// Window CPU ceiling as a percentage of one core above which growth is
+    /// suppressed.
+    pub cpu_ceiling_percent: f64,
+    /// Consecutive pressure windows required before REDUCING (task 4.2
+    /// hysteresis): one saturated window vetoes growth but does not shrink
+    /// the level; an in-flight probe still reverts immediately.
+    pub sustained_pressure_windows: u32,
 }
 
 impl Default for AdaptiveConfig {
@@ -37,6 +56,12 @@ impl Default for AdaptiveConfig {
             cooldown: Duration::from_millis(1000),
             max_retries_per_window: 2,
             max_throttled_per_window: 0,
+            writer_queue_p95_ceiling: 8.0,
+            writer_ack_p95_ceiling_ms: 250.0,
+            budget_wait_ceiling_ms: 250,
+            rss_ceiling_bytes: 1024 * 1024 * 1024,
+            cpu_ceiling_percent: 400.0,
+            sustained_pressure_windows: 2,
         }
     }
 }
@@ -83,6 +108,13 @@ pub struct WindowSample {
     /// Worker time blocked waiting for write-byte budget over the window
     /// (ms); `0` on the legacy writer-lane path (no byte budget).
     pub budget_wait_ms: u64,
+    /// Process resident set size at the window boundary (bytes); `None`
+    /// when the platform cannot report it (labeled unavailable, never
+    /// guessed).
+    pub rss_bytes: Option<u64>,
+    /// CPU consumed during the window as a percentage of one core; `None`
+    /// when unavailable.
+    pub cpu_percent: Option<f64>,
     /// Window length (real elapsed).
     pub elapsed: Duration,
 }
@@ -103,6 +135,33 @@ impl WindowSample {
             || self.wasted_bytes > 0
                 && self.wasted_bytes >= self.completed_bytes
                 && self.completed_bytes > 0
+    }
+
+    /// Storage-pressure signals (task 4.2): writer backlog or acknowledgement
+    /// latency beyond the configured ceilings, or workers blocked on the
+    /// write-byte budget. These veto growth regardless of raw network
+    /// throughput — a saturated sink must not be fed harder, or the
+    /// bottleneck simply hides in queued payload.
+    #[must_use]
+    pub fn storage_pressure(&self, config: &AdaptiveConfig) -> bool {
+        self.writer_queue_p95
+            .is_some_and(|p95| p95 >= config.writer_queue_p95_ceiling)
+            || self
+                .writer_ack_p95_ms
+                .is_some_and(|p95| p95 >= config.writer_ack_p95_ceiling_ms)
+            || self.budget_wait_ms >= config.budget_wait_ceiling_ms
+    }
+
+    /// Process-resource pressure (task 4.2): RSS or CPU above the configured
+    /// ceilings. Unavailable signals never trigger — they are reported as
+    /// unavailable rather than guessed.
+    #[must_use]
+    pub fn resource_pressure(&self, config: &AdaptiveConfig) -> bool {
+        self.rss_bytes
+            .is_some_and(|rss| rss >= config.rss_ceiling_bytes)
+            || self
+                .cpu_percent
+                .is_some_and(|cpu| cpu >= config.cpu_ceiling_percent)
     }
 }
 
@@ -158,6 +217,38 @@ impl WorkerActivity {
     }
 }
 
+/// Why the controller reached its last decision (tasks 4.2/4.4): stable
+/// report reason codes, so a phase report can explain holds and reductions
+/// without changing the decision enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecisionReason {
+    /// No window has been evaluated yet.
+    None,
+    /// A manual override pins concurrency for the job's remainder.
+    ManualOverride,
+    /// The window observed no traffic; the baseline is untouched.
+    EmptyWindow,
+    /// A cooldown from an earlier change or veto is still active.
+    Cooldown,
+    /// The first observation established the comparison baseline.
+    Baseline,
+    /// A probe's marginal goodput gain was material and its cost bounded.
+    GainKept,
+    /// A probe's marginal gain was not material; it was reverted.
+    NoGainReverted,
+    /// A stable level with no pressure: probe one more worker.
+    Probe,
+    /// Retry/throttle pressure (immediate response).
+    RetryPressure,
+    /// Writer backlog, acknowledgement latency or byte-budget wait.
+    StoragePressure,
+    /// Process RSS or CPU above the configured ceiling.
+    ResourcePressure,
+    /// The configured maximum is already reached.
+    AtMaximum,
+}
+
 /// The controller's decision for one window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -187,6 +278,11 @@ pub struct AdaptiveController {
     /// Manual override active: the controller suspends for the job's
     /// remainder (design D5).
     manual_override: bool,
+    /// Consecutive windows under storage/resource pressure (task 4.2
+    /// hysteresis: sustained pressure reduces, one window only vetoes).
+    pressure_windows: u32,
+    /// Reason code for the last decision (tasks 4.2/4.4).
+    reason: DecisionReason,
 }
 
 impl AdaptiveController {
@@ -203,7 +299,16 @@ impl AdaptiveController {
             pre_probe_level: None,
             cooldown_until: None,
             manual_override: false,
+            pressure_windows: 0,
+            reason: DecisionReason::None,
         }
+    }
+
+    /// Reason code for the last decision (tasks 4.2/4.4): lets reports and
+    /// diagnostics explain why concurrency was held or reduced.
+    #[must_use]
+    pub fn last_reason(&self) -> DecisionReason {
+        self.reason
     }
 
     /// A manual `set_concurrency` occurred: pin the desired count and
@@ -231,11 +336,13 @@ impl AdaptiveController {
     pub fn decide(&mut self, sample: WindowSample, current: u64) -> Decision {
         // Manual override wins unconditionally (task 9.3 precedence).
         if self.manual_override {
+            self.reason = DecisionReason::ManualOverride;
             return Decision::Hold;
         }
         // Empty window (no elapsed time or no bytes at all): hold without
         // disturbing the baseline (task 9.2: empty windows never decide).
         if sample.elapsed.is_zero() || sample.completed_bytes == 0 && sample.network_bytes == 0 {
+            self.reason = DecisionReason::EmptyWindow;
             return Decision::Hold;
         }
 
@@ -248,28 +355,56 @@ impl AdaptiveController {
         });
 
         let now = Instant::now();
-        // Pressure: hold or reduce — never probe into trouble (task 9.3).
-        if sample.under_pressure(&self.config) {
-            self.cooldown_until = Some(now + self.config.cooldown);
-            // An active probe under pressure: revert to the pre-probe level.
+        // Pressure: hold or reduce — never probe into trouble (tasks 9.3 and
+        // 4.2). Retry/throttle pressure responds immediately; storage and
+        // resource pressure veto growth on the first saturated window but
+        // only shrink after the configured number of sustained windows, so
+        // one noisy sample cannot oscillate the level.
+        let retry_pressure = sample.under_pressure(&self.config);
+        let storage_pressure = sample.storage_pressure(&self.config);
+        let resource_pressure = sample.resource_pressure(&self.config);
+        if retry_pressure || storage_pressure || resource_pressure {
+            self.reason = if retry_pressure {
+                DecisionReason::RetryPressure
+            } else if storage_pressure {
+                DecisionReason::StoragePressure
+            } else {
+                DecisionReason::ResourcePressure
+            };
+            self.pressure_windows = if retry_pressure {
+                self.config.sustained_pressure_windows.max(1)
+            } else {
+                self.pressure_windows.saturating_add(1)
+            };
+            // A probe that coincides with pressure has no support: revert to
+            // the pre-probe level regardless of the raw goodput it produced
+            // (marginal gain is only kept when its cost is bounded).
             if let Some(pre) = self.pre_probe_level.take() {
                 self.baseline_goodput = self.smoothed_goodput;
+                self.cooldown_until = Some(now + self.config.cooldown);
                 return if pre < current {
                     Decision::Reduce
                 } else {
                     Decision::Hold
                 };
             }
-            return if current > self.min {
+            if self.pressure_windows >= self.config.sustained_pressure_windows.max(1) {
                 self.baseline_goodput = self.smoothed_goodput;
                 self.cooldown_until = Some(now + self.config.cooldown);
-                Decision::Reduce
-            } else {
-                Decision::Hold
-            };
+                if current > self.min {
+                    return Decision::Reduce;
+                }
+                return Decision::Hold;
+            }
+            // First saturated window: veto growth, hold the level and cool
+            // down; recovery can probe again afterwards.
+            self.cooldown_until = Some(now + self.config.cooldown);
+            return Decision::Hold;
         }
+        self.pressure_windows = 0;
 
         if self.in_cooldown(now) {
+            self.reason = DecisionReason::Cooldown;
             return Decision::Hold;
         }
 
@@ -278,6 +413,7 @@ impl AdaptiveController {
             (None, _) => {
                 self.baseline_goodput = self.smoothed_goodput;
                 self.pre_probe_level = None;
+                self.reason = DecisionReason::Baseline;
                 Decision::Hold
             }
             // A probe is in flight: compare against the baseline.
@@ -292,8 +428,10 @@ impl AdaptiveController {
                     self.cooldown_until = Some(now + self.config.cooldown);
                     if current < self.max {
                         self.pre_probe_level = Some(current);
+                        self.reason = DecisionReason::GainKept;
                         Decision::ProbeUp
                     } else {
+                        self.reason = DecisionReason::AtMaximum;
                         Decision::Hold
                     }
                 } else {
@@ -302,6 +440,7 @@ impl AdaptiveController {
                     self.pre_probe_level = None;
                     self.baseline_goodput = self.smoothed_goodput;
                     self.cooldown_until = Some(now + self.config.cooldown);
+                    self.reason = DecisionReason::NoGainReverted;
                     if current > self.min {
                         Decision::Reduce
                     } else {
@@ -315,8 +454,10 @@ impl AdaptiveController {
                 if current < self.max {
                     self.pre_probe_level = Some(current);
                     self.cooldown_until = Some(now + self.config.cooldown);
+                    self.reason = DecisionReason::Probe;
                     Decision::ProbeUp
                 } else {
+                    self.reason = DecisionReason::AtMaximum;
                     Decision::Hold
                 }
             }
@@ -353,6 +494,8 @@ mod tests {
             writer_queue_p50: None,
             writer_queue_p95: None,
             budget_wait_ms: 0,
+            rss_bytes: None,
+            cpu_percent: None,
             elapsed: Duration::from_millis(window_ms),
         }
     }
@@ -495,6 +638,8 @@ mod tests {
             writer_queue_p50: None,
             writer_queue_p95: None,
             budget_wait_ms: 0,
+            rss_bytes: None,
+            cpu_percent: None,
             elapsed: Duration::from_secs(1),
         };
         assert_eq!(sample.useful_goodput(), 1000.0);
@@ -550,6 +695,174 @@ mod tests {
         assert_eq!(WorkerActivity::idle_ratio(0, 0), 0.0);
         assert_eq!(WorkerActivity::idle_ratio(100, 0), 0.0);
         assert_eq!(WorkerActivity::idle_ratio(0, 100), 1.0);
+    }
+
+    /// A synthetic window with writer/process instrumentation (task 4.2):
+    /// tests drive the veto paths deterministically instead of racing a
+    /// real sink.
+    fn instrumented_sample(completed: u64, window_ms: u64) -> WindowSample {
+        WindowSample {
+            completed_bytes: completed,
+            network_bytes: completed,
+            elapsed: Duration::from_millis(window_ms),
+            ..WindowSample::default()
+        }
+    }
+
+    /// Pressure predicates at the configured ceilings (task 4.2): at-or-above
+    /// is pressure, unavailable signals are not.
+    #[test]
+    fn pressure_predicates_are_threshold_exact() {
+        let config = AdaptiveConfig::default();
+        let mut sample = instrumented_sample(1000, 500);
+        assert!(!sample.storage_pressure(&config));
+        assert!(!sample.resource_pressure(&config));
+        sample.writer_queue_p95 = Some(config.writer_queue_p95_ceiling);
+        assert!(sample.storage_pressure(&config), "queue p95 at ceiling");
+        sample.writer_queue_p95 = None;
+        sample.writer_ack_p95_ms = Some(config.writer_ack_p95_ceiling_ms);
+        assert!(sample.storage_pressure(&config), "ack p95 at ceiling");
+        sample.writer_ack_p95_ms = None;
+        sample.budget_wait_ms = config.budget_wait_ceiling_ms;
+        assert!(sample.storage_pressure(&config), "budget wait at ceiling");
+        sample.budget_wait_ms = 0;
+        sample.rss_bytes = Some(config.rss_ceiling_bytes);
+        assert!(sample.resource_pressure(&config), "rss at ceiling");
+        sample.rss_bytes = None;
+        sample.cpu_percent = Some(config.cpu_ceiling_percent);
+        assert!(sample.resource_pressure(&config), "cpu at ceiling");
+        sample.cpu_percent = None;
+        assert!(
+            !sample.storage_pressure(&config) && !sample.resource_pressure(&config),
+            "unavailable signals never trigger pressure"
+        );
+    }
+
+    /// Storage saturation reverts a probe that raised raw goodput (task 4.2):
+    /// a saturated sink must not be fed harder, and recovery still probes.
+    #[test]
+    fn storage_saturation_reverts_a_probe_despite_raw_gain() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 1),
+            Decision::Hold
+        );
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 1),
+            Decision::ProbeUp
+        );
+        controller.cooldown_until = None;
+        // The probe window reports 4x the raw goodput but a writer backlog
+        // above the ceiling: the increase is reverted, not kept.
+        let mut saturated = instrumented_sample(2_000_000, 500);
+        saturated.writer_queue_p95 = Some(config.writer_queue_p95_ceiling + 4.0);
+        assert_eq!(controller.decide(saturated, 2), Decision::Reduce);
+        assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
+        // After the cooldown, a recovered window probes again.
+        controller.cooldown_until = None;
+        assert_eq!(
+            controller.decide(instrumented_sample(600_000, 500), 1),
+            Decision::ProbeUp
+        );
+        assert_eq!(controller.last_reason(), DecisionReason::Probe);
+    }
+
+    /// One saturated window vetoes growth; sustained saturation reduces
+    /// (task 4.2 hysteresis).
+    #[test]
+    fn sustained_storage_pressure_reduces_after_the_configured_windows() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 4),
+            Decision::Hold
+        );
+        let mut saturated = instrumented_sample(500_000, 500);
+        saturated.budget_wait_ms = config.budget_wait_ceiling_ms + 50;
+        // First saturated window: veto growth, keep the level.
+        assert_eq!(controller.decide(saturated, 4), Decision::Hold);
+        assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
+        // Second consecutive saturated window: reduce.
+        controller.cooldown_until = None;
+        assert_eq!(controller.decide(saturated, 4), Decision::Reduce);
+        assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
+        // The floor still holds.
+        controller.cooldown_until = None;
+        assert_eq!(controller.decide(saturated, 1), Decision::Hold);
+    }
+
+    /// High RSS or CPU vetoes growth and never fabricates an unavailable
+    /// measurement into pressure (task 4.2).
+    #[test]
+    fn process_resource_pressure_vetoes_growth() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 1),
+            Decision::Hold
+        );
+        let mut high_rss = instrumented_sample(900_000, 500);
+        high_rss.rss_bytes = Some(config.rss_ceiling_bytes + 1024);
+        assert_eq!(controller.decide(high_rss, 1), Decision::Hold);
+        assert_eq!(controller.last_reason(), DecisionReason::ResourcePressure);
+        controller.cooldown_until = None;
+        let mut high_cpu = instrumented_sample(900_000, 500);
+        high_cpu.cpu_percent = Some(config.cpu_ceiling_percent + 100.0);
+        assert_eq!(controller.decide(high_cpu, 1), Decision::Hold);
+        assert_eq!(controller.last_reason(), DecisionReason::ResourcePressure);
+        // Recovery: a clean window with no resource data probes again.
+        controller.cooldown_until = None;
+        assert_eq!(
+            controller.decide(instrumented_sample(950_000, 500), 1),
+            Decision::ProbeUp
+        );
+    }
+
+    /// Acknowledged-latency saturation is storage pressure on its own
+    /// (task 4.2): slow acknowledgements mean the sink is the bottleneck.
+    #[test]
+    fn acknowledgement_latency_is_storage_pressure() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 1),
+            Decision::Hold
+        );
+        let mut slow_ack = instrumented_sample(1_500_000, 500);
+        slow_ack.writer_ack_p95_ms = Some(config.writer_ack_p95_ceiling_ms * 2.0);
+        assert_eq!(controller.decide(slow_ack, 1), Decision::Hold);
+        assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
+        // An in-flight probe under slow acknowledgements reverts too.
+        controller.cooldown_until = None;
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 1),
+            Decision::ProbeUp
+        );
+        controller.cooldown_until = None;
+        assert_eq!(controller.decide(slow_ack, 2), Decision::Reduce);
+        assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
+    }
+
+    /// Retry and 429/503 pressure still respond immediately (task 9.3
+    /// behavior preserved by task 4.2) and report their own reason.
+    #[test]
+    fn retry_and_throttle_pressure_still_reduce_immediately() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        assert_eq!(
+            controller.decide(instrumented_sample(500_000, 500), 4),
+            Decision::Hold
+        );
+        let mut retrying = instrumented_sample(500_000, 500);
+        retrying.retries = config.max_retries_per_window + 1;
+        assert_eq!(controller.decide(retrying, 4), Decision::Reduce);
+        assert_eq!(controller.last_reason(), DecisionReason::RetryPressure);
+        controller.cooldown_until = None;
+        let mut throttled = instrumented_sample(500_000, 500);
+        throttled.throttled = config.max_throttled_per_window + 1;
+        assert_eq!(controller.decide(throttled, 4), Decision::Reduce);
+        assert_eq!(controller.last_reason(), DecisionReason::RetryPressure);
     }
 
     /// Strict bounds (task 9.3): apply never leaves [min, max].

@@ -2381,6 +2381,8 @@ struct WindowInputs {
     queue_p50: Option<f64>,
     queue_p95: Option<f64>,
     budget_wait_ms: u64,
+    rss_bytes: Option<u64>,
+    cpu_percent: Option<f64>,
     elapsed: Duration,
 }
 
@@ -2403,6 +2405,8 @@ impl WindowInputs {
             writer_queue_p50: self.queue_p50,
             writer_queue_p95: self.queue_p95,
             budget_wait_ms: self.budget_wait_ms,
+            rss_bytes: self.rss_bytes,
+            cpu_percent: self.cpu_percent,
             elapsed: self.elapsed,
         }
     }
@@ -2433,6 +2437,9 @@ async fn adaptive_controller_loop(
     let mut previous_ack = job.ack_latency_snapshot();
     let mut previous_queue = job.queue_depth_snapshot();
     let mut previous_budget_us = job.budget_wait_us();
+    // Process RSS/CPU for the storage/resource veto (task 4.2); unavailable
+    // measurements stay None and never trigger a veto.
+    let mut resources = crate::metrics::resources::ResourceSampler::new();
     let mut last = Instant::now();
     loop {
         // Task 1.5: the controller exits promptly on the job shutdown
@@ -2470,6 +2477,8 @@ async fn adaptive_controller_loop(
         let queue = job.queue_depth_snapshot();
         let budget_us = job.budget_wait_us();
         let (active_ms, idle_ms) = activity.take();
+        let window = now.saturating_duration_since(last);
+        let (rss_bytes, cpu_percent) = resources.sample(window);
         let (completed, network, wasted, retries) = window_counter_deltas(&previous, &fold);
         let ack_delta = previous_ack.delta(&ack);
         let queue_delta = previous_queue.delta(&queue);
@@ -2486,7 +2495,9 @@ async fn adaptive_controller_loop(
             queue_p50: queue_delta.depth_percentile(0.50),
             queue_p95: queue_delta.depth_percentile(0.95),
             budget_wait_ms: budget_us.saturating_sub(previous_budget_us) / 1000,
-            elapsed: now.saturating_duration_since(last),
+            rss_bytes,
+            cpu_percent,
+            elapsed: window,
         }
         .into_sample();
         previous = fold;
@@ -3100,6 +3111,8 @@ mod write_pipeline_tests {
             queue_p50: Some(1.0),
             queue_p95: Some(2.0),
             budget_wait_ms: 5,
+            rss_bytes: None,
+            cpu_percent: None,
             elapsed: Duration::from_millis(20),
         }
         .into_sample();
@@ -3184,6 +3197,28 @@ mod write_pipeline_tests {
             samples.iter().any(|s| s.writer_queue_p50.is_some()),
             "submitted writes must appear as queue-depth percentiles: {samples:?}"
         );
+        // Process resource signals (task 4.2) reach the controller where the
+        // platform reports them; elsewhere they stay labeled unavailable.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                samples.iter().all(|s| s.rss_bytes.is_some()),
+                "linux windows carry RSS: {samples:?}"
+            );
+            assert!(
+                samples.iter().all(|s| s.cpu_percent.is_some()),
+                "linux windows carry CPU: {samples:?}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                samples
+                    .iter()
+                    .all(|s| s.rss_bytes.is_none() && s.cpu_percent.is_none()),
+                "unavailable resource measurements stay None: {samples:?}"
+            );
+        }
         // Window deltas partition the receipts exactly once: two chunks
         // received and two writes submitted add up to the payload total.
         let total_network: u64 = samples.iter().map(|s| s.network_bytes).sum();
