@@ -18,9 +18,9 @@
 //!   responses (resource-change scenarios).
 //!
 //! Startup protocol (stdout, one per line):
-//!   LISTENING <addr>   — bind address to point clients at
-//!   SIZE <bytes>       — synthetic file length
-//!   SHA256 <hex>       — expected content digest (generator parity check)
+//!   LISTENING \<addr\>   — bind address to point clients at
+//!   SIZE \<bytes\>       — synthetic file length
+//!   SHA256 \<hex\>       — expected content digest (generator parity check)
 //!   READY              — servers are accepting
 //!
 //! The server serves until killed. With `--tls-cert`/`--tls-key` it speaks
