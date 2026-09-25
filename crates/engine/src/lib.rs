@@ -16,12 +16,12 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use kdown_engine::{DownloadRequest, EngineConfig, HttpTransport, SingleStreamController};
+//! use kdown_engine::{DownloadRequest, EngineConfig, HttpTransport, DownloadController};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = EngineConfig::default();
 //! let transport = HttpTransport::from_config(&config)?;
-//! let controller = SingleStreamController::new(transport, config);
+//! let controller = DownloadController::new(transport, config);
 //! let request = DownloadRequest::new(
 //!     "https://example.test/archive.bin",
 //!     PathBuf::from("archive.bin"),
@@ -67,13 +67,13 @@
 //! use kdown_engine::http::probe::ProbeMetadata;
 //! use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 //! use kdown_engine::http::{HttpExecution, HttpBodySource as _};
-//! use kdown_engine::job::controller::{DownloadRequest, SingleStreamController};
+//! use kdown_engine::job::controller::{DownloadRequest, DownloadController};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Compatible production construction (unchanged):
 //! let config = EngineConfig::default();
 //! let transport = kdown_engine::HttpTransport::from_config(&config)?;
-//! let controller = SingleStreamController::new(transport, config);
+//! let controller = DownloadController::new(transport, config);
 //!
 //! // Scripted injection (tests and alternate adapters): the same
 //! // controller code runs against a deterministic adapter with no socket.
@@ -87,7 +87,7 @@
 //!         TransferStep::new()
 //!             .ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
 //!     );
-//! let scripted_controller = SingleStreamController::with_execution(
+//! let scripted_controller = DownloadController::with_execution(
 //!     HttpExecution::from_adapter(scripted),
 //!     EngineConfig::default(),
 //! );
@@ -118,9 +118,14 @@
 //! ## Events and concurrency guarantees
 //!
 //! [`EventHub`] broadcasts lifecycle, segment, progress, retry, resource,
-//! integrity, commit, warning, and failure events. Progress is cadence
-//! batched (default 500 ms) and may be skipped by a lagging subscriber;
-//! callers can always read a current [`ProgressSnapshot`] from the handle.
+//! rate-limit and runtime-concurrency control, integrity, commit, warning,
+//! and failure events. `set_concurrency` publishes
+//! [`Event::ConcurrencyChanged`] with the applied worker count, and
+//! `set_rate_limit` publishes [`Event::RateLimitChanged`] with the
+//! effective limit — each control emits only its own event. Progress is
+//! cadence batched (default 500 ms) and may be skipped by a lagging
+//! subscriber; callers can always read a current [`ProgressSnapshot`] from
+//! the handle.
 //! The engine never invokes user callbacks while holding scheduler or sink
 //! locks; host code receives events on the consumer task's executor.
 //!
@@ -154,9 +159,10 @@ pub use config::{
 };
 pub use error::{DownloadError, ErrorCategory, Retryability};
 pub use http::HttpTransport;
+#[allow(deprecated)]
+pub use job::controller::SingleStreamController;
 pub use job::controller::{
-    CancelMode, DownloadHandle, DownloadRequest, DownloadResult, ResultStatus,
-    SingleStreamController,
+    CancelMode, DownloadController, DownloadHandle, DownloadRequest, DownloadResult, ResultStatus,
 };
 pub use metrics::{EngineMetrics, Event, EventHub, EventStream, MetricsSnapshot, ProgressSnapshot};
 pub use redact::Redactor;

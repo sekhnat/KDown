@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 
 fn cfg(physical: bool) -> EngineConfig {
@@ -30,8 +30,8 @@ fn cfg(physical: bool) -> EngineConfig {
     c
 }
 
-fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(
+fn controller(cfg: EngineConfig) -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     )
@@ -122,6 +122,12 @@ async fn logical_only_allocation_completes_identically() {
 
 /// A real storage failure (unreadable destination directory) surfaces as a
 /// sink error and NEVER publishes incomplete output (task 11.2).
+// POSIX-only mechanism: a mode-based read-only directory. Windows cannot
+// block file creation in a directory via Permissions::from_mode, so the
+// equivalent guarantee is exercised on the POSIX platforms and the
+// Windows storage-failure surface stays covered by allocation-failure
+// tests that do not depend on permission bits.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn storage_permission_failure_surfaces_and_never_publishes() {
     let content = deterministic_bytes(64 * 1024, 4403);

@@ -143,7 +143,7 @@ pub struct FileSink {
     destination: PathBuf,
     temp_path: PathBuf,
     preallocate: bool,
-    /// Opt-in physical reservation (task 11.1): attempt fallocate-style
+    /// Opt-in physical reservation: attempt fallocate-style
     /// space reservation after the logical `set_len`; unsupported
     /// platforms/filesystems fall back to logical sizing.
     physical: bool,
@@ -156,7 +156,7 @@ pub struct FileSink {
     fail_next_flush: bool,
     /// Shared immutable handle: positional writes need only `&File`, so the
     /// handle is reference-counted and lent to write-only worker capabilities
-    /// while the owner keeps lifecycle authority (design D1, task 2.2).
+    /// while the owner keeps lifecycle authority .
     file: Option<Arc<File>>,
     /// Bytes written so far (high-water mark) — informational.
     bytes_written: u64,
@@ -212,7 +212,7 @@ impl FileSink {
     }
 
     /// The shared immutable handle for lending write-only worker
-    /// capabilities (task 2.2): positional writes need only `&File`.
+    /// capabilities: positional writes need only `&File`.
     pub(crate) fn shared_handle(&self) -> Option<Arc<File>> {
         self.file.clone()
     }
@@ -224,7 +224,7 @@ impl FileSink {
     }
 
     /// Preallocate `size` bytes: portable logical sizing (`set_len`) plus,
-    /// when opted in, a physical reservation attempt (task 11.1).
+    /// when opted in, a physical reservation attempt.
     /// Unsupported filesystem ops are non-fatal (§14.3) — the reservation
     /// falls back to logical sizing without correctness changes. Real
     /// errors (permission, out-of-space) surface as sink errors.
@@ -250,14 +250,14 @@ impl FileSink {
             Err(e) => return Err(SinkError(DownloadError::from_io(&e))),
         };
         if self.physical {
-            // Real errors (ENOSPC, EPERM, ...) surface (task 11.2);
+            // Real errors (ENOSPC, EPERM, ...) surface;
             // unsupported operations/filesystems fall back silently.
             self.reserve_physical(file, size)?;
         }
         Ok(logical)
     }
 
-    /// Optional physical reservation (task 11.1, design D6): attempted only
+    /// Optional physical reservation: attempted only
     /// where a portable binding exists (fs2 wraps fallocate on Unix and the
     /// SetFileInformationByHandle path on Windows). Unsupported
     /// operations/filesystems fall back silently — allocation is never a

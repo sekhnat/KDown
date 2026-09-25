@@ -1,4 +1,4 @@
-//! Durable-interval tracking (§15.4, task 4.3): a checkpoint may never
+//! Durable-interval tracking (§15.4): a checkpoint may never
 //! claim durability beyond what the selected policy has acknowledged.
 //!
 //! Two valid modes:

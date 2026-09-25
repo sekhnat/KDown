@@ -146,7 +146,7 @@ pub struct ProgressSnapshot {
 #[cfg(test)]
 mod tests {
 
-    /// False-sharing probe (task 7.3, #[ignore]): N threads each hammering
+    /// False-sharing probe: N threads each hammering
     /// their OWN WorkerCounters (the real pattern — one worker, one cell)
     /// laid out adjacently (current) vs cache-line-padded. Evidence only.
     #[test]

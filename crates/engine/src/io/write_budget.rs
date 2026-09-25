@@ -1,12 +1,12 @@
 // The budgets are defined and verified here; the segmented transfer paths
-// reserve against them when the executor is integrated (tasks 2.5-2.7).
+// reserve against them when the executor is integrated.
 #![allow(dead_code)]
-//! Outstanding-write byte budgets (design D2, task 2.2).
+//! Outstanding-write byte budgets .
 //!
 //! Bounds the payload bytes the engine retains between network receipt and
 //! write acknowledgement: one engine-global pool shared by every job, one
 //! per-job pool, and a per-worker read-ahead cap enforced by the worker
-//! loop (task 2.5). Capacity is counted in **bytes**, and permits cover
+//! loop. Capacity is counted in **bytes**, and permits cover
 //! queued+executing payload: a reservation is taken BEFORE the next body
 //! chunk is polled (pre-read reservation), reconciled to the actual frame
 //! size after receipt, and released by RAII when the write completes,
@@ -105,7 +105,7 @@ impl OutstandingByteBudget {
     }
 }
 
-/// Engine-wide budget set (design D2, task 2.2): one global pool plus the
+/// Engine-wide budget set : one global pool plus the
 /// configured per-job cap and per-worker read-ahead. Shared across every
 /// job of one engine context; each job derives its own [`JobWriteBudget`].
 #[derive(Debug, Clone)]
@@ -117,7 +117,7 @@ pub(crate) struct WriteBudgets {
 
 impl WriteBudgets {
     /// Build from validated configuration (construction validation lives in
-    /// `EngineConfig::validate`, task 2.2: budgets admit at least one frame).
+    /// `EngineConfig::validate`).
     #[must_use]
     pub(crate) fn new(
         global_max_bytes: u64,
@@ -149,7 +149,7 @@ impl WriteBudgets {
     }
 }
 
-/// Per-job write budget (design D2): the job's workers reserve payload
+/// Per-job write budget: the job's workers reserve payload
 /// bytes here before reading the next body chunk.
 #[derive(Debug, Clone)]
 pub(crate) struct JobWriteBudget {
@@ -159,7 +159,7 @@ pub(crate) struct JobWriteBudget {
 }
 
 impl JobWriteBudget {
-    /// Per-worker read-ahead cap (worker-loop enforcement, task 2.5): the
+    /// Per-worker read-ahead cap (worker-loop enforcement): the
     /// bytes one worker may hold submitted-but-unacknowledged.
     #[must_use]
     pub(crate) fn worker_read_ahead_bytes(&self) -> u64 {
@@ -218,7 +218,7 @@ impl Drop for RollbackGuard {
     }
 }
 
-/// RAII byte reservation for one write (design D2): covers the write's
+/// RAII byte reservation for one write: covers the write's
 /// queued+executing payload in BOTH pools. Reconciled to the actual frame
 /// size after receipt; released on completion, failure or discard.
 #[derive(Debug)]
@@ -258,7 +258,7 @@ impl ByteReservation {
     /// bytes in the same global→job order. The payload is already in
     /// memory; held bytes are attached to writes that complete
     /// independently, so waiting for extra admission delays but cannot
-    /// deadlock (design D2).
+    /// deadlock.
     ///
     /// Cancellation-aware: dropping the future mid-wait releases any
     /// partially acquired extra bytes.

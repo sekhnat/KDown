@@ -1,5 +1,5 @@
 //! Connection layer: TLS, proxying, per-origin/global connection limits,
-//! and the SSRF restriction hook (§27, §28, §21.5; tasks 6.1, 7.1).
+//! and the SSRF restriction hook (§27, §28, §21.5;  7.1).
 //!
 //! The connector is a `tower::Service<Uri>` usable directly by
 //! hyper-util's legacy client. Every connection holds one global and one
@@ -315,7 +315,7 @@ pub enum HttpProtocol {
     Http2,
 }
 
-/// Protocol-level transport instrumentation (task 5.1): logical HTTP
+/// Protocol-level transport instrumentation: logical HTTP
 /// requests/H2 streams counted separately from physical TCP/TLS
 /// establishments, each labeled with its negotiated protocol.
 ///
@@ -343,7 +343,7 @@ pub struct HttpProtocolStats {
 /// Whether H2 flow-control windows/stall waits AND peer stream limits
 /// (SETTINGS_MAX_CONCURRENT_STREAMS) are instrumented. The hyper-util
 /// legacy client exposes neither, so this is `false` and dependent reports
-/// are labeled unavailable (task 5.1/5.3: automatic extra H2 sockets stay
+/// are labeled unavailable (automatic extra H2 sockets stay
 /// off without measured flow-control/stream-limit evidence; peer stream
 /// limits cannot be probed where not exposed).
 pub const H2_FLOW_CONTROL_INSTRUMENTED: bool = false;
@@ -441,7 +441,7 @@ pub(crate) fn origin_key(scheme: &str, host: &str, port: u16, proxy: Option<&str
 /// `tower::Service<Uri>` so hyper-util's legacy `Client` can drive it.
 pub(crate) struct EngineConnector {
     limits: Arc<ConnectionLimits>,
-    /// Shared protocol instrumentation (task 5.1): requests/streams vs
+    /// Shared protocol instrumentation: requests/streams vs
     /// physical establishments, labeled by negotiated protocol.
     stats: Arc<HttpProtocolStats>,
     proxy: ProxyConfig,
@@ -525,7 +525,7 @@ impl EngineConnector {
         &self.limits
     }
 
-    /// The shared protocol instrumentation (task 5.1): logical
+    /// The shared protocol instrumentation: logical
     /// requests/H2 streams vs physical TCP/TLS establishments and their
     /// negotiated protocol. Shared by every client slot of one transport.
     #[must_use]

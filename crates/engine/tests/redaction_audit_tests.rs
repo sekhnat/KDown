@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 
 use kdown_engine::config::EngineConfig;
-use kdown_engine::job::controller::{DownloadRequest, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 
 mod support;
 use support::test_server::{ScriptedResponse, TestServer};
@@ -112,7 +112,7 @@ async fn run_with_capture(
     let cfg = EngineConfig::default();
     let transport =
         kdown_engine::http::transport::HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let result = controller.run(request).await.expect("run");
     let records = records_since(&captured, before);
     (before, records, result)

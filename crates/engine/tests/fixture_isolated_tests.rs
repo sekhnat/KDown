@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 
 mod support;
 use support::fixtures;
@@ -84,7 +84,7 @@ async fn download(
     cfg.network.read_idle_timeout = Duration::from_secs(30);
     configure(&mut cfg);
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
@@ -290,7 +290,7 @@ async fn isolated_client_fail_if_exists_unchanged() {
     let mut cfg = EngineConfig::default();
     cfg.network.response_header_timeout = Duration::from_secs(30);
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let result = controller
         .run(DownloadRequest::new(
             format!("http://{}/f.bin", server.addr),
@@ -343,7 +343,7 @@ fn configure_tls(cfg: &mut EngineConfig, ca: &std::path::Path) {
 async fn read_tls_stats(cfg: &EngineConfig, server: &IsolatedServer) -> (u64, u64, u64) {
     let dir = tempfile::tempdir().expect("stats tmpdir");
     let transport = HttpTransport::from_config(cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let result = controller
         .run(DownloadRequest::new(
             tls_url(server, "/__stats"),
@@ -380,7 +380,7 @@ async fn isolated_tls_h2_segmented_parity() {
     cfg.transfer.max_segment_size = 256 * 1024;
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
         .run(DownloadRequest::new(
@@ -419,7 +419,7 @@ async fn isolated_tls_single_stream_parity() {
     cfg.transfer.segmentation_threshold = u64::MAX;
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
@@ -444,7 +444,7 @@ async fn isolated_tls_ignore_ranges_falls_back() {
     cfg.transfer.max_workers = 4;
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
@@ -489,7 +489,7 @@ async fn isolated_tls_mid_transfer_reset_recovers() {
     cfg.retry.base_delay = Duration::from_millis(10);
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("tmpdir");
     let result = controller
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
@@ -648,7 +648,7 @@ async fn h1_connection_and_request_counters_reconcile_with_server() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
 
     let (_, conns_before, reqs_before) = raw_server_stats(&server.addr);
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -715,7 +715,7 @@ async fn h2_stream_counters_reconcile_with_server_side_requests() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
 
     let (_, conns_before, reqs_before) = read_tls_stats(&cfg, &server).await;
     let dir = tempfile::tempdir().expect("tmpdir");

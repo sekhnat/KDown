@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::scheduler::core::{SchedulerPolicy, SegmentScheduler};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
@@ -38,8 +38,8 @@ fn cfg(threshold: u64, max_segment: u64) -> EngineConfig {
     c
 }
 
-fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(
+fn controller(cfg: EngineConfig) -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     )

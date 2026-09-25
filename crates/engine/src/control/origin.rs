@@ -1,5 +1,5 @@
 //! Normalized final-origin identity and the controller-shared origin
-//! registry (tasks 6.1-6.4, design D6).
+//! registry.
 //!
 //! The registry coordinates *request admission* and *throttle feedback* for
 //! jobs that share one final origin within one engine. It sits ABOVE the
@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
 
-/// Normalize a URL to its final-origin identity (task 6.1):
+/// Normalize a URL to its final-origin identity:
 /// `scheme://host:effective-port`, lowercased, trailing dot stripped, any
 /// `user:pass@` userinfo removed.
 ///
@@ -118,7 +118,7 @@ struct OriginEntry {
     backoff_until_ms: AtomicU64,
     throttle_events: AtomicU64,
     success_events: AtomicU64,
-    /// Last admission/feedback touch, for idle eviction (task 6.4).
+    /// Last admission/feedback touch, for idle eviction.
     last_active_ms: AtomicU64,
 }
 
@@ -151,7 +151,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// RAII origin request permit (task 6.2): held from before network dispatch
+/// RAII origin request permit: held from before network dispatch
 /// until the response is fully consumed (or failed/cancelled); dropping it
 /// releases the origin's request slot. Cancelled or failed jobs therefore
 /// never retain origin capacity.
@@ -165,11 +165,11 @@ pub struct OriginPermit {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-/// Controller-shared origin registry (design D6): one instance per engine
-/// (`SingleStreamController`), shared by every job it starts. Entries are
+/// Controller-shared origin registry: one instance per engine
+/// (`DownloadController`), shared by every job it starts. Entries are
 /// created lazily per normalized final origin and bounded by an inactive-TTL
 /// plus a size cap that never evicts entries with live permit holders
-/// (task 6.4).
+///.
 #[derive(Debug)]
 pub struct OriginRegistry {
     entries: Mutex<HashMap<String, Arc<OriginEntry>>>,
@@ -179,7 +179,7 @@ pub struct OriginRegistry {
     max_entries: usize,
     /// Idle entries older than this become evictable.
     idle_ttl: Duration,
-    /// Test/diagnostic switch (task 6.5 "no-origin-feedback" variant): when
+    /// Test/diagnostic switch: when
     /// set, admission never waits and feedback is ignored — the per-job
     /// `origin_backoff_until` gate alone remains active.
     disabled: bool,
@@ -225,8 +225,8 @@ impl OriginRegistry {
     }
 
     /// A registry that performs no coordination: admission always succeeds
-    /// immediately and throttle feedback is ignored (task 6.5 fallback
-    /// variant; the per-job backoff gate remains active).
+    /// immediately and throttle feedback is ignored (the per-job backoff
+    /// gate remains active).
     #[must_use]
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
@@ -246,7 +246,7 @@ impl OriginRegistry {
             e.touch();
             return e.clone();
         }
-        // Opportunistic eviction keeps retained state bounded (task 6.4):
+        // Opportunistic eviction keeps retained state bounded:
         // expired idle entries first, then the size cap.
         if map.len() >= self.max_entries {
             evict_idle_entries(&mut map, self.idle_ttl);
@@ -271,7 +271,7 @@ impl OriginRegistry {
         entry
     }
 
-    /// Admit one request to `key` (task 6.2): wait out the origin's shared
+    /// Admit one request to `key`: wait out the origin's shared
     /// throttle deadline (if any), then acquire one request slot. Fair FIFO
     /// across waiting jobs; both waits are cancellation-aware, and the
     /// returned permit releases its slot on drop — success, failure or
@@ -286,7 +286,7 @@ impl OriginRegistry {
     ) -> Result<OriginPermit, DownloadError> {
         let entry = self.entry(key);
         loop {
-            // Shared throttle deadline (task 6.3): every peer of this origin
+            // Shared throttle deadline: every peer of this origin
             // waits until the coordinated earliest-retry instant passes.
             if !self.disabled {
                 let wait = {
@@ -340,7 +340,7 @@ impl OriginRegistry {
     }
 
     /// Record a throttle response (429/503) observed by ANY job against this
-    /// origin (task 6.3): the shared deadline extends to
+    /// origin: the shared deadline extends to
     /// `now + min(retry_after, retry_after_max)` — the caller passes the
     /// `RetryClassifier`-capped value — or `now + fallback_delay` when the
     /// server sent no usable Retry-After. Peers' next requests wait out the
@@ -378,9 +378,8 @@ impl OriginRegistry {
         }
     }
 
-    /// Record one successfully completed request against `key` (task 6.3
-    /// recovery accounting): successes are the probe signal that the origin
-    /// recovered after its cooldown.
+    /// Record one successfully completed request against `key`: successes
+    /// are the probe signal that the origin recovered after its cooldown.
     pub fn report_success(&self, key: &str) {
         if self.disabled {
             return;
@@ -421,7 +420,7 @@ impl OriginRegistry {
         self.entries.lock().expect("registry entries").len()
     }
 
-    /// Throttle/success event counts for `key` (task 6.5 traces).
+    /// Throttle/success event counts for `key`.
     #[must_use]
     pub fn throttle_trace(&self, key: &str) -> (u64, u64) {
         let map = self.entries.lock().expect("registry entries");
@@ -434,7 +433,7 @@ impl OriginRegistry {
         }
     }
 
-    /// Evict entries idle beyond the TTL that hold no permits (task 6.4);
+    /// Evict entries idle beyond the TTL that hold no permits;
     /// returns the number evicted. Live permit holders are never evicted.
     pub fn evict_idle(&self) -> usize {
         let mut map = self.entries.lock().expect("registry entries");

@@ -1,4 +1,4 @@
-//! Process resource sampling for the adaptive controller (task 4.2).
+//! Process resource sampling for the adaptive controller.
 //!
 //! The controller's storage/resource veto needs to know whether the process
 //! itself is under pressure. Linux reports both through /proc; platforms
@@ -65,7 +65,7 @@ pub(crate) fn cpu_percent_from_delta(delta_us: u64, window: Duration) -> f64 {
     delta_us as f64 / window.as_secs_f64().max(f64::EPSILON) / 10_000.0
 }
 
-/// Per-window process resource sampler (task 4.2): RSS is a level, CPU is a
+/// Per-window process resource sampler: RSS is a level, CPU is a
 /// delta against the previous window's sample.
 #[derive(Debug, Default)]
 pub(crate) struct ResourceSampler {

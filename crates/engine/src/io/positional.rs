@@ -1,5 +1,5 @@
 //! Checked positional writes over one shared immutable file handle (§14.2,
-//! design D1, task 2.1).
+//! design D1).
 //!
 //! Segmented workers write complete buffers at their assigned absolute
 //! offsets without sharing or moving a common file cursor. The adapter is
@@ -28,7 +28,6 @@ impl PositionalWriter for std::fs::File {
 #[cfg(windows)]
 impl PositionalWriter for std::fs::File {
     fn pos_write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        use std::os::windows::fs::FileExt;
         // seek_write: positional write; does not move the file pointer used
         // by other handles, but this handle's own cursor is per-handle state
         // that no segmented worker shares.
@@ -222,6 +221,12 @@ mod tests {
 
     #[test]
     fn real_file_positional_writes_at_large_offsets() {
+        // Sparse coverage with limited read-back: disjoint writes at three
+        // absolute offsets, including one beyond 4 GiB, are each verified by
+        // reading back only the written span. A full-span buffer would waste
+        // gigabytes of runner memory/disk for no extra signal; the gap must
+        // read as zeros, and the end-to-end oversized-download test covers
+        // whole-file equality at this scale.
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("pos.bin");
         let mut file = std::fs::File::options()
@@ -231,26 +236,35 @@ mod tests {
             .truncate(false)
             .open(&path)
             .expect("open");
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
         let head = b"head";
+        let mid = b"mid-block";
         let tail = b"tail-bytes";
         write_all_at(&file, 0, head).expect("write head");
-        // Large offset: sparse file, content only at the written positions.
-        const FAR: u64 = 4 * 1024 * 1024;
-        write_all_at(&file, FAR, tail).expect("write tail at large offset");
-        let mut out = vec![0u8; FAR as usize + tail.len()];
-        file.read_exact_at(&mut out, 0).expect("read back");
-        assert_eq!(&out[..head.len()], head);
-        assert_eq!(&out[FAR as usize..FAR as usize + tail.len()], tail);
+        write_all_at(&file, 4 * MIB, mid).expect("write mid at large offset");
+        // Beyond the 32-bit range: exercises full 64-bit positional
+        // arithmetic on every platform, including Windows seek_write.
+        write_all_at(&file, 4 * GIB + 512, tail).expect("write tail past 4 GiB");
+        let mut head_back = vec![0u8; head.len()];
+        read_exact_at(&mut file, &mut head_back, 0).expect("read head back");
+        assert_eq!(&head_back, head);
+        let mut mid_back = vec![0u8; mid.len()];
+        read_exact_at(&mut file, &mut mid_back, 4 * MIB).expect("read mid back");
+        assert_eq!(&mid_back, mid);
+        let mut tail_back = vec![0u8; tail.len()];
+        read_exact_at(&mut file, &mut tail_back, 4 * GIB + 512).expect("read tail back");
+        assert_eq!(&tail_back, tail);
     }
 
-    #[cfg(unix)]
-    trait ReadExactAt {
-        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
-    }
-    #[cfg(unix)]
-    impl ReadExactAt for std::fs::File {
-        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-            std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
-        }
+    /// Portable positional read-back on the test's own private handle:
+    /// seek to the absolute offset, then read exactly `buf.len()` bytes.
+    /// The handle is test-local, so moving its cursor cannot disturb
+    /// anything; this keeps verification identical on every platform while
+    /// the code under test (positional WRITES) stays platform-specific.
+    fn read_exact_at(file: &mut std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
     }
 }

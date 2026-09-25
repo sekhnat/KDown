@@ -1,4 +1,4 @@
-//! Engine-wide metrics export (§19.5, task 7.5).
+//! Engine-wide metrics export (§19.5).
 //!
 //! Counters/gauges are atomic on the transfer path; retry/category maps are
 //! updated at lifecycle boundaries, never while scheduler locks are held.

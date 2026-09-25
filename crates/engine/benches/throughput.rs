@@ -28,7 +28,7 @@ use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsCon
 use kdown_engine::control::origin::OriginRegistry;
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{
-    DownloadRequest, DownloadResult, ResultStatus, SingleStreamController,
+    DownloadController, DownloadRequest, DownloadResult, ResultStatus,
 };
 
 /// Fixture size per benchmark iteration: big enough that per-request setup
@@ -561,7 +561,7 @@ async fn measure_download(
     conn_probe: Option<&Arc<AtomicUsize>>,
 ) -> (DownloadResult, ResourceRecord) {
     let transport = HttpTransport::from_config(cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dest = dest_dir.join(format!("{name}.bin"));
     let cpu0 = cpu_time();
     let ctx0 = context_switches();
@@ -710,7 +710,7 @@ fn bench_h1_throughput(c: &mut Criterion) {
                 rt.block_on(async {
                     let dir = tempfile::tempdir().expect("tmpdir");
                     let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let controller = DownloadController::new(transport, cfg_for_bench.clone());
                     let r = controller
                         .run(DownloadRequest::new(
                             black_box(url.clone()),
@@ -773,7 +773,7 @@ fn bench_h2_throughput(c: &mut Criterion) {
                 rt.block_on(async {
                     let out = tempfile::tempdir().expect("tmpdir");
                     let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let controller = DownloadController::new(transport, cfg_for_bench.clone());
                     let r = controller
                         .run(DownloadRequest::new(
                             black_box(url.clone()),
@@ -828,7 +828,7 @@ fn bench_prealloc(c: &mut Criterion) {
                 rt.block_on(async {
                     let out = tempfile::tempdir().expect("tmpdir");
                     let transport = HttpTransport::from_config(&cfg_for_bench).expect("transport");
-                    let controller = SingleStreamController::new(transport, cfg_for_bench.clone());
+                    let controller = DownloadController::new(transport, cfg_for_bench.clone());
                     let r = controller
                         .run(DownloadRequest::new(
                             black_box(url.clone()),
@@ -1400,7 +1400,7 @@ fn run_jobs_matrix(pipeline: bool) {
 async fn fetch_isolated_stats(cfg: &EngineConfig, base: &str) -> Option<(u64, u64, u64)> {
     let dir = tempfile::tempdir().ok()?;
     let transport = HttpTransport::from_config(cfg).ok()?;
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let result = controller
         .run(DownloadRequest::new(
             format!("{base}/__stats"),
@@ -1744,7 +1744,7 @@ async fn origin_compare_cell(
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller =
-        SingleStreamController::new(transport, cfg.clone()).with_origin_registry(registry.clone());
+        DownloadController::new(transport, cfg.clone()).with_origin_registry(registry.clone());
 
     let dir = tempfile::tempdir().expect("cell tmpdir");
     let urls = match (topology, job_count) {
@@ -2000,7 +2000,7 @@ async fn protocol_compare_cell(
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
 
     let dir = tempfile::tempdir().expect("cell tmpdir");
     let cpu0 = cpu_time();
@@ -2187,7 +2187,7 @@ async fn buffer_sweep_cell(
     }
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let dir = tempfile::tempdir().expect("cell tmpdir");
     let cpu0 = cpu_time();
     let ctx0 = context_switches();
@@ -2332,7 +2332,7 @@ async fn alloc_compare_cell(
     };
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let cpu0 = cpu_time();
     let started = Instant::now();
 

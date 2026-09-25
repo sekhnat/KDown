@@ -1,4 +1,4 @@
-//! Segmented download orchestration (§12, §13, tasks 5.5-5.6, 5.8).
+//! Segmented download orchestration (§12, §13).
 //!
 //! eligibility gate (§10.3, caller) -> scheduler -> bounded worker pool:
 //! acquire -> validated range request -> positional write -> report ->
@@ -46,101 +46,101 @@ pub struct SegmentedJob {
     /// Coordinated origin backoff gate (§17.4): when set, all workers wait
     /// until this instant before their next request.
     origin_backoff_until: AsyncMutex<Option<Instant>>,
-    /// Terminal error state (§14.5, task 5.2): a cheap atomic flag for the
+    /// Terminal error state (§14.5): a cheap atomic flag for the
     /// chunk path plus a small mutex owning the first-wins detailed error.
     fatal: FatalState,
     cancel: CancellationToken,
     hub: SharedHub,
     counters: Arc<JobCounters>,
-    /// Stable per-job token bucket (§18, task 5.3): one `Arc<TokenBucket>`
+    /// Stable per-job token bucket (§18): one `Arc<TokenBucket>`
     /// for the job's lifetime; rate `0` = unlimited. Live rate updates
     /// mutate the bucket in place — active workers never see the object
     /// replaced, and unlimited chunks take no outer lock.
     rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
-    /// Engine-global payload bucket above the job bucket (§18, task 7.1).
+    /// Engine-global payload bucket above the job bucket (§18).
     /// Unlimited by default; `acquire` early-returns without the lock.
     global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
     total_size: u64,
     validators: crate::http::validators::ResourceValidators,
-    /// Durable-mode data-sync capability over the output file (task 3.3):
+    /// Durable-mode data-sync capability over the output file:
     /// used by the shared save path to synchronize before persisting.
     sync: Option<crate::io::output_session::OutputSyncCapability>,
-    /// Selected checkpoint durability (task 3.3): drives the save path's
+    /// Selected checkpoint durability: drives the save path's
     /// sync-before-persist ordering.
     durability: DurabilityMode,
-    /// Versioned scheduler-state signal (task 7.1): bumped AFTER every
+    /// Versioned scheduler-state signal: bumped AFTER every
     /// state transition (work added/removed, split eligibility, progress
     /// reconciliation, desired-worker changes, fatal, resume). Parked
     /// workers register before sleeping and recheck on change — no lost
     /// work, no fixed polling.
     revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
-    /// The job-level checkpoint coordinator's command channel (task 4.1):
+    /// The job-level checkpoint coordinator's command channel:
     /// workers wake the coordinator for pause-boundary saves. The task's
     /// join handle stays with `run_segmented`, which stops the coordinator
     /// before reclaim/verify/publish/cleanup.
     save_now_tx: mpsc::Sender<CoordinatorCmd>,
-    /// Requested worker concurrency (handle API, task 5.8). Manual updates
-    /// clamp to `[min_workers, max_workers]` (task 8.2) and suspend the
-    /// adaptive controller (task 9.3: manual precedence).
+    /// Requested worker concurrency (handle API). Manual updates
+    /// clamp to `[min_workers, max_workers]` and suspend the
+    /// adaptive controller (manual precedence).
     desired_workers: AtomicU64,
-    /// A manual concurrency override happened (task 9.3): the adaptive
+    /// A manual concurrency override happened: the adaptive
     /// controller suspends for the job's remainder.
     manual_override: AtomicBool,
     /// Throttle events (429/503-style responses) observed by any worker
-    /// (task 9.2's controller sampling).
+    ///.
     throttle_events: AtomicU64,
-    /// Writer acknowledgement-latency histogram (task 4.1): per-window
+    /// Writer acknowledgement-latency histogram: per-window
     /// p50/p95 for the adaptive controller instead of a last-value sample.
     ack_latency: crate::metrics::histogram::LatencyHistogram,
-    /// Outstanding-write depth histogram sampled at submit time (task 4.1).
+    /// Outstanding-write depth histogram sampled at submit time.
     queue_depth: crate::metrics::histogram::DepthHistogram,
     /// Worker time blocked waiting for write-byte budget, in microseconds
-    /// (task 4.1).
+    ///.
     budget_wait_us: AtomicU64,
-    /// Test-only capture of adaptive controller window samples (task 4.1).
+    /// Test-only capture of adaptive controller window samples.
     #[cfg(test)]
     adaptive_samples: std::sync::Mutex<Vec<crate::control::adaptive::WindowSample>>,
-    /// Live-tail split events observed by this job (task 0.4 observability):
+    /// Live-tail split events observed by this job:
     /// every successful `split_tail` increments this counter.
     splits: AtomicU64,
-    /// Range requests issued by any worker (task 3.5 diagnostic).
+    /// Range requests issued by any worker.
     segment_requests: AtomicU64,
     /// Per-worker provisioning state keyed by the stable worker index
-    /// (task 1.2): `0` = not provisioned, `1` = parked/idle (no lease),
+    ///: `0` = not provisioned, `1` = parked/idle (no lease),
     /// `2` = actively holding a lease. Written only by the owning worker;
     /// read by the gauges below. Sized to `max_workers`.
     worker_states: Vec<AtomicU8>,
-    /// Per-worker live writer-lane flag (task 1.4): the owning worker sets
+    /// Per-worker live writer-lane flag: the owning worker sets
     /// it when it spawns its blocking lane and clears it after the lane's
     /// shutdown join returns, so `writer_lanes_alive` tracks real blocking
     /// writer threads.
     worker_lane_live: Vec<AtomicBool>,
     /// Duration of the last coordinator checkpoint save, in microseconds
-    /// (task 0.4 observability). `0` means no save has completed yet.
+    ///. `0` means no save has completed yet.
     last_checkpoint_save_us: AtomicU64,
-    /// Configured bounds for manual concurrency control (task 8.2).
+    /// Configured bounds for manual concurrency control.
     min_workers: u64,
     max_workers: u64,
-    /// Negotiated wire protocol of the probe response (tasks 5.2/5.3):
+    /// Negotiated wire protocol of the probe response:
     /// `true` when HTTP/2 was actually negotiated — additional active
     /// workers are streams multiplexed over one connection; `false` for
     /// HTTP/1, where each additional active worker means an additional
     /// physical connection subject to the connector's permits.
     protocol_is_h2: bool,
-    /// Per-origin physical connection allowance (task 5.2): the connector
+    /// Per-origin physical connection allowance: the connector
     /// enforces it; on HTTP/1 the adaptive controller never probes desired
     /// beyond it — a growth probe into blocked permits is wasted.
     per_origin_connection_cap: u32,
-    /// Engine-global physical connection allowance (task 5.2): also gates
+    /// Engine-global physical connection allowance: also gates
     /// HTTP/1 growth probes alongside the per-origin cap.
     global_connection_cap: u32,
-    /// Controller-shared origin registry (task 6.2, design D6): request
+    /// Controller-shared origin registry: request
     /// admission and shared throttle feedback, keyed by the normalized
     /// FINAL origin of the probe-resolved URL. A `None` key (unparseable
     /// origin) skips admission; the per-job backoff gate remains.
     origin_registry: Arc<OriginRegistry>,
     origin_key: Option<String>,
-    /// Ready-work sizing (task 3.3): the opt-in Automatic selector keeps
+    /// Ready-work sizing: the opt-in Automatic selector keeps
     /// `ready_work_factor × desired` unclaimed leases pending; disabled for
     /// Explicit sizing (which keeps its configured meaning).
     ready_work_sizing: bool,
@@ -149,7 +149,7 @@ pub struct SegmentedJob {
     /// writes on every acquire; workers apply changes under their existing
     /// scheduler lock).
     applied_ready_divisor: AtomicU64,
-    /// Hot-path lease progress (§13.3, task 6.3): one atomic cell per
+    /// Hot-path lease progress (§13.3): one atomic cell per
     /// worker. A worker publishing durable-through offsets for its current
     /// lease writes `(lease_id, generation, durable_through)` into its own
     /// cell with Relaxed atomics — no scheduler lock on the chunk path.
@@ -171,16 +171,16 @@ pub struct LeaseRecord {
     pub lease_start: u64,
     /// Written-through offset (exclusive) acknowledged by the output path.
     /// Written means OS-acknowledged page-cache writes; this is NOT a
-    /// durability claim (checkpoint saves synchronize separately, task 3.3).
+    /// durability claim (checkpoint saves synchronize separately).
     pub written_through: u64,
-    /// Receipt high-watermark (exclusive; task 3.2): how far the worker has
+    /// Receipt high-watermark (exclusive): how far the worker has
     /// pulled payload for this lease from the network, regardless of write
     /// acknowledgement. The live-tail split uses it as the boundary so the
     /// split lease never re-requests received/queued bytes.
     pub received_through: u64,
 }
 
-/// One worker's in-flight lease progress (§13.3, task 5.1, design D3).
+/// One worker's in-flight lease progress (§13.3).
 ///
 /// Single-writer sequence-counter cell: the writer (one worker task owns
 /// this cell) stores an odd sequence, then the fields, then an even
@@ -202,7 +202,7 @@ pub struct LeaseProgress {
 }
 
 impl LeaseProgress {
-    /// Single-writer publication (task 5.1): odd sequence → fields → even
+    /// Single-writer publication: odd sequence → fields → even
     /// sequence, all `SeqCst`.
     fn publish(&self, record: LeaseRecord) {
         let seq = self.sequence.load(Ordering::SeqCst);
@@ -246,7 +246,7 @@ impl LeaseProgress {
         });
     }
 
-    /// One coherent snapshot (task 5.1): retry when the two sequence reads
+    /// One coherent snapshot: retry when the two sequence reads
     /// differ or are odd; `(0, .., ..)` records read as idle.
     pub(crate) fn snapshot(&self) -> Option<LeaseRecord> {
         loop {
@@ -277,7 +277,7 @@ impl LeaseProgress {
     }
 }
 
-/// Terminal failure state (task 5.2, design D3): a separate atomic fatal
+/// Terminal failure state: a separate atomic fatal
 /// flag gives workers a cheap `Acquire` check on the chunk path — no
 /// asynchronous error lock per chunk. Installing a terminal failure takes
 /// the small mutex, sets the error only if absent (first-wins: a racing
@@ -318,13 +318,13 @@ impl FatalState {
 
 impl SegmentedJob {
     /// Whether no leases are active (all work done or in pending) — a
-    /// direct, allocation-free scheduler query (task 6.2).
+    /// direct, allocation-free scheduler query.
     async fn active_leases_empty(&self) -> bool {
         !self.scheduler.lock().await.has_active()
     }
 
     /// The receipt high-watermark published for `lease_id` by any worker
-    /// cell (task 3.2): the live-tail split boundary must not re-request
+    /// cell: the live-tail split boundary must not re-request
     /// bytes the original request already pulled. `0` when no cell tracks
     /// the lease (the split then falls back to the acknowledged frontier).
     fn cell_received_through(&self, lease_id: u64) -> u64 {
@@ -337,31 +337,37 @@ impl SegmentedJob {
             .unwrap_or(0)
     }
 
-    /// Range requests issued so far (task 3.5 diagnostic).
+    /// Range requests issued so far.
     pub fn segment_requests(&self) -> u64 {
         self.segment_requests.load(Ordering::Relaxed)
     }
 
-    /// Live-tail splits performed so far (task 3.5 diagnostic).
+    /// Live-tail splits performed so far.
     pub fn live_splits(&self) -> u64 {
         self.splits.load(Ordering::Relaxed)
     }
 
-    /// Set the desired worker count at runtime (task 5.8: handle API).
-    /// Excess workers settle their leases and exit on the next loop.
-    pub fn set_desired_workers(&self, n: u64) {
-        // Clamp manual control to the configured bounds (task 8.2).
+    /// Set the desired worker count at runtime. Excess workers settle their
+    /// leases and exit on the next loop. Returns the APPLIED count after
+    /// clamping to the configured worker bounds, so callers report what
+    /// actually took effect rather than what was requested.
+    pub fn set_desired_workers(&self, n: u64) -> u64 {
+        // Manual control is clamped to the configured bounds; a request
+        // outside them is partially honored rather than rejected.
         let clamped = n.clamp(self.min_workers, self.max_workers);
         self.desired_workers.store(clamped, Ordering::Relaxed);
-        // Manual override suspends the adaptive controller for the job's
-        // remainder (task 9.3: manual precedence over the controller).
+        // A manual override suspends the adaptive controller for the job's
+        // remainder: the operator's count must not be second-guessed by
+        // later automatic probes.
         self.manual_override.store(true, Ordering::Relaxed);
-        // Concurrency change is a transition: parked workers above/below the
-        // desired count must wake (task 7.1).
+        // A concurrency change is a scheduler transition: parked workers
+        // above or below the new desired count must wake so provisioning
+        // converges promptly.
         self.notify_transition();
+        clamped
     }
 
-    /// The adaptive controller's internal adjustment (task 9.1): does NOT
+    /// The adaptive controller's internal adjustment: does NOT
     /// mark a manual override.
     fn adjust_desired_workers(&self, n: u64) {
         let clamped = n.clamp(self.min_workers, self.max_workers);
@@ -369,7 +375,7 @@ impl SegmentedJob {
         self.notify_transition();
     }
 
-    /// The ready-work divisor for a desired count (task 3.3):
+    /// The ready-work divisor for a desired count:
     /// `ready_work_factor × desired`; `0` when the opt-in Automatic sizing
     /// is not active (Explicit keeps its configured meaning).
     fn ready_work_divisor_for(&self, desired: u64) -> u64 {
@@ -379,7 +385,7 @@ impl SegmentedJob {
         self.ready_work_factor.max(1).saturating_mul(desired.max(1))
     }
 
-    /// Actual active/idle worker counts (task 4.1): active workers hold a
+    /// Actual active/idle worker counts: active workers hold a
     /// lease right now; idle workers are provisioned and parked without one.
     /// Dormant workers above the desired count hold no capacity and are not
     /// counted. The controller weights these counts by interval so a
@@ -397,42 +403,42 @@ impl SegmentedJob {
         (active, idle)
     }
 
-    /// Record one writer acknowledgement-latency sample (task 4.1).
+    /// Record one writer acknowledgement-latency sample.
     fn record_ack_latency(&self, latency: Duration) {
         self.ack_latency
             .record_us(u64::try_from(latency.as_micros()).unwrap_or(u64::MAX));
     }
 
-    /// Record the outstanding-write depth observed at submit time (task 4.1).
+    /// Record the outstanding-write depth observed at submit time.
     fn record_queue_depth(&self, depth: u64) {
         self.queue_depth.record(depth);
     }
 
-    /// Accumulate worker time blocked on write-byte budget (task 4.1).
+    /// Accumulate worker time blocked on write-byte budget.
     fn add_budget_wait(&self, wait: Duration) {
         let us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
         self.budget_wait_us.fetch_add(us, Ordering::Relaxed);
     }
 
-    /// Total worker microseconds blocked on write-byte budget (task 4.1).
+    /// Total worker microseconds blocked on write-byte budget.
     #[must_use]
     pub fn budget_wait_us(&self) -> u64 {
         self.budget_wait_us.load(Ordering::Relaxed)
     }
 
-    /// Writer acknowledgement-latency samples recorded so far (task 4.1).
+    /// Writer acknowledgement-latency samples recorded so far.
     #[must_use]
     pub fn ack_latency_samples(&self) -> u64 {
         self.ack_latency.samples()
     }
 
-    /// Outstanding-write depth samples recorded so far (task 4.1).
+    /// Outstanding-write depth samples recorded so far.
     #[must_use]
     pub fn queue_depth_samples(&self) -> u64 {
         self.queue_depth.samples()
     }
 
-    /// Test-only capture of the controller's window samples (task 4.1): lets
+    /// Test-only capture of the controller's window samples: lets
     /// in-module tests assert the inputs the controller actually saw.
     #[cfg(test)]
     pub(crate) fn adaptive_sample_log(&self) -> Vec<crate::control::adaptive::WindowSample> {
@@ -442,30 +448,30 @@ impl SegmentedJob {
             .unwrap_or_default()
     }
 
-    /// Cumulative acknowledgement-latency bucket snapshot (task 4.1).
+    /// Cumulative acknowledgement-latency bucket snapshot.
     fn ack_latency_snapshot(&self) -> crate::metrics::histogram::BucketSnapshot {
         self.ack_latency.snapshot()
     }
 
-    /// Cumulative outstanding-depth bucket snapshot (task 4.1).
+    /// Cumulative outstanding-depth bucket snapshot.
     fn queue_depth_snapshot(&self) -> crate::metrics::histogram::BucketSnapshot {
         self.queue_depth.snapshot()
     }
 
-    /// Whether a manual override is active (task 9.3).
+    /// Whether a manual override is active.
     fn is_manual_override(&self) -> bool {
         self.manual_override.load(Ordering::Relaxed)
     }
 
-    /// Throttle events since job start (task 9.2).
+    /// Throttle events since job start.
     fn throttle_events(&self) -> u64 {
         self.throttle_events.load(Ordering::Relaxed)
     }
 
-    /// Publish a scheduler-state transition (task 7.1): called AFTER the
+    /// Publish a scheduler-state transition: called AFTER the
     /// mutating mutation completed while holding (or having held) the
     /// scheduler serialization — parked workers recheck state on wake.
-    /// Publish a scheduler-state transition (task 7.1): called AFTER the
+    /// Publish a scheduler-state transition: called AFTER the
     /// state mutation completed. Public for the runtime-control handle.
     pub fn notify_transition(&self) {
         // `send_modify` takes `&self` (tokio watch has interior mutability)
@@ -480,7 +486,7 @@ impl SegmentedJob {
         self.revision_tx.as_ref().subscribe()
     }
 
-    /// Update the job rate limit at runtime (§18.2, task 5.3): mutates the
+    /// Update the job rate limit at runtime (§18.2): mutates the
     /// stable bucket in place; takes effect on the next acquire. `0` =
     /// unlimited.
     pub fn set_rate(&self, bytes_per_second: u64) {
@@ -498,14 +504,16 @@ impl SegmentedJob {
     /// gates (§18.2: payload bytes only, no busy wait, no outer lock —
     /// the bucket checks its atomic limit before the internal state lock).
     async fn acquire_rate(&self, len: u64) {
-        // Aggregate job and engine-global levels (§18, task 7.1): the
-        // slowest level's wait governs; both `acquire` calls early-return
-        // without touching their mutex while unlimited. Waiting stops on
-        // cancellation (prompt pause/cancel interruption); the worker loop
-        // observes the cancel on its next check.
+        // Aggregate job and engine-global levels (§18): the slowest level's
+        // wait governs, computed by the one shared combiner so this path
+        // cannot diverge from the hierarchical limiter or the sequential
+        // path. Both `acquire` calls early-return without touching their
+        // mutex while unlimited. Waiting stops on cancellation (prompt
+        // pause/cancel interruption); the worker loop observes the cancel
+        // on its next check.
         let job_wait = self.rate_bucket.acquire(len).wait;
         let global_wait = self.global_rate_bucket.acquire(len).wait;
-        let wait = job_wait.into_iter().chain(global_wait).max();
+        let wait = crate::control::rate_limit::dominant_wait([job_wait, global_wait]);
         if let Some(wait) = wait {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
@@ -519,20 +527,20 @@ impl SegmentedJob {
         self.desired_workers.load(Ordering::Relaxed)
     }
 
-    /// Split events observed so far (task 0.4 observability).
+    /// Split events observed so far.
     #[must_use]
     pub fn split_count(&self) -> u64 {
         self.splits.load(Ordering::Relaxed)
     }
 
-    /// Configured worker capacity (task 1.3): the number of provisioned
+    /// Configured worker capacity: the number of provisioned
     /// async tasks; the desired count floats within `[min_workers, this]`.
     #[must_use]
     pub fn max_workers(&self) -> u64 {
         self.max_workers
     }
 
-    /// Workers currently holding a lease (task 0.4: the *actual* active
+    /// Workers currently holding a lease (the *actual* active
     /// gauge, distinct from `desired_workers`). Dormant or parked workers
     /// publish no lease record and are not counted.
     #[must_use]
@@ -544,7 +552,7 @@ impl SegmentedJob {
     }
 
     /// Duration of the last completed checkpoint save in microseconds, or
-    /// `None` before the first save (task 0.4 observability). Values below
+    /// `None` before the first save. Values below
     /// one microsecond report as one microsecond.
     #[must_use]
     pub fn last_checkpoint_save_us(&self) -> Option<u64> {
@@ -554,7 +562,7 @@ impl SegmentedJob {
         }
     }
 
-    /// Workers with a provisioned task (task 1.2): the *actual* capacity,
+    /// Workers with a provisioned task: the *actual* capacity,
     /// which may trail `desired_workers` until provisioning matches it.
     #[must_use]
     pub fn provisioned_workers(&self) -> u64 {
@@ -564,7 +572,7 @@ impl SegmentedJob {
             .count() as u64
     }
 
-    /// Workers parked/idle without a lease (task 1.2): provisioned minus
+    /// Workers parked/idle without a lease: provisioned minus
     /// active — includes dormant workers above the desired count.
     #[must_use]
     pub fn parked_workers(&self) -> u64 {
@@ -574,7 +582,7 @@ impl SegmentedJob {
             .count() as u64
     }
 
-    /// Per-worker state setter used by `worker_loop` (task 1.2): `0` not
+    /// Per-worker state setter used by `worker_loop`: `0` not
     /// provisioned, `1` parked/idle, `2` active lease. Index-stable: the
     /// state array position is the worker index.
     pub(crate) fn set_worker_state(&self, worker_idx: usize, state: u8) {
@@ -583,7 +591,7 @@ impl SegmentedJob {
         }
     }
 
-    /// Live blocking writer lanes (task 1.4): threads actually serving
+    /// Live blocking writer lanes: threads actually serving
     /// positional writes right now.
     #[must_use]
     pub fn writer_lanes_alive(&self) -> u64 {
@@ -612,7 +620,7 @@ impl SegmentedJob {
     }
 
     /// Whether the scheduler is finished (no pending, no active) — the
-    /// persistent pool's job-done condition (task 8.1).
+    /// persistent pool's job-done condition.
     async fn is_finished(&self) -> bool {
         self.scheduler.lock().await.is_finished()
     }
@@ -624,15 +632,15 @@ pub struct SegmentedOutcome {
     pub error: Option<DownloadError>,
     pub network_bytes: u64,
     pub reused_bytes: u64,
-    /// Unique newly completed file bytes (real counter, task 1.1).
+    /// Unique newly completed file bytes (real counter).
     pub completed_bytes: u64,
-    /// Wasted/retransmitted network bytes (real counter, task 1.1).
+    /// Wasted/retransmitted network bytes (real counter).
     pub wasted_bytes: u64,
-    /// Retry attempts charged (real counter, task 1.1).
+    /// Retry attempts charged (real counter).
     pub retries: u64,
-    /// Range requests issued (task 3.5 diagnostic).
+    /// Range requests issued.
     pub segment_requests: u64,
-    /// Live-tail splits performed (task 3.5 diagnostic).
+    /// Live-tail splits performed.
     pub live_splits: u64,
     pub total_size: u64,
     pub elapsed: Duration,
@@ -642,7 +650,7 @@ pub struct SegmentedOutcome {
     pub completed_ranges: Vec<(u64, u64)>,
 }
 
-/// Run a segmented download over a validated probe result (task 5.5).
+/// Run a segmented download over a validated probe result.
 ///
 /// The caller has already checked eligibility (§10.3), opened the sink,
 /// and validated resume state. This drives the worker pool to a terminal
@@ -670,7 +678,7 @@ pub(crate) async fn run_segmented(
     global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 ) -> SegmentedOutcome {
     let mut warnings: Vec<String> = vec![];
-    // Lease sizing per configuration (task 6.1): the explicit
+    // Lease sizing per configuration: the explicit
     // `initial_segment_size` is honored (previously ignored in favor of
     // `max_segment_size`); the opt-in automatic selector derives the target
     // from remaining coverage and the initial active workers.
@@ -693,7 +701,7 @@ pub(crate) async fn run_segmented(
         target,
         256 * 1024,
     );
-    // Adaptive mode (task 9.1, design D6) starts at `min_workers` and probes
+    // Adaptive mode starts at `min_workers` and probes
     // upward; fixed mode keeps the configured fixed concurrency.
     let adaptive = config.transfer.concurrency_mode == crate::config::ConcurrencyMode::Adaptive;
     let desired = if adaptive {
@@ -701,7 +709,7 @@ pub(crate) async fn run_segmented(
     } else {
         u64::from(config.transfer.max_workers.max(1))
     };
-    // Ready-work target (task 3.3, design D4): with the opt-in Automatic
+    // Ready-work target: with the opt-in Automatic
     // sizing, keep roughly `oversubscription × desired` unclaimed leases
     // pending so workers acquire unclaimed ranges instead of splitting live
     // tails. Explicit sizing keeps its configured meaning (no ready-work
@@ -718,7 +726,7 @@ pub(crate) async fn run_segmented(
             .saturating_mul(desired.max(1));
     }
     let scheduler = SegmentScheduler::initialize(total_size, &start_offset_ranges, policy);
-    // Task 1.3: cells cover the full capacity (all provisioned workers),
+    // Progress cells cover the full capacity (all provisioned workers),
     // not just the initial desired count.
     let worker_progress: Vec<Arc<LeaseProgress>> =
         (0..u64::from(config.transfer.max_workers.max(1)).max(16))
@@ -749,7 +757,7 @@ pub(crate) async fn run_segmented(
     // The checkpoint coordinator channel exists before the job so workers
     // can wake it; the join handle stays with run_segmented.
     let (save_now_tx, save_now_rx) = mpsc::channel(8);
-    // The versioned scheduler-state signal (task 7.1).
+    // The versioned scheduler-state signal.
     let (revision_tx, _revision_rx_init) = tokio::sync::watch::channel(0u64);
     let job = Arc::new(SegmentedJob {
         scheduler: AsyncMutex::new(scheduler),
@@ -798,7 +806,7 @@ pub(crate) async fn run_segmented(
         applied_ready_divisor: AtomicU64::new(u64::MAX),
         worker_progress,
     });
-    // One job-level checkpoint coordinator (task 4.1): owns interval timing,
+    // One job-level checkpoint coordinator: owns interval timing,
     // reconciliation and persistence; workers never save on the chunk path.
     let coordinator_join = tokio::spawn(coordinator_loop(
         job.clone(),
@@ -811,15 +819,15 @@ pub(crate) async fn run_segmented(
     // resumed jobs, §15.5) runs before the transfer's chunk loop monopolizes
     // the worker.
     tokio::time::sleep(Duration::from_millis(1)).await;
-    // Publish the live job for the handle's runtime controls (task 5.8).
+    // Publish the live job for the handle's runtime controls.
     if let Some(cell) = &handle_cell {
         let _ = cell.set(job.clone());
     }
 
-    // Task 1.3: provision the FULL capacity (`max_workers`) of lightweight
+    // Provision the FULL capacity (`max_workers`) of lightweight
     // async tasks up front; workers above the desired count park dormant on
     // the revision signal and reactivate without rebuilding when the
-    // desired count rises (task 8.2 dormancy, now backed by real tasks).
+    // desired count rises.
     // Fixed mode starts with desired == max, so its visible behavior is
     // unchanged; adaptive mode can now actually grow.
     let worker_count = job.max_workers() as usize;
@@ -846,11 +854,11 @@ pub(crate) async fn run_segmented(
             };
         }
     };
-    // Task 2.5: internal legacy/new write-path switch (design D2). The
+    // Internal legacy/new write-path switch. The
     // pipelined path routes worker writes through the shared bounded
     // executor with byte budgets and per-lease acknowledged frontiers; the
     // default remains the legacy writer lanes until the phase 2 gate
-    // proves parity (task 2.8).
+    // proves parity.
     let pipelined = config.write_executor.pipeline_writes;
     let write_executor = pipelined.then(|| WriteExecutor::new(&config.write_executor));
     let write_budgets = pipelined.then(|| {
@@ -860,7 +868,7 @@ pub(crate) async fn run_segmented(
             config.write_budget.worker_read_ahead_bytes,
         )
     });
-    // Task 1.4: workers own their writer-lane lifecycle — each receives one
+    // Workers own their writer-lane lifecycle — each receives one
     // write-only capability and spawns its blocking lane on first activation,
     // releasing it on dormancy or exit. `worker join` therefore implies every
     // lane is shut down and every capability clone dropped before reclaim.
@@ -907,12 +915,12 @@ pub(crate) async fn run_segmented(
         }));
     }
 
-    // Adaptive controller task (task 9.1, design D6): evaluates windowed
+    // Adaptive controller task: evaluates windowed
     // useful-goodput deltas and probes +1 conservatively. Manual overrides
     // (handle `set_concurrency`) suspend it for the job's remainder.
-    // Adaptive controller (task 9.1, design D6). Task 1.5: the join handle
-    // is kept and awaited after the workers exit — no late decision can
-    // race the terminal outcome, and the task never leaks.
+    // Adaptive controller. Its join handle is kept and awaited after the
+    // workers exit — no late decision can race the terminal outcome, and
+    // the task never leaks.
     let mut controller_join: Option<tokio::task::JoinHandle<()>> = None;
     let controller_stop_tx;
     if adaptive {
@@ -948,7 +956,7 @@ pub(crate) async fn run_segmented(
         }
     }
     drop(writers);
-    // Task 2.5: shut the pipelined executor down after every worker
+    // Shut the pipelined executor down after every worker
     // detached its session (each worker exit drains and releases its
     // capability), so pool threads are gone before the output is reclaimed.
     if let Some(executor) = write_executor {
@@ -956,7 +964,7 @@ pub(crate) async fn run_segmented(
             outcome_error.get_or_insert(error.0);
         }
     }
-    // Task 1.5: stop and join the adaptive controller before the outcome is
+    // Stop and join the adaptive controller before the outcome is
     // computed — no decision can fire after the workers settled.
     if let Some(tx) = controller_stop_tx {
         let _ = tx.send(true);
@@ -964,12 +972,12 @@ pub(crate) async fn run_segmented(
     if let Some(join) = controller_join {
         let _ = join.await;
     }
-    // Task 1.4: no separate lane join is needed — every worker shut its lane
-    // down (and dropped its capability clone) before returning, so the joins
-    // above already drained all blocking writer threads (design D1, task 2.3
-    // semantics preserved at the same boundary).
+    // No separate lane join is needed — every worker shut its lane down
+    // (and dropped its capability clone) before returning, so the joins
+    // above already drained all blocking writer threads at this same
+    // boundary.
     // Stop the checkpoint coordinator before reclaim/verify/publish/cleanup
-    // (task 4.3, design D2): no save can race post-commit cleanup or a
+    //: no save can race post-commit cleanup or a
     // stale checkpoint. All workers have joined, so no boundary save can
     // arrive afterwards; the stop acks after any in-flight save drained.
     let (stop_ack_tx, stop_ack_rx) = oneshot::channel();
@@ -997,7 +1005,7 @@ pub(crate) async fn run_segmented(
     if job.cancel.is_cancelled() {
         let completed = job.completed_ranges().await;
         let cleanup_warnings = if ownership_reclaimed {
-            crate::job::controller::SingleStreamController::cleanup_cancelled(
+            crate::job::controller::DownloadController::cleanup_cancelled(
                 crate::job::controller::CancelMode::from_u8(
                     cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                 ),
@@ -1009,7 +1017,7 @@ pub(crate) async fn run_segmented(
             vec![]
         };
         warnings.extend(cleanup_warnings);
-        // One consistent fold for the whole terminal record (task 1.1).
+        // One consistent fold for the whole terminal record.
         let snap = counters.fold();
         return SegmentedOutcome {
             status: if ownership_reclaimed {
@@ -1106,7 +1114,7 @@ struct WorkerRequestSpec {
     identity_encoding: bool,
 }
 
-/// The per-worker write path (design D2, task 2.5). The legacy path keeps
+/// The per-worker write path . The legacy path keeps
 /// one blocking lane per worker and awaits every write before reading the
 /// next chunk; the pipelined path submits writes through the shared
 /// bounded executor and keeps receiving under the byte budgets, with
@@ -1119,7 +1127,7 @@ enum WorkerWriter {
     Pipelined(Box<PipelinedWriter>),
 }
 
-/// One worker's pipelined write path (task 2.5): an executor session (its
+/// One worker's pipelined write path: an executor session (its
 /// own completion stream), the job write budget, the pre-read frame
 /// quantum and the reservations for submitted-but-unsettled writes.
 struct PipelinedWriter {
@@ -1140,7 +1148,7 @@ enum WorkerError {
         error: DownloadError,
         retry_after: Option<Duration>,
         /// Bytes received past the acknowledged written-through frontier:
-        /// retransmitted overhead counted at the lease boundary (task 5.4).
+        /// retransmitted overhead counted at the lease boundary.
         wasted: u64,
     },
     Fatal(DownloadError),
@@ -1170,7 +1178,7 @@ fn worker_error_from_failure(
 
 /// The worker loop (§13 steps 1-10).
 #[allow(clippy::too_many_arguments)]
-/// One provisioned worker (task 1.4): owns the lazy writer lane lifecycle —
+/// One provisioned worker: owns the lazy writer lane lifecycle —
 /// the blocking lane is created on first activation and released on dormancy
 /// or exit, so blocking writer threads track the desired count, not the
 /// configured maximum.
@@ -1198,8 +1206,8 @@ async fn worker_loop(
         started,
     )
     .await;
-    // Release the write path on exit (task 1.4 legacy / task 2.5
-    // pipelined): blocking threads end and capability clones drop before
+    // Release the write path on exit (legacy or pipelined): blocking
+    // threads end and capability clones drop before
     // this worker joins, so run_segmented's reclaim observes no live
     // writers. A shutdown failure means the blocking thread panicked —
     // surfaced via the first-wins fatal state, matching the old
@@ -1214,11 +1222,11 @@ async fn worker_loop(
             }
         }
         WorkerWriter::Pipelined(pipelined) => {
-            // Detach with discard (task 2.5 exit hygiene): queued writes are
+            // Detach with discard: queued writes are
             // dropped, in-flight writes finish; draining the completion
             // stream releases every outstanding reservation so the job
-            // budget never leaks bytes across worker lifecycles (task 2.7
-            // formalizes the pause/retry dispositions).
+            // budget never leaks bytes across worker lifecycles (the
+            // pause/retry dispositions below rely on that).
             let PipelinedWriter {
                 session,
                 mut completions,
@@ -1248,16 +1256,16 @@ async fn worker_cycle(
     started: Instant,
 ) -> Result<(), DownloadError> {
     let _ = started;
-    // Provisioning gauge (task 1.2): this task exists — mark it parked/idle
+    // Provisioning gauge: this task exists — mark it parked/idle
     // until it holds a lease. Index-stable per worker.
     job.set_worker_state(worker_idx, 1);
     let mut attempt: u32 = 0;
-    // Versioned scheduler-state signal (task 7.1/7.2): parked workers wake
+    // Versioned scheduler-state signal: parked workers wake
     // on transitions instead of polling on a fixed timer.
     let mut revisions = job.subscribe_revisions();
 
     loop {
-        // Register the current revision BEFORE checking for work (task 7.1):
+        // Register the current revision BEFORE checking for work:
         // any transition after this mark re-notifies and wakes the park
         // below, so no transition is ever slept through. The guard drops
         // immediately — only the seen-version matters.
@@ -1274,17 +1282,17 @@ async fn worker_cycle(
             return Ok(());
         }
         // All work settled: the job is done — persistent workers exit
-        // together (task 8.1 termination).
+        // together.
         if job.is_finished().await {
             return Ok(());
         }
-        // Concurrency reduction (task 8.1): a worker above the desired
+        // Concurrency reduction: a worker above the desired
         // count deactivates — it holds no lease here (any in-flight lease
         // was settled by completing/failing before the next loop), so it
-        // parks DORMANT instead of exiting (task 8.2: a later increase
+        // parks DORMANT instead of exiting (a later increase
         // reactivates it via the revision signal, without rebuilding).
         if job.desired_workers() <= u64::from(u32::try_from(worker_idx).unwrap_or(u32::MAX)) {
-            // Dormant (task 1.4): release the blocking writer lane while
+            // Dormant: release the blocking writer lane while
             // parked so writer threads track the desired count.
             if let WorkerWriter::Legacy { lane, .. } = writer {
                 if let Some(l) = lane.take() {
@@ -1308,7 +1316,7 @@ async fn worker_cycle(
         // Acquire a lease (short lock, §13.3).
         let lease = {
             let mut sched = job.scheduler.lock().await;
-            // Ready-work divisor (task 3.3): track desired-count changes
+            // Ready-work divisor: track desired-count changes
             // under the lock the worker already holds for the acquire.
             let desired_now = job.desired_workers.load(Ordering::Relaxed);
             let want_divisor = job.ready_work_divisor_for(desired_now);
@@ -1329,13 +1337,13 @@ async fn worker_cycle(
             Some(l) => l,
             None => {
                 // No pending work; if nothing is active either, the job is
-                // finished — exit on the next loop-top check (task 8.1).
+                // finished — exit on the next loop-top check.
                 if job.active_leases_empty().await {
                     return Ok(());
                 }
                 // Other workers still hold work; opportunistically split a
                 // big live tail once, then wait (§12.3). The split threshold
-                // is scheduler policy, not a worker constant (task 6.2).
+                // is scheduler policy, not a worker constant.
                 let split = {
                     let mut sched = job.scheduler.lock().await;
                     let threshold = sched.policy().split_threshold;
@@ -1347,7 +1355,7 @@ async fn worker_cycle(
                         None => None,
                     };
                     if split.is_some() {
-                        // New lease available for parked workers (task 7.1).
+                        // New lease available for parked workers.
                         job.splits.fetch_add(1, Ordering::Relaxed);
                         job.notify_transition();
                     }
@@ -1356,7 +1364,7 @@ async fn worker_cycle(
                 match split {
                     Some(tail) => tail,
                     None => {
-                        // Park on the versioned state signal (task 7.2):
+                        // Park on the versioned state signal:
                         // wake on any transition (new pending, requeue,
                         // split eligibility via progress, desired-worker
                         // changes, fatal, resume, completion) or on
@@ -1387,12 +1395,12 @@ async fn worker_cycle(
             .await;
 
         // Holding a lease (acquired or split): mark this worker active
-        // (task 1.2) right before the transfer so both acquisition paths
+        // right before the transfer so both acquisition paths
         // report identically.
         job.set_worker_state(worker_idx, 2);
-        // Lazy writer lane (task 1.4): created on this worker's first
+        // Lazy writer lane: created on this worker's first
         // activation; the blocking thread lives until dormancy or exit.
-        // Lazy writer lane (task 1.4): created on this worker's first
+        // Lazy writer lane: created on this worker's first
         // activation; the blocking thread lives until dormancy or exit.
         // Pipelined workers need no activation step (their session holds
         // the capability from attach; the shared pool bounds threads).
@@ -1420,16 +1428,16 @@ async fn worker_cycle(
         match result {
             Ok(()) => {
                 attempt = 0; // reset backoff on success
-                             // Reconcile (crediting accepted coverage, task 5.4) then
+                             // Reconcile (crediting accepted coverage) then
                              // complete the lease.
                 reconcile_and_credit(job).await;
                 let mut sched = job.scheduler.lock().await;
                 let _ = sched.complete(lease.id, lease.generation);
                 job.worker_progress[worker_idx].clear();
-                // The worker is idle again (task 1.2): state flips exactly
+                // The worker is idle again: state flips exactly
                 // where the lease cell clears so the gauges never disagree.
                 job.set_worker_state(worker_idx, 1);
-                // Completion frees bytes / finishes the job (task 7.1).
+                // Completion frees bytes / finishes the job.
                 job.notify_transition();
             }
             Err(WorkerError::Retryable {
@@ -1437,7 +1445,7 @@ async fn worker_cycle(
                 retry_after,
                 wasted,
             }) => {
-                // Retry accounting at the lease boundary (task 5.4): charge
+                // Retry accounting at the lease boundary: charge
                 // the received-but-lost gap to THIS worker's shard before
                 // the tail-only requeue.
                 if wasted > 0 {
@@ -1445,7 +1453,7 @@ async fn worker_cycle(
                         w.add_wasted(wasted);
                     }
                 }
-                // Reconcile (credit accepted coverage, task 5.4) then
+                // Reconcile (credit accepted coverage) then
                 // requeue: the acknowledged prefix completes, the tail
                 // returns to pending (§17.3 tail-only retry) — one lock at
                 // the retry boundary.
@@ -1453,11 +1461,11 @@ async fn worker_cycle(
                 {
                     let mut sched = job.scheduler.lock().await;
                     let _ = sched.fail(lease.id, lease.generation);
-                    // Requeue adds pending work (task 7.1).
+                    // Requeue adds pending work.
                     job.notify_transition();
                 }
                 job.worker_progress[worker_idx].clear();
-                // Idle again after the retry requeue (task 1.2).
+                // Idle again after the retry requeue.
                 job.set_worker_state(worker_idx, 1);
                 if let Some(w) = counters.worker(worker_idx) {
                     w.add_retries(1);
@@ -1467,9 +1475,9 @@ async fn worker_cycle(
                     error.category(),
                     crate::error::ErrorCategory::Server | crate::error::ErrorCategory::RateLimited
                 ) {
-                    // Throttle signal for the adaptive controller (task 9.2).
+                    // Throttle signal for the adaptive controller.
                     job.throttle_events.fetch_add(1, Ordering::Relaxed);
-                    // RetryClassifier-capped Retry-After (task 6.3): the
+                    // RetryClassifier-capped Retry-After: the
                     // coordinated window — per job AND shared across
                     // same-origin peers — never exceeds policy.
                     let capped = classifier.honor_retry_after(retry_after);
@@ -1518,7 +1526,7 @@ async fn worker_cycle(
                     job.notify_transition();
                 }
                 job.worker_progress[worker_idx].clear();
-                // Terminal failure wakes every parked worker (task 7.1).
+                // Terminal failure wakes every parked worker.
                 job.fatal.install(e);
                 job.notify_transition();
                 return Ok(());
@@ -1534,10 +1542,10 @@ async fn worker_cycle(
                 {
                     let mut sched = job.scheduler.lock().await;
                     let _ = sched.bump_generation();
-                    // Generation invalidation is a transition (task 7.1).
+                    // Generation invalidation is a transition.
                     job.notify_transition();
                 }
-                // Terminal failure wakes every parked worker (task 7.1).
+                // Terminal failure wakes every parked worker.
                 job.fatal.install(e);
                 job.notify_transition();
                 return Ok(());
@@ -1547,7 +1555,7 @@ async fn worker_cycle(
 }
 
 /// Reconcile worker cells into the scheduler and credit each cell's
-/// accepted-delta to the OWNING worker's completed shard (tasks 5.4/8.2):
+/// accepted-delta to the OWNING worker's completed shard:
 /// only scheduler-accepted bytes count as unique completed coverage, so
 /// writes beyond a split-shrunk lease end are never double-counted. The
 /// operation is idempotent (a second reconcile of the same progress credits
@@ -1597,11 +1605,11 @@ async fn transfer_lease(
         break;
     }
 
-    // Shared-origin request admission (task 6.2, design D6): wait out the
+    // Shared-origin request admission: wait out the
     // origin's coordinated throttle deadline (shared with every peer job)
     // and take one fair FIFO request slot; the RAII permit releases on
     // success, failure and cancellation alike. The per-job gate above stays
-    // as the compatibility fallback (design D6).
+    // as the compatibility fallback.
     let _origin_permit = match (&job.origin_registry, &job.origin_key) {
         (registry, Some(key)) => match registry.admit(key, &job.cancel).await {
             Ok(permit) => Some(permit),
@@ -1620,7 +1628,7 @@ async fn transfer_lease(
         _ => None,
     };
 
-    // Range-request diagnostic (task 3.5): one counter per issued request
+    // Range-request diagnostic: one counter per issued request
     // (attempts included; retries are visible separately).
     job.segment_requests.fetch_add(1, Ordering::Relaxed);
     // Resume offset for tail retries (§17.3): the worker's own progress
@@ -1630,7 +1638,7 @@ async fn transfer_lease(
     let cell = &job.worker_progress[worker_idx];
     let start_from = match cell.snapshot() {
         // The worker's own progress record holds the acknowledged
-        // written-through offset (task 3.2: one coherent record).
+        // written-through offset (one coherent record).
         Some(record) if record.lease_id == lease.id => {
             record.written_through.max(lease.next_offset)
         }
@@ -1669,7 +1677,7 @@ async fn transfer_lease(
     let validated_start = response.start;
     let validated_end = response.end;
     let accepted_len = validated_end - validated_start + 1;
-    // The write path diverges here (task 2.5): the legacy lane blocks the
+    // The write path diverges here: the legacy lane blocks the
     // worker per chunk; the pipelined path submits through the shared
     // executor. Both consume the SAME validated response body and share
     // the reconciliation/complete tail below.
@@ -1713,7 +1721,7 @@ async fn transfer_lease(
     };
     consume?;
     // Final acknowledgment: everything accepted is written. Reconcile this
-    // worker's cell (crediting accepted coverage — task 5.4) before
+    // worker's cell (crediting accepted coverage) before
     // completing the lease (§31).
     reconcile_and_credit(job).await;
     {
@@ -1728,7 +1736,7 @@ async fn transfer_lease(
             end: validated_end,
         })
         .await;
-    // One completed origin request (task 6.3 recovery accounting): the
+    // One completed origin request: the
     // post-cooldown probe signal for the shared registry.
     if let (registry, Some(key)) = (&job.origin_registry, &job.origin_key) {
         registry.report_success(key);
@@ -1736,7 +1744,7 @@ async fn transfer_lease(
     Ok(())
 }
 
-/// Legacy write path (task 2.5): one blocking lane per worker; the worker
+/// Legacy write path: one blocking lane per worker; the worker
 /// awaits each write before reading the next chunk (one outstanding
 /// payload per worker). Behavior is unchanged from the pre-executor
 /// transfer loop.
@@ -1754,7 +1762,7 @@ async fn consume_legacy_body(
 ) -> Result<(), WorkerError> {
     let cell = &job.worker_progress[worker_idx];
     let mut in_range_offset: u64 = 0;
-    // Live-tail split safety (task 3.2): the lease end may SHRINK when an
+    // Live-tail split safety: the lease end may SHRINK when an
     // idle worker splits this request's tail. The worker refreshes the end
     // on revision wakes and stops consuming at the shrunken boundary — the
     // discarded response tail is accounted as split waste, never written or
@@ -1770,7 +1778,7 @@ async fn consume_legacy_body(
     // rejection live inside the body; the worker consumes one chunk at a
     // time and never sees frame types.
     loop {
-        // Register the current revision BEFORE the read (task 7.1): a fatal
+        // Register the current revision BEFORE the read: a fatal
         // installed while this worker is parked mid-body publishes a
         // transition and wakes the select below — no lost convergence.
         let _seen_revision = {
@@ -1804,7 +1812,7 @@ async fn consume_legacy_body(
         };
         match event {
             Ok(BodyEvent::Data(mut data)) => {
-                // Live-tail split boundary (task 3.2): stop consuming at the
+                // Live-tail split boundary: stop consuming at the
                 // shrunken lease end — the response tail beyond it belongs
                 // to the split lease and is discarded as split waste.
                 // The lease end is INCLUSIVE: bytes up to and including
@@ -1829,7 +1837,7 @@ async fn consume_legacy_body(
                 if owned_len == 0 {
                     break;
                 }
-                // Wire bytes count at RECEIPT (task 5.4, design D4): even if
+                // Wire bytes count at RECEIPT: even if
                 // a later write fails, the payload crossed the network and
                 // must show in wire throughput.
                 if let Some(w) = job.counters.worker(worker_idx) {
@@ -1839,7 +1847,7 @@ async fn consume_legacy_body(
                 // this worker's blocking writer lane. Rate tokens first:
                 // payload bytes only (§18.2). The lane acknowledges before
                 // the worker publishes progress or completed counters (one
-                // outstanding payload per worker, task 2.3); no per-chunk
+                // outstanding payload per worker); no per-chunk
                 // flush.
                 let chunk_was_truncated = owned_len < original_len;
                 let owned = data.split_to(owned_len as usize);
@@ -1849,16 +1857,16 @@ async fn consume_legacy_body(
                     .await
                     .map_err(|se| WorkerError::Fatal(se.0))?;
                 // Write-ack latency and submit-time queue depth for the
-                // controller's window sampling (task 4.1). The legacy lane
+                // controller's window sampling. The legacy lane
                 // holds exactly one outstanding payload per worker, so its
                 // observed depth is 1 by construction.
                 job.record_ack_latency(write_started.elapsed());
                 job.record_queue_depth(1);
                 in_range_offset += owned.len() as u64;
 
-                // Hot-path progress (§13.3, task 6.3): publish the
+                // Hot-path progress (§13.3): publish the
                 // acknowledged written-through offset as one coherent record
-                // (task 3.2) — no scheduler lock on the chunk path. The
+                // — no scheduler lock on the chunk path. The
                 // publication happens BEFORE the boundary break so the owned
                 // prefix of a truncated chunk is published and credited.
                 let durable_through = validated_start + in_range_offset;
@@ -1878,7 +1886,7 @@ async fn consume_legacy_body(
             Ok(BodyEvent::End) => break, // clean EOF
             Ok(BodyEvent::Paused) => {
                 // §9.3: pause converges at a safe boundary. The coordinator
-                // settles the acknowledged snapshot (task 4.3) and the
+                // settles the acknowledged snapshot and the
                 // worker waits for the save result before reporting
                 // resumability. A save failure is fatal: the observing
                 // worker installs the shared error and all workers converge
@@ -1913,7 +1921,7 @@ async fn consume_legacy_body(
                 // shared retry/coordination policy. Bytes received past the
                 // acknowledged written-through frontier are lost with the
                 // attempt: count them as wasted at this lease boundary
-                // (task 5.4).
+                //.
                 let written_frontier = cell
                     .snapshot()
                     .filter(|record| record.lease_id == lease.id)
@@ -1932,7 +1940,7 @@ async fn consume_legacy_body(
 /// Handle one completion: release its reservation, fold it into the
 /// frontier and publish one coherent record when the contiguous
 /// acknowledged frontier advanced. Stale generations are ignored — they can
-/// never credit the live lease (design D3).
+/// never credit the live lease.
 async fn settle_completion(
     job: &Arc<SegmentedJob>,
     worker_idx: usize,
@@ -1957,12 +1965,12 @@ async fn settle_completion(
     ) {
         CompletionStatus::Acknowledged { through } => {
             // Write-ack latency for the controller's window sampling
-            // (task 4.1): every acknowledged write contributes one sample.
+            //: every acknowledged write contributes one sample.
             if let Some(elapsed) = latency {
                 job.record_ack_latency(elapsed);
             }
             // Hot-path progress (§13.3): publish the acknowledged
-            // contiguous frontier as one coherent record (task 3.2) —
+            // contiguous frontier as one coherent record —
             // no scheduler lock on the completion path.
             job.worker_progress[worker_idx].publish(LeaseRecord {
                 lease_id: frontier.lease_id(),
@@ -1987,7 +1995,7 @@ async fn settle_completion(
     }
 }
 
-/// Drain every outstanding write of the frontier (task 2.7): completions
+/// Drain every outstanding write of the frontier: completions
 /// settle (or fail fatally) until nothing is queued or executing, leaving
 /// the published frontier at the contiguous acknowledged prefix. Used at
 /// end-of-body, pause boundaries and before retryable-error requeue so a
@@ -2026,7 +2034,7 @@ async fn drain_outstanding_writes(
     Ok(())
 }
 
-/// Pipelined write path (design D2/D3, task 2.5): the worker reserves byte
+/// Pipelined write path (design D2/D3): the worker reserves byte
 /// budget BEFORE polling the next chunk, submits writes to the shared
 /// executor without awaiting them, and keeps receiving while earlier writes
 /// execute. Progress publication is driven by completions through the
@@ -2048,7 +2056,7 @@ async fn consume_pipelined_body(
     let mut frontier =
         LeaseFrontier::new(lease.id, lease.generation, validated_start, validated_end);
     let mut in_range_offset: u64 = 0;
-    // Live-tail split safety (task 3.2): refresh the stop boundary on
+    // Live-tail split safety: refresh the stop boundary on
     // revision wakes; chunks at/after the shrunken lease end are discarded
     // as split waste (never written or credited to the split lease).
     let mut effective_end = validated_end;
@@ -2058,12 +2066,12 @@ async fn consume_pipelined_body(
             effective_end = effective_end.min(end);
         }
     }
-    // The pre-read reservation (design D2): held across the body poll and
+    // The pre-read reservation: held across the body poll and
     // reconciled to the actual frame size after receipt.
     let mut reservation: Option<ByteReservation> = None;
 
     loop {
-        // Register the current revision BEFORE the read (task 7.1): a fatal
+        // Register the current revision BEFORE the read: a fatal
         // installed while this worker is parked mid-body publishes a
         // transition and wakes the select below — no lost convergence.
         let _seen_revision = {
@@ -2077,11 +2085,11 @@ async fn consume_pipelined_body(
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
         }
 
-        // Pre-read reservation (design D2, task 2.2): hold byte budget for
+        // Pre-read reservation : hold byte budget for
         // the next frame BEFORE polling the body, bounded by the worker
         // read-ahead so a fast connection cannot outrun a slow sink.
         if reservation.is_none() {
-            // Byte-budget wait (task 4.1): the read-ahead wait loop plus the
+            // Byte-budget wait: the read-ahead wait loop plus the
             // reservation acquisition, both of which are storage backpressure.
             let wait_started = Instant::now();
             let quantum = writer.frame_quantum;
@@ -2158,7 +2166,7 @@ async fn consume_pipelined_body(
         };
         match event {
             Ok(BodyEvent::Data(mut data)) => {
-                // Live-tail split boundary (task 3.2/3.6): stop consuming at
+                // Live-tail split boundary: stop consuming at
                 // the shrunken lease end — the response tail beyond it
                 // belongs to the split lease. The lease end is INCLUSIVE
                 // (the byte at effective_end is still owned), so a chunk
@@ -2195,7 +2203,7 @@ async fn consume_pipelined_body(
                     }
                     break;
                 }
-                // Wire bytes count at RECEIPT (task 5.4, design D4): even if
+                // Wire bytes count at RECEIPT: even if
                 // a later write fails, the payload crossed the network and
                 // must show in wire throughput. The full received chunk is
                 // counted (the truncated remainder was received too).
@@ -2237,7 +2245,7 @@ async fn consume_pipelined_body(
                 writer
                     .reservations
                     .insert((lease.id, abs_offset), (frame, std::time::Instant::now()));
-                // Outstanding depth at submit time (task 4.1).
+                // Outstanding depth at submit time.
                 job.record_queue_depth(writer.reservations.len() as u64);
                 in_range_offset += chunk_len;
                 if spanned_boundary {
@@ -2260,7 +2268,7 @@ async fn consume_pipelined_body(
                 // Settle every outstanding write before completing the
                 // lease: completions may arrive out of order, and the
                 // frontier publishes only the contiguous acknowledged
-                // prefix (design D3).
+                // prefix.
                 drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions).await?;
                 if frontier.acknowledged_through() != effective_end + 1 {
                     return Err(WorkerError::Fatal(DownloadError::SinkWrite(
@@ -2273,14 +2281,14 @@ async fn consume_pipelined_body(
                 // §9.3: pause converges at a safe boundary. Drain the
                 // outstanding writes first so the acknowledged snapshot the
                 // coordinator settles covers everything already received
-                // (task 2.5; dispositions are formalized in task 2.7).
+                //.
                 drop(reservation.take());
                 // Settle outstanding writes BEFORE the pause save so the
                 // checkpoint captures exactly the acknowledged prefix
-                // (task 2.7: drain before coordinator_loop save).
+                // (drain before coordinator_loop save).
                 drain_outstanding_writes(job, worker_idx, writer, &mut frontier, revisions).await?;
                 // The coordinator settles the acknowledged snapshot
-                // (task 4.3) and the worker waits for the save result
+                // and the worker waits for the save result
                 // before reporting resumability. A save failure is fatal:
                 // the observing worker installs the shared error and all
                 // workers converge before the job fails.
@@ -2311,7 +2319,7 @@ async fn consume_pipelined_body(
             Err(e) => {
                 // Body faults (reset, truncation, idle timeout, overrun)
                 // arrive classified (§32); the worker maps them onto the
-                // shared retry/coordination policy. Task 2.7: retryable
+                // shared retry/coordination policy. Retryable
                 // errors DRAIN the outstanding writes first so the retry
                 // requeues from the settled acknowledged prefix — never
                 // past a gap. Fatal and generation-change errors return
@@ -2342,7 +2350,7 @@ async fn consume_pipelined_body(
 }
 
 // ---------------------------------------------------------------------------
-// Job-level checkpoint coordinator (tasks 4.1-4.3, design D2)
+// Job-level checkpoint coordinator
 // ---------------------------------------------------------------------------
 
 /// Commands into the coordinator.
@@ -2352,13 +2360,13 @@ enum CoordinatorCmd {
     SaveNow {
         ack: oneshot::Sender<Result<(), DownloadError>>,
     },
-    /// Stop the coordinator after draining in-flight work (task 4.3: no
+    /// Stop the coordinator after draining in-flight work (no
     /// post-cleanup saves).
     Stop { ack: oneshot::Sender<()> },
 }
 
 /// What the last successful save recorded; unchanged candidates are skipped
-/// (task 4.1: coalescing compares intervals plus identity/validator metadata,
+/// (coalescing compares intervals plus identity/validator metadata,
 /// not a chunk counter).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SavedRevision {
@@ -2368,7 +2376,7 @@ struct SavedRevision {
 }
 
 /// The coordinator loop: wakes on the configured interval and on boundary
-/// commands; every save runs the shared mode-aware path (task 3.3).
+/// commands; every save runs the shared mode-aware path.
 async fn coordinator_loop(
     job: Arc<SegmentedJob>,
     store: Arc<dyn CheckpointStore>,
@@ -2409,8 +2417,8 @@ async fn coordinator_loop(
             }
             _ = tick.tick() => {
                 // Interval save: skip-unchanged snapshots make a no-progress
-                // tick a no-op (task 4.1). A persistence failure is fatal
-                // (task 4.2): install the shared error — first wins — and
+                // tick a no-op. A persistence failure is fatal
+                //: install the shared error — first wins — and
                 // stop saving; workers converge on the fatal flag and the
                 // job reports exactly one terminal failure.
                 if let Err(error) = attempt_coordinator_save(
@@ -2426,7 +2434,7 @@ async fn coordinator_loop(
     }
 }
 
-/// Counter deltas for one adaptive window (task 4.1): unique newly
+/// Counter deltas for one adaptive window: unique newly
 /// completed bytes (checkpoint-reused bytes are never part of
 /// `completed_bytes`), wire receipts, waste and retries. Duplicate write
 /// submissions are not wire bytes — the network delta counts receipts only —
@@ -2445,7 +2453,7 @@ fn window_counter_deltas(
     )
 }
 
-/// One window's inputs (task 4.1) folded into the controller's sample: the
+/// One window's inputs folded into the controller's sample: the
 /// conversion computes the interval-weighted idle share, so the controller
 /// never sees a raw instantaneous count.
 struct WindowInputs {
@@ -2492,8 +2500,8 @@ impl WindowInputs {
     }
 }
 
-/// The adaptive range-concurrency controller loop (tasks 9.1-9.3, design
-/// D6, extended by task 4.1): sample the actual worker activity at
+/// The adaptive range-concurrency controller loop: sample the actual
+/// worker activity interval-weighted (never one point sample) at
 /// sub-intervals, and every `window` fold the counter deltas (unique
 /// completed = useful goodput — resumed bytes excluded — plus network/wasted,
 /// retries, throttle events, interval-weighted active/idle worker-time and
@@ -2506,14 +2514,14 @@ async fn adaptive_controller_loop(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let config = crate::control::adaptive::AdaptiveConfig::default();
-    // Protocol-aware growth gate (tasks 5.2/5.3, design D5): on HTTP/1 an
+    // Protocol-aware growth gate: on HTTP/1 an
     // additional active worker means an additional physical connection, so
     // growth probes never target more concurrent workers than the
     // per-origin connection allowance the connector enforces — probing
     // into blocked permits wastes the probe and the cooldown. On HTTP/2
     // workers are streams multiplexed over one connection: the connection
     // allowance does not cap stream growth, and automatic additional
-    // sockets stay off (flow-control evidence is unavailable, task 5.1).
+    // sockets stay off (flow-control evidence is unavailable).
     let effective_max = if job.protocol_is_h2 {
         job.max_workers
     } else {
@@ -2525,7 +2533,7 @@ async fn adaptive_controller_loop(
     };
     let mut controller =
         crate::control::adaptive::AdaptiveController::new(config, job.min_workers, effective_max);
-    // Sub-interval activity sampling (task 4.1): the window's active/idle
+    // Sub-interval activity sampling: the window's active/idle
     // inputs are interval-weighted worker-time, not one instantaneous count.
     let sample_interval = (config.window / 8).max(Duration::from_millis(1));
     let mut activity = crate::control::adaptive::WorkerActivity::default();
@@ -2534,12 +2542,12 @@ async fn adaptive_controller_loop(
     let mut previous_ack = job.ack_latency_snapshot();
     let mut previous_queue = job.queue_depth_snapshot();
     let mut previous_budget_us = job.budget_wait_us();
-    // Process RSS/CPU for the storage/resource veto (task 4.2); unavailable
+    // Process RSS/CPU for the storage/resource veto; unavailable
     // measurements stay None and never trigger a veto.
     let mut resources = crate::metrics::resources::ResourceSampler::new();
     let mut last = Instant::now();
     loop {
-        // Task 1.5: the controller exits promptly on the job shutdown
+        // The controller exits promptly on the job shutdown
         // signal as well as its own cancel/fatal/manual-override checks —
         // run_segmented joins it before computing the outcome, so no late
         // decision can race the terminal record.
@@ -2555,14 +2563,14 @@ async fn adaptive_controller_loop(
         if job.cancel.is_cancelled() || job.fatal.is_fatal() {
             return;
         }
-        // Manual override: suspend for the remainder (design D5).
+        // Manual override: suspend for the remainder.
         if job.is_manual_override() {
             controller.manual_override();
             return;
         }
         let now = Instant::now();
         // Weight the actual active/idle counts by the interval they were in
-        // effect for (task 4.1) before deciding whether a window ended.
+        // effect for before deciding whether a window ended.
         let (active, idle) = job.worker_activity_counts();
         activity.observe(active, idle, now);
         if now.saturating_duration_since(last) < config.window {
@@ -2638,11 +2646,11 @@ async fn attempt_coordinator_save(
     identity: &str,
     last_saved: &mut Option<SavedRevision>,
 ) -> Result<(), DownloadError> {
-    // Task 0.4 observability: the save latency covers snapshot through the
+    // The save latency covers snapshot through the
     // store write (the whole coordinator save), recorded only on success.
     let save_started = std::time::Instant::now();
     // 1. Coherent snapshot under the scheduler lock (reconcile + credit the
-    // accepted deltas — task 5.4 — then settle).
+    // accepted deltas), then settle.
     let (ranges, generation) = {
         let mut sched = job.scheduler.lock().await;
         let deltas = sched.absorb_worker_progress(&job.worker_progress);
@@ -2655,7 +2663,7 @@ async fn attempt_coordinator_save(
         }
         let result = (sched.settled_ranges(), sched.generation());
         // Progress reconciliation can make a live tail splittable — parked
-        // workers recheck (task 7.1).
+        // workers recheck.
         job.notify_transition();
         result
     };
@@ -2667,12 +2675,12 @@ async fn attempt_coordinator_save(
         generation,
         validators: job.validators.clone(),
     };
-    // 2. Skip unchanged snapshots (task 4.1: no rewrite without new coverage).
+    // 2. Skip unchanged snapshots (no rewrite without new coverage).
     if last_saved.as_ref() == Some(&candidates) {
         return Ok(());
     }
 
-    // Generation fence (design D2): a generation rollover between the
+    // Generation fence: a generation rollover between the
     // snapshot and this check invalidates the snapshot — stale-generation
     // coverage is never persisted. Residual exposure (a bump between this
     // check and the store write) is safe: the ranges are genuinely written
@@ -2690,7 +2698,7 @@ async fn attempt_coordinator_save(
         let sync = job.sync.as_ref().ok_or_else(|| {
             DownloadError::SinkWrite("durable checkpoint save has no sync capability".into())
         })?;
-        // Blocking fs work off the network tasks (task 4.2): one
+        // Blocking fs work off the network tasks: one
         // spawn_blocking per infrequent checkpoint, never per chunk.
         let sync = sync.clone();
         tokio::task::spawn_blocking(move || sync.sync_data())
@@ -2700,7 +2708,7 @@ async fn attempt_coordinator_save(
             })??;
     }
 
-    // 4. Persist off the latency-sensitive path (task 4.2).
+    // 4. Persist off the latency-sensitive path.
     let mut cp = Checkpoint::new(
         identity,
         String::new(), // original URL is set by the caller's checkpoint; identity hash suffices here
@@ -2844,7 +2852,7 @@ mod durability_tests {
         (job, session, store, store_counts)
     }
 
-    /// Write→sync boundary (durable mode, tasks 3.4/4.1): a failed sync must
+    /// Write→sync boundary (durable mode): a failed sync must
     /// prevent ANY save — the store sees zero save attempts, and the
     /// revision does not advance.
     #[tokio::test]
@@ -2879,7 +2887,7 @@ mod durability_tests {
         assert!(last_saved.is_none(), "revision never advances on failure");
     }
 
-    /// Sync→save boundary (durable mode, task 3.4): the sync succeeds but
+    /// Sync→save boundary (durable mode): the sync succeeds but
     /// persistence fails — the save is attempted (sync happened first) but
     /// no coverage is durably recorded and the revision stays put.
     #[tokio::test]
@@ -2905,7 +2913,7 @@ mod durability_tests {
         assert!(last_saved.is_none());
     }
 
-    /// Performance mode (tasks 3.3/4.1): the shared save path persists
+    /// Performance mode: the shared save path persists
     /// WITHOUT a data sync — the Flush script op is never touched by saves.
     #[tokio::test]
     async fn performance_mode_saves_without_sync() {
@@ -2935,7 +2943,7 @@ mod durability_tests {
             last_saved.is_some(),
             "a successful save advances the revision"
         );
-        // Task 0.4 observability: a completed save records its latency.
+        // A completed save records its latency.
         assert!(
             job.last_checkpoint_save_us().is_some(),
             "save latency must be recorded after a successful save"
@@ -2962,7 +2970,7 @@ mod durability_tests {
         assert_eq!(attempts, 0);
     }
 
-    /// Unchanged snapshots are skipped (task 4.1 coalescing): a second save
+    /// Unchanged snapshots are skipped: a second save
     /// with identical ranges/generation/validators does not reach the store;
     /// new progress persists again.
     #[tokio::test]
@@ -3008,7 +3016,7 @@ mod sync_tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Stress (task 5.1, design D3): one writer publishes records where the
+    /// Stress: one writer publishes records where the
     /// written-through offset is a pure function of (lease_id, generation);
     /// readers must NEVER observe a mixed record. Includes clear/reuse
     /// cycles (lease_id 0) and stale-generation records.
@@ -3061,7 +3069,7 @@ mod sync_tests {
         assert!(observed > 0, "stress readers observed publications");
     }
 
-    /// Stale-generation progress (task 5.1): a stale record read by the
+    /// Stale-generation progress: a stale record read by the
     /// scheduler's reconciliation is rejected (existing invariant, now over
     /// the sequence cell).
     #[test]
@@ -3079,7 +3087,7 @@ mod sync_tests {
         );
     }
 
-    /// First-wins fatal ownership (task 5.2): simultaneous failures retain
+    /// First-wins fatal ownership: simultaneous failures retain
     /// exactly one authoritative error.
     #[test]
     fn simultaneous_failures_retain_exactly_one_error() {
@@ -3107,7 +3115,7 @@ mod sync_tests {
     }
 }
 
-/// Task 2.5 verification: the pipelined write path under the internal
+/// Pipelined write path under the internal
 /// switch — byte-exact H1 segmented transfer, network/storage overlap with
 /// reverse completion through the ack frontier, and read-ahead-bounded
 /// receipt under a blocked sink.
@@ -3116,7 +3124,7 @@ mod write_pipeline_tests {
     use super::*;
     use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
     use crate::io::fault_script::{OutputFaultScript, OutputOperation};
-    use crate::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+    use crate::job::controller::{DownloadController, DownloadRequest, ResultStatus};
     use std::time::Duration;
 
     const TOTAL: u64 = 2000;
@@ -3166,7 +3174,7 @@ mod write_pipeline_tests {
         config
     }
 
-    /// Task 4.1: window deltas exclude checkpoint-resumed bytes and count
+    /// Window deltas exclude checkpoint-resumed bytes and count
     /// wire receipts once, so neither resumed coverage nor a re-submitted
     /// write can inflate useful goodput. The weighted activity converts to
     /// the interval idle share.
@@ -3230,7 +3238,7 @@ mod write_pipeline_tests {
         assert_eq!(sample.budget_wait_ms, 5);
     }
 
-    /// Task 4.1: the live controller records interval-weighted activity plus
+    /// The live controller records interval-weighted activity plus
     /// writer queue/ack percentiles and never lets one receipt inflate the
     /// wire delta (two chunks received, two writes submitted).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3248,7 +3256,7 @@ mod write_pipeline_tests {
         // windows while the second write still acknowledges.
         let script = OutputFaultScript::register(&dest);
         let gate = script.script().hold_next(OutputOperation::Write);
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             crate::http::execution::HttpExecution::from_adapter(scripted),
             config,
         );
@@ -3300,7 +3308,7 @@ mod write_pipeline_tests {
             samples.iter().any(|s| s.writer_queue_p50.is_some()),
             "submitted writes must appear as queue-depth percentiles: {samples:?}"
         );
-        // Process resource signals (task 4.2) reach the controller where the
+        // Process resource signals reach the controller where the
         // platform reports them; elsewhere they stay labeled unavailable.
         #[cfg(target_os = "linux")]
         {
@@ -3360,7 +3368,7 @@ mod write_pipeline_tests {
         let content = content();
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = directory.path().join("output.bin");
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(pipeline_http(&content)),
             pipeline_config(true, 4),
         );
@@ -3383,7 +3391,7 @@ mod write_pipeline_tests {
         );
     }
 
-    /// Overlap (design D2): while the FIRST write is blocked on a slow
+    /// Overlap: while the FIRST write is blocked on a slow
     /// sink, the worker keeps receiving the next chunk and submits it; the
     /// second write completes first (reverse completion) and the frontier
     /// publishes nothing until the first write settles. Releasing the
@@ -3396,7 +3404,7 @@ mod write_pipeline_tests {
         let registration = OutputFaultScript::register(&destination);
         let gate = registration.script().hold_next(OutputOperation::Write);
 
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(pipeline_http(&content)),
             pipeline_config(true, 2),
         );
@@ -3442,7 +3450,7 @@ mod write_pipeline_tests {
         assert_eq!(result.completed_bytes, TOTAL);
     }
 
-    /// Bounded bytes (design D2): with a one-frame read-ahead, a blocked
+    /// Bounded bytes: with a one-frame read-ahead, a blocked
     /// sink stops network receipt — the worker cannot outrun storage and
     /// engine-owned payload stays within the configured read-ahead.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3453,7 +3461,7 @@ mod write_pipeline_tests {
         let registration = OutputFaultScript::register(&destination);
         let gate = registration.script().hold_next(OutputOperation::Write);
 
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(pipeline_http(&content)),
             pipeline_config(true, 1),
         );
@@ -3495,7 +3503,7 @@ mod write_pipeline_tests {
         );
     }
 
-    /// Task 2.7 (retry): a retryable body fault DRAINS the outstanding
+    /// Retryable body fault: DRAINS the outstanding
     /// writes before the lease requeues, so the retry resumes from the
     /// settled acknowledged prefix — here exactly [1000, 1999] — and the
     /// union stays byte-exact with no double-credited coverage.
@@ -3538,7 +3546,7 @@ mod write_pipeline_tests {
         config.retry.base_delay = Duration::from_millis(5);
         config.retry.max_delay = Duration::from_millis(10);
         let controller =
-            SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config);
+            DownloadController::with_execution(HttpExecution::from_adapter(scripted), config);
         let result = controller
             .run(DownloadRequest::new(
                 "https://scripted/retry",
@@ -3559,7 +3567,7 @@ mod write_pipeline_tests {
         );
     }
 
-    /// Task 2.7 (pause + durable sync-before-save): pausing mid-transfer
+    /// Pause with durable sync-before-save: pausing mid-transfer
     /// with queued writes drains them first; the coordinator persists the
     /// acknowledged prefix (durable mode synchronizes first) and the pause
     /// cannot settle while a write is still blocked on the slow sink.
@@ -3615,7 +3623,7 @@ mod write_pipeline_tests {
         config.retry.base_delay = Duration::from_millis(5);
         config.retry.max_delay = Duration::from_millis(10);
         let controller =
-            SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config);
+            DownloadController::with_execution(HttpExecution::from_adapter(scripted), config);
         let (handle, task) = controller.start(DownloadRequest::new(
             "https://scripted/pause-drain",
             destination.clone(),
@@ -3673,7 +3681,7 @@ mod write_pipeline_tests {
         assert_eq!(result.completed_bytes, TOTAL, "unique coverage once");
     }
 
-    /// Task 2.7 (cancellation): cancelling with queued writes converges
+    /// Cancellation: cancelling with queued writes converges
     /// deterministically — delete-partial removes the artifact, keep-partial
     /// preserves it; neither hangs on queued writes or leaks budget permits
     /// (a leak would deadlock the drain and trip the timeout).
@@ -3687,7 +3695,7 @@ mod write_pipeline_tests {
             let registration = OutputFaultScript::register(&destination);
             let gate = registration.script().hold_next(OutputOperation::Write);
 
-            let controller = SingleStreamController::with_execution(
+            let controller = DownloadController::with_execution(
                 HttpExecution::from_adapter(pipeline_http(&content)),
                 pipeline_config(true, 2),
             );
@@ -3733,7 +3741,7 @@ mod write_pipeline_tests {
         }
     }
 
-    /// Task 2.7 (fatal write errors): ENOSPC and permission-denied surface
+    /// Fatal write errors: ENOSPC and permission-denied surface
     /// as structured failures, publish nothing, and the job terminates
     /// promptly — no permit leak can deadlock the pipeline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3756,7 +3764,7 @@ mod write_pipeline_tests {
                 .script()
                 .fail_next(OutputOperation::Write, expected);
 
-            let controller = SingleStreamController::with_execution(
+            let controller = DownloadController::with_execution(
                 HttpExecution::from_adapter(pipeline_http(&content)),
                 pipeline_config(true, 2),
             );
@@ -3790,7 +3798,7 @@ mod write_pipeline_tests {
         let content = content();
         let directory = tempfile::tempdir().expect("tempdir");
         let destination = directory.path().join("output.bin");
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(pipeline_http(&content)),
             pipeline_config(false, 4),
         );

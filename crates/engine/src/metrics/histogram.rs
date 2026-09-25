@@ -1,5 +1,5 @@
 //! Lock-free bucketed histograms for adaptive-window instrumentation
-//! (task 4.1, design D5).
+//!.
 //!
 //! The controller needs stable window inputs instead of instantaneous
 //! samples: writer acknowledgement-latency and outstanding-queue-depth
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Bucket count for both histogram kinds.
 const BUCKETS: usize = 40;
 
-/// Bucket-wise counter snapshot (task 4.1): the unit both histograms
+/// Bucket-wise counter snapshot: the unit both histograms
 /// expose for window deltas.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BucketSnapshot {
@@ -78,7 +78,7 @@ impl BucketSnapshot {
         Some(BUCKETS - 1)
     }
 
-    /// Latency percentile in microseconds (task 4.1): the bucket's inclusive
+    /// Latency percentile in microseconds: the bucket's inclusive
     /// upper bound, so the value never under-reports the true percentile.
     /// `None` when the window observed no acknowledgement.
     #[must_use]
@@ -91,7 +91,7 @@ impl BucketSnapshot {
         Some(bound as f64)
     }
 
-    /// Queue-depth percentile (task 4.1): exact for every bucket except the
+    /// Queue-depth percentile: exact for every bucket except the
     /// overflow bucket, which reports `BUCKETS - 1` (a documented lower
     /// bound). `None` when the window observed no submission.
     #[must_use]
@@ -101,7 +101,7 @@ impl BucketSnapshot {
     }
 }
 
-/// Log2-bucketed latency histogram in microseconds (task 4.1).
+/// Log2-bucketed latency histogram in microseconds.
 #[derive(Debug)]
 pub(crate) struct LatencyHistogram {
     buckets: [AtomicU64; BUCKETS],
@@ -155,7 +155,7 @@ impl LatencyHistogram {
     }
 }
 
-/// Linear depth histogram (task 4.1): bucket `i` is exactly depth `i`; the
+/// Linear depth histogram: bucket `i` is exactly depth `i`; the
 /// last bucket also collects overflow.
 #[derive(Debug)]
 pub(crate) struct DepthHistogram {

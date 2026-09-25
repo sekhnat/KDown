@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, RetryPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::TestServer;
 
@@ -84,7 +84,7 @@ fn flaky_server_fixed_cut(
     })
 }
 
-fn controller() -> SingleStreamController {
+fn controller() -> DownloadController {
     let cfg = EngineConfig {
         // Tight backoff so the randomized suite stays fast; enough attempts
         // for up to 3 induced kills plus slack.
@@ -97,7 +97,7 @@ fn controller() -> SingleStreamController {
         },
         ..EngineConfig::default()
     };
-    SingleStreamController::new(
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     )

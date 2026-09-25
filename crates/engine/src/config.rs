@@ -71,7 +71,7 @@ pub enum DurabilityMode {
     Durable,
 }
 
-/// Range-worker concurrency mode (task 9.1): `Fixed` (default) keeps the
+/// Range-worker concurrency mode: `Fixed` (default) keeps the
 /// configured fixed concurrency; `Adaptive` opts into the conservative
 /// goodput-driven controller starting at `min_workers`. Manual runtime
 /// control remains supported in both modes and suspends the controller.
@@ -81,11 +81,11 @@ pub enum ConcurrencyMode {
     /// Fixed concurrency (default; unchanged behavior).
     #[default]
     Fixed,
-    /// Opt-in conservative adaptive range concurrency (design D6).
+    /// Opt-in conservative adaptive range concurrency.
     Adaptive,
 }
 
-/// How initial segmented lease sizes are chosen (task 6.1).
+/// How initial segmented lease sizes are chosen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SegmentSizing {
@@ -97,15 +97,15 @@ pub enum SegmentSizing {
     /// workers × `auto_oversubscription`))`, clamped to the segment bounds.
     /// Remaining coverage comes from validated intervals, not total length.
     Automatic,
-    /// Opt-in duration-informed sizing (task 3.4, design D4): each new
+    /// Opt-in duration-informed sizing: each new
     /// lease aims to hold its request for about `duration_ms`, sized from
     /// the scheduler's smoothed per-lease unique-goodput samples (request
     /// setup included in the measured service time). Allocations are
     /// clamped to the segment bounds, bounded to a 2× step change, and
     /// seeded from `initial_segment_size` until samples stabilize.
     ///
-    /// Recorded tuning guidance (task 3.5 sweep,
-    /// `benches/results/report-duration-sweep.md`): `duration_ms = 1000`
+    /// Recorded tuning guidance (`benches/results/report-duration-sweep.md`):
+    /// `duration_ms = 1000`
     /// with `auto_oversubscription = 3` (the ready-work factor) was at or
     /// above the explicit/automatic baselines on every non-network-bound
     /// axis with amplification ≤ 1.021 and zero retries. Opt-in only; the
@@ -189,18 +189,18 @@ pub struct TransferPolicy {
     pub initial_segment_size: u64,
     pub min_segment_size: u64,
     pub max_segment_size: u64,
-    /// Initial-lease sizing selector (task 6.1): `Explicit` (default) honors
+    /// Initial-lease sizing selector: `Explicit` (default) honors
     /// `initial_segment_size`; `Automatic` opts into the derived target.
     pub segment_sizing: SegmentSizing,
-    /// Oversubscription factor for `SegmentSizing::Automatic` (task 6.1);
+    /// Oversubscription factor for `SegmentSizing::Automatic`;
     /// initial candidate 3, tuned from benchmarks.
     pub auto_oversubscription: u64,
-    /// Range-worker concurrency mode (task 9.1): `Fixed` (default) or
+    /// Range-worker concurrency mode: `Fixed` (default) or
     /// opt-in `Adaptive` (starts at `min_workers`; manual control wins).
     pub concurrency_mode: ConcurrencyMode,
     pub segmentation_threshold: u64,
     pub preallocate_output: bool,
-    /// Opt-in physical space reservation at output preparation (task 11.1):
+    /// Opt-in physical space reservation at output preparation:
     /// attempts an fallocate-style reservation where supported; unsupported
     /// platforms/filesystems fall back to logical sizing.
     pub preallocate_physical: bool,
@@ -263,7 +263,7 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Connection pooling shape (§27, task 6.1).
+/// Connection pooling shape (§27).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolConfig {
     /// Engine-global concurrent connection cap across all jobs.
@@ -290,7 +290,7 @@ impl Default for PoolConfig {
         }
     }
 }
-/// Outstanding-write byte budgets (design D2, task 2.2): caps on the
+/// Outstanding-write byte budgets : caps on the
 /// payload bytes the engine retains between network receipt and write
 /// acknowledgement (queued+executing), enforced before each body chunk is
 /// read. Invalid budgets fail validation before any network activity.
@@ -308,7 +308,7 @@ pub struct WriteBudgetConfig {
 
 impl Default for WriteBudgetConfig {
     fn default() -> Self {
-        // Provisional conservative limits (design D2): two
+        // Provisional conservative limits: two
         // `read_buffer_size` frames of read-ahead per active worker, a
         // job pool admitting the default `max_workers` of them, and an
         // engine-wide aggregate. Tuned by the phase 2 benchmark gate;
@@ -322,7 +322,7 @@ impl Default for WriteBudgetConfig {
     }
 }
 
-/// Shared blocking write-executor policy (design D2, tasks 2.2-2.3): a
+/// Shared blocking write-executor policy : a
 /// small fixed-size blocking pool serves positional writes for every
 /// job's network workers, so blocking filesystem threads never scale with
 /// `jobs × workers`. Invalid bounds fail validation before network
@@ -336,11 +336,11 @@ pub struct WriteExecutorConfig {
     /// depth beyond the write budgets; must admit at least one frame
     /// quantum (validated against `read_buffer_size`).
     pub max_queued_bytes: u64,
-    /// Internal rollout switch (design D2, task 2.5): route segmented
+    /// Internal rollout switch : route segmented
     /// worker writes through the shared pipelined executor instead of the
     /// legacy per-worker blocking lanes. Defaults to `false` — the legacy
     /// path remains the production behavior until the phase 2 gate proves
-    /// parity (task 2.8); removed after acceptance (task 9.5).
+    /// parity; removed after acceptance.
     pub pipeline_writes: bool,
 }
 
@@ -355,7 +355,7 @@ impl Default for WriteExecutorConfig {
 }
 
 /// How many additional HTTP/2 connections a segmented job may open to one
-/// origin beyond the first multiplexed connection (§24, D5, task 6.2).
+/// origin beyond the first multiplexed connection (§24, D5).
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub enum H2ConnectionPolicy {
@@ -370,7 +370,7 @@ pub enum H2ConnectionPolicy {
 
 /// Proxy selection (§28): the caller picks; the engine never reads the
 /// environment implicitly.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub enum ProxyConfig {
     /// Direct connection (default).
@@ -380,6 +380,25 @@ pub enum ProxyConfig {
     Http { url: String },
     /// SOCKS5 proxy (extension hook, §28).
     Socks5 { url: String },
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Proxy URLs may embed userinfo credentials; they are redacted
+        // exactly like request URLs, while the proxy kind stays visible.
+        let redacted_url = |url: &String| crate::redact::Redactor::new().redact_url(url);
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Http { url } => f
+                .debug_struct("Http")
+                .field("url", &redacted_url(url))
+                .finish(),
+            Self::Socks5 { url } => f
+                .debug_struct("Socks5")
+                .field("url", &redacted_url(url))
+                .finish(),
+        }
+    }
 }
 
 /// TLS trust configuration (§21.1).
@@ -397,7 +416,7 @@ pub struct EngineConfig {
     pub max_connections_total: u32,
     pub max_connections_per_origin: u32,
     pub read_buffer_size: u32,
-    /// Bounds the public `BufferPool`'s own allocation ONLY (task 10.2):
+    /// Bounds the public `BufferPool`'s own allocation ONLY:
     /// the engine's transfer path no longer constructs pools (Hyper `Bytes`
     /// flow straight to positional writes). This is NOT a bound on Hyper's
     /// internal ingress buffers or socket windows — peak RSS may
@@ -421,10 +440,10 @@ pub struct EngineConfig {
     pub transfer: TransferPolicy,
     pub retry: RetryPolicy,
     pub network: NetworkPolicy,
-    /// Outstanding-write byte budgets (design D2, task 2.2): engine-global,
+    /// Outstanding-write byte budgets : engine-global,
     /// per-job and per-worker read-ahead caps on unacknowledged payload.
     pub write_budget: WriteBudgetConfig,
-    /// Shared blocking write-executor policy (design D2, task 2.3): the
+    /// Shared blocking write-executor policy : the
     /// small bounded blocking pool serving positional writes for all jobs.
     pub write_executor: WriteExecutorConfig,
     /// Engine-wide (global) payload rate limit in bytes/second shared by

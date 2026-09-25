@@ -44,6 +44,13 @@ pub enum Event {
     RateLimitChanged {
         bytes_per_second: Option<u64>,
     },
+    /// A manual concurrency update was applied: `workers` is the clamped,
+    /// applied desired worker count. Emitted only after the update is
+    /// visible; a concurrency-only change never emits `RateLimitChanged`,
+    /// and a rate-only change never emits this event.
+    ConcurrencyChanged {
+        workers: u64,
+    },
     ResourceChanged {
         detail: String,
     },

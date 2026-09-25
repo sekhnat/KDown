@@ -10,7 +10,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kdown_engine::{DownloadRequest, EngineConfig, HttpTransport, SingleStreamController};
+use kdown_engine::{DownloadController, DownloadRequest, EngineConfig, HttpTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = EngineConfig::default();
     let transport = HttpTransport::from_config(&config)?;
-    let controller = SingleStreamController::new(transport, config);
+    let controller = DownloadController::new(transport, config);
     let request = DownloadRequest::new(url, PathBuf::from(destination));
     let (handle, task) = controller.start(request);
 

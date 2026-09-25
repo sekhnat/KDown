@@ -13,7 +13,12 @@
 
 use std::time::{Duration, Instant};
 
-/// Opt-in adaptive concurrency configuration (task 9.1).
+/// Bound on how many opening windows may be spent anchoring the goodput
+/// reference before the first probe. Convergence normally ends anchoring
+/// far earlier; the cap only bounds the delay when goodput keeps drifting
+/// (for example a long slow-start ramp).
+const OPENING_WINDOW_CAP: u32 = 8;
+/// Opt-in adaptive concurrency configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdaptiveConfig {
     /// Observation window per decision.
@@ -27,7 +32,7 @@ pub struct AdaptiveConfig {
     pub max_retries_per_window: u64,
     /// Maximum tolerated throttle responses (429/503) per window.
     pub max_throttled_per_window: u64,
-    /// Storage-pressure veto (task 4.2): outstanding-write depth p95 at or
+    /// Storage-pressure veto: outstanding-write depth p95 at or
     /// above which growth is suppressed even when raw network goodput rises.
     /// Provisional until the phase-4 gate records measured thresholds.
     pub writer_queue_p95_ceiling: f64,
@@ -42,9 +47,9 @@ pub struct AdaptiveConfig {
     /// Window CPU ceiling as a percentage of one core above which growth is
     /// suppressed.
     pub cpu_ceiling_percent: f64,
-    /// Consecutive pressure windows required before REDUCING (task 4.2
-    /// hysteresis): one saturated window vetoes growth but does not shrink
-    /// the level; an in-flight probe still reverts immediately.
+    /// Consecutive pressure windows required before REDUCING (hysteresis):
+    /// one saturated window vetoes growth but does not shrink the level; an
+    /// in-flight probe still reverts immediately.
     pub sustained_pressure_windows: u32,
 }
 
@@ -66,13 +71,13 @@ impl Default for AdaptiveConfig {
     }
 }
 
-/// What one window observed (task 9.2): DELTAS over the window — the caller
+/// What one window observed: DELTAS over the window — the caller
 /// folds the counters at window boundaries and subtracts the previous fold.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WindowSample {
     /// Unique completed bytes over the window (never includes reused
-    /// checkpoint bytes — the goodput objective, task 9.2: no
-    /// resumed-byte inflation).
+    /// checkpoint bytes — the goodput objective; resumed bytes never
+    /// inflate it).
     pub completed_bytes: u64,
     /// Network (wire) bytes received over the window.
     pub network_bytes: u64,
@@ -82,15 +87,15 @@ pub struct WindowSample {
     pub retries: u64,
     /// Throttling responses (429/503) over the window.
     pub throttled: u64,
-    /// Interval-weighted worker time spent holding a lease (task 4.1):
+    /// Interval-weighted worker time spent holding a lease:
     /// worker-milliseconds accumulated by sub-interval sampling, never an
     /// instantaneous count.
     pub active_worker_ms: u64,
     /// Interval-weighted worker time spent provisioned and parked without a
-    /// lease (task 4.1). Dormant workers above the desired count are not
+    /// lease. Dormant workers above the desired count are not
     /// counted — they hold no capacity.
     pub idle_worker_ms: u64,
-    /// Interval-weighted idle share (task 4.1):
+    /// Interval-weighted idle share:
     /// `idle_worker_ms / (active_worker_ms + idle_worker_ms)`; `0.0` when no
     /// worker time was observed. Replaces the previous instantaneous cell
     /// sample.
@@ -127,7 +132,7 @@ impl WindowSample {
     }
 
     /// Pressure signals: retries or throttling above the configured
-    /// tolerances (task 9.3).
+    /// tolerances.
     #[must_use]
     pub fn under_pressure(&self, config: &AdaptiveConfig) -> bool {
         self.retries > config.max_retries_per_window
@@ -137,7 +142,7 @@ impl WindowSample {
                 && self.completed_bytes > 0
     }
 
-    /// Storage-pressure signals (task 4.2): writer backlog or acknowledgement
+    /// Storage-pressure signals: writer backlog or acknowledgement
     /// latency beyond the configured ceilings, or workers blocked on the
     /// write-byte budget. These veto growth regardless of raw network
     /// throughput — a saturated sink must not be fed harder, or the
@@ -152,7 +157,7 @@ impl WindowSample {
             || self.budget_wait_ms >= config.budget_wait_ceiling_ms
     }
 
-    /// Process-resource pressure (task 4.2): RSS or CPU above the configured
+    /// Process-resource pressure: RSS or CPU above the configured
     /// ceilings. Unavailable signals never trigger — they are reported as
     /// unavailable rather than guessed.
     #[must_use]
@@ -165,7 +170,7 @@ impl WindowSample {
     }
 }
 
-/// Interval-weighted worker activity (task 4.1): converts point samples of
+/// Interval-weighted worker activity: converts point samples of
 /// the actual active/idle worker counts into worker-time, so one slow
 /// observation cannot masquerade as a whole window of idleness.
 #[derive(Debug, Default)]
@@ -217,7 +222,7 @@ impl WorkerActivity {
     }
 }
 
-/// Why the controller reached its last decision (tasks 4.2/4.4): stable
+/// Why the controller reached its last decision: stable
 /// report reason codes, so a phase report can explain holds and reductions
 /// without changing the decision enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,27 +271,36 @@ pub struct AdaptiveController {
     config: AdaptiveConfig,
     min: u64,
     max: u64,
-    /// Smoothed useful goodput before the current probe (the comparison
-    /// baseline).
-    baseline_goodput: Option<f64>,
-    /// Smoothed useful goodput of the last window.
+    /// Best smoothed useful goodput observed while the desired level was
+    /// stable (no probe in flight). This high-water reference is what a new
+    /// level must beat to be kept: a startup-dipped or mid-transfer first
+    /// window must not make a slower level look like a gain, and probe
+    /// windows must not raise the bar for their own evaluation.
+    best_goodput: Option<f64>,
+    /// Whether the goodput reference has been anchored. The opening windows
+    /// include the probe request and connection ramp-up; a probe decided
+    /// against an unconverged reference can keep a slower level for the
+    /// whole transfer, so anchoring waits for convergence or the cap.
+    reference_anchored: bool,
+    /// Opening windows evaluated while the reference was not yet anchored.
+    baseline_windows: u32,
     smoothed_goodput: Option<f64>,
     /// The concurrency level before the current probe (the revert target).
     pre_probe_level: Option<u64>,
     /// Instant until which probes are held (cooldown).
     cooldown_until: Option<Instant>,
     /// Manual override active: the controller suspends for the job's
-    /// remainder (design D5).
+    /// remainder.
     manual_override: bool,
-    /// Consecutive windows under storage/resource pressure (task 4.2
-    /// hysteresis: sustained pressure reduces, one window only vetoes).
+    /// Consecutive windows under storage/resource pressure (hysteresis:
+    /// sustained pressure reduces, one window only vetoes).
     pressure_windows: u32,
-    /// Reason code for the last decision (tasks 4.2/4.4).
+    /// Reason code for the last decision.
     reason: DecisionReason,
 }
 
 impl AdaptiveController {
-    /// Create a controller for the configured bounds (task 9.1: the job
+    /// Create a controller for the configured bounds (the job
     /// starts at `min`).
     #[must_use]
     pub fn new(config: AdaptiveConfig, min: u64, max: u64) -> Self {
@@ -294,7 +308,9 @@ impl AdaptiveController {
             config,
             min: min.max(1),
             max: max.max(min.max(1)),
-            baseline_goodput: None,
+            best_goodput: None,
+            reference_anchored: false,
+            baseline_windows: 0,
             smoothed_goodput: None,
             pre_probe_level: None,
             cooldown_until: None,
@@ -304,7 +320,7 @@ impl AdaptiveController {
         }
     }
 
-    /// Reason code for the last decision (tasks 4.2/4.4): lets reports and
+    /// Reason code for the last decision: lets reports and
     /// diagnostics explain why concurrency was held or reduced.
     #[must_use]
     pub fn last_reason(&self) -> DecisionReason {
@@ -312,7 +328,7 @@ impl AdaptiveController {
     }
 
     /// A manual `set_concurrency` occurred: pin the desired count and
-    /// suspend auto-adjustment for the job's remainder (design D5).
+    /// suspend auto-adjustment for the job's remainder.
     pub fn manual_override(&mut self) {
         self.manual_override = true;
     }
@@ -327,20 +343,20 @@ impl AdaptiveController {
         self.cooldown_until.is_some_and(|until| now < until)
     }
 
-    /// The next decision given one window's deltas (task 9.3). Deterministic
+    /// The next decision given one window's deltas. Deterministic
     /// pure function over the sample + internal state.
     ///
     /// `current` is the desired concurrency now; the returned decision never
     /// leaves `[min, max]`.
     #[must_use]
     pub fn decide(&mut self, sample: WindowSample, current: u64) -> Decision {
-        // Manual override wins unconditionally (task 9.3 precedence).
+        // Manual override wins unconditionally.
         if self.manual_override {
             self.reason = DecisionReason::ManualOverride;
             return Decision::Hold;
         }
         // Empty window (no elapsed time or no bytes at all): hold without
-        // disturbing the baseline (task 9.2: empty windows never decide).
+        // disturbing the baseline (empty windows never decide).
         if sample.elapsed.is_zero() || sample.completed_bytes == 0 && sample.network_bytes == 0 {
             self.reason = DecisionReason::EmptyWindow;
             return Decision::Hold;
@@ -348,11 +364,36 @@ impl AdaptiveController {
 
         // Exponential smoothing of useful goodput (α = 0.5 — the tunable
         // stays internal until benchmarks justify exposure).
+        // Exponential smoothing of useful goodput (α = 0.5 — the tunable
+        // stays internal until benchmarks justify exposure).
         let instant_goodput = sample.useful_goodput();
-        self.smoothed_goodput = Some(match self.smoothed_goodput {
+        let smoothed = match self.smoothed_goodput {
             Some(prev) => 0.5 * prev + 0.5 * instant_goodput,
             None => instant_goodput,
-        });
+        };
+        // Anchor the reference before any probe. The opening windows include
+        // the probe request and connection ramp-up; a probe decided against
+        // an unconverged reference can keep a slower level for the whole
+        // transfer, because a depressed reference makes even a worse level
+        // look like material gain. Observe until smoothing converges — the
+        // window-over-window change falls inside the material band — or
+        // until OPENING_WINDOW_CAP windows have passed, whichever comes
+        // first. The check reads the previous window's smoothed value, so
+        // convergence reflects the settled trend rather than this window's
+        // own sample.
+        if !self.reference_anchored {
+            let anchored = match self.smoothed_goodput {
+                Some(prev) => {
+                    (smoothed - prev).abs()
+                        < self.config.material_gain_band * prev.max(f64::EPSILON)
+                }
+                None => false,
+            };
+            if anchored || self.baseline_windows >= OPENING_WINDOW_CAP {
+                self.reference_anchored = true;
+            }
+        }
+        self.smoothed_goodput = Some(smoothed);
 
         let now = Instant::now();
         // Pressure: hold or reduce — never probe into trouble (tasks 9.3 and
@@ -380,7 +421,6 @@ impl AdaptiveController {
             // the pre-probe level regardless of the raw goodput it produced
             // (marginal gain is only kept when its cost is bounded).
             if let Some(pre) = self.pre_probe_level.take() {
-                self.baseline_goodput = self.smoothed_goodput;
                 self.cooldown_until = Some(now + self.config.cooldown);
                 return if pre < current {
                     Decision::Reduce
@@ -389,7 +429,6 @@ impl AdaptiveController {
                 };
             }
             if self.pressure_windows >= self.config.sustained_pressure_windows.max(1) {
-                self.baseline_goodput = self.smoothed_goodput;
                 self.cooldown_until = Some(now + self.config.cooldown);
                 if current > self.min {
                     return Decision::Reduce;
@@ -403,27 +442,49 @@ impl AdaptiveController {
         }
         self.pressure_windows = 0;
 
+        // Ratchet the stable-level reference: only unpressured windows with
+        // no probe in flight may raise it. A depressed opening window must
+        // not lower the bar a new level has to beat, and probe or pressure
+        // windows must not inflate the bar with samples that do not
+        // describe a steady level. The ratchet sits after the pressure
+        // gates so pressured windows never fold into the reference.
+        if self.pre_probe_level.is_none() {
+            self.best_goodput = Some(match self.best_goodput {
+                Some(best) => best.max(smoothed),
+                None => smoothed,
+            });
+        }
+
         if self.in_cooldown(now) {
             self.reason = DecisionReason::Cooldown;
             return Decision::Hold;
         }
 
-        match (self.baseline_goodput, self.pre_probe_level) {
-            // No baseline yet: observe one more window before the first probe.
-            (None, _) => {
-                self.baseline_goodput = self.smoothed_goodput;
-                self.pre_probe_level = None;
-                self.reason = DecisionReason::Baseline;
-                Decision::Hold
-            }
-            // A probe is in flight: compare against the baseline.
-            (Some(baseline), Some(_pre)) => {
-                let smoothed = self.smoothed_goodput.unwrap_or(baseline);
-                let gain = (smoothed - baseline) / baseline.max(f64::EPSILON);
+        if !self.reference_anchored {
+            // Still anchoring the reference: observe without deciding. The
+            // counter only advances on unpressured, uncooled windows, so a
+            // rough start cannot spend the cap on windows that could not
+            // describe steady state anyway.
+            self.baseline_windows += 1;
+            self.reason = DecisionReason::Baseline;
+            return Decision::Hold;
+        }
+
+        match self.pre_probe_level {
+            // A probe is in flight: compare against the best stable-level
+            // observation. Measuring against the level the probe left (or
+            // against a startup-dipped opening window) can make a slower
+            // level look like material gain and lock the job above its best
+            // level for the remainder of the transfer.
+            Some(_pre) => {
+                let reference = self.best_goodput.unwrap_or(0.0);
+                let smoothed = self.smoothed_goodput.unwrap_or(reference);
+                let gain = (smoothed - reference) / reference.max(f64::EPSILON);
                 if gain >= self.config.material_gain_band {
                     // The probe helped: KEEP the increase and allow another
-                    // probe after cooldown (additive +1, strict bounds).
-                    self.baseline_goodput = self.smoothed_goodput;
+                    // probe after cooldown (additive +1, strict bounds). The
+                    // kept level becomes the new high-water reference.
+                    self.best_goodput = self.smoothed_goodput;
                     self.pre_probe_level = None;
                     self.cooldown_until = Some(now + self.config.cooldown);
                     if current < self.max {
@@ -435,10 +496,10 @@ impl AdaptiveController {
                         Decision::Hold
                     }
                 } else {
-                    // No material gain: revert the probe and cool down
-                    // (task 9.3: revert unhelpful probes, avoid oscillation).
+                    // No material gain: revert the probe and cool down, so
+                    // an unhelpful level cannot persist by immediately
+                    // re-probing.
                     self.pre_probe_level = None;
-                    self.baseline_goodput = self.smoothed_goodput;
                     self.cooldown_until = Some(now + self.config.cooldown);
                     self.reason = DecisionReason::NoGainReverted;
                     if current > self.min {
@@ -448,9 +509,9 @@ impl AdaptiveController {
                     }
                 }
             }
-            // Stable state: probe +1 (additive probing, task 9.3). Every
-            // change requires a cooldown before the next evaluation.
-            (Some(_), None) => {
+            // Stable state: probe +1 (additive probing). Every change
+            // requires a cooldown before the next evaluation.
+            None => {
                 if current < self.max {
                     self.pre_probe_level = Some(current);
                     self.cooldown_until = Some(now + self.config.cooldown);
@@ -464,7 +525,7 @@ impl AdaptiveController {
         }
     }
 
-    /// Apply a decision to a desired count (strict bounds, task 9.3).
+    /// Apply a decision to a desired count (strict bounds).
     #[must_use]
     pub fn apply(&self, decision: Decision, current: u64) -> u64 {
         match decision {
@@ -500,7 +561,7 @@ mod tests {
         }
     }
 
-    /// Deterministic trace (task 9.3): gain keeps probes; no gain reverts;
+    /// Deterministic trace: gain keeps probes; no gain reverts;
     /// pressure reduces; cooldown holds; manual override pins.
     #[test]
     fn controller_trace_gain_no_gain_pressure_cooldown() {
@@ -540,6 +601,42 @@ mod tests {
         controller.cooldown_until = None;
         // The probe produced NO gain (same goodput): revert to 1.
         assert_eq!(controller.decide(sample(500_000, 500), 2), Decision::Reduce);
+        assert_eq!(controller.apply(Decision::Reduce, 2), 1);
+    }
+
+    /// A startup-dipped opening window must not make a slower level look
+    /// like material gain. The reference is the best stable-level
+    /// observation, so a probe that never beats the best level reverts;
+    /// comparing against the opening window instead locked jobs at an
+    /// unhelpful level for the whole transfer on slow or loaded runners
+    /// (observed as macOS CI never returning to the minimum).
+    #[test]
+    fn depressed_opening_window_cannot_lock_a_worse_level() {
+        let config = AdaptiveConfig::default();
+        let mut controller = AdaptiveController::new(config, 1, 8);
+        // Window 1 is startup-contaminated: far below steady state. The
+        // controller observes until smoothing converges on the reference.
+        assert_eq!(controller.decide(sample(200_000, 500), 1), Decision::Hold);
+        // Steady level-1 windows; the reference climbs toward the true
+        // level instead of staying at the depressed opening value.
+        for _ in 0..4 {
+            assert_eq!(controller.decide(sample(4_000_000, 500), 1), Decision::Hold);
+        }
+        // Converged: the first probe raises desired to 2.
+        assert_eq!(
+            controller.decide(sample(4_000_000, 500), 1),
+            Decision::ProbeUp
+        );
+        // Probe windows (cooldown): the new level is clearly slower.
+        assert_eq!(controller.decide(sample(2_000_000, 500), 2), Decision::Hold);
+        controller.cooldown_until = None;
+        // Evaluation: the probe never beat the best stable observation, so
+        // it must revert to 1 rather than be kept as a "gain" against the
+        // depressed opening window.
+        assert_eq!(
+            controller.decide(sample(2_000_000, 500), 2),
+            Decision::Reduce
+        );
         assert_eq!(controller.apply(Decision::Reduce, 2), 1);
     }
 
@@ -593,7 +690,7 @@ mod tests {
         assert!(controller.is_manual_override());
     }
 
-    /// Empty windows (no elapsed, no bytes) never decide (task 9.2).
+    /// Empty windows (no elapsed, no bytes) never decide.
     #[test]
     fn empty_windows_hold() {
         let config = AdaptiveConfig::default();
@@ -617,13 +714,13 @@ mod tests {
         assert_eq!(controller.decide(sample(500_000, 500), 1), Decision::Hold);
     }
 
-    /// Resumed bytes never inflate the objective (task 9.2): reused bytes
+    /// Resumed bytes never inflate the objective: reused bytes
     /// are not part of `completed_bytes` deltas.
     #[test]
     fn window_arithmetic_excludes_reused_bytes() {
         // `completed_bytes` counts only UNIQUE newly completed bytes; reused
         // checkpoint bytes live in a separate counter and never enter the
-        // goodput objective (task 9.2: no resumed-byte inflation).
+        // goodput objective (no resumed-byte inflation).
         let sample = WindowSample {
             completed_bytes: 1_000,
             network_bytes: 1_000,
@@ -645,7 +742,7 @@ mod tests {
         assert_eq!(sample.useful_goodput(), 1000.0);
     }
 
-    /// Interval weighting (task 4.1): the elapsed interval is credited to the
+    /// Interval weighting: the elapsed interval is credited to the
     /// counts in effect at its start, so one slow observation cannot
     /// masquerade as a whole window of idleness.
     #[test]
@@ -667,7 +764,7 @@ mod tests {
     }
 
     /// A momentary idle sample inside a busy window must not read as a mostly
-    /// idle window (the instantaneous-sample failure mode of task 4.1).
+    /// idle window (the instantaneous-sample failure mode).
     #[test]
     fn momentary_idle_does_not_dominate_the_window() {
         let start = Instant::now();
@@ -697,7 +794,7 @@ mod tests {
         assert_eq!(WorkerActivity::idle_ratio(0, 100), 1.0);
     }
 
-    /// A synthetic window with writer/process instrumentation (task 4.2):
+    /// A synthetic window with writer/process instrumentation:
     /// tests drive the veto paths deterministically instead of racing a
     /// real sink.
     fn instrumented_sample(completed: u64, window_ms: u64) -> WindowSample {
@@ -709,7 +806,7 @@ mod tests {
         }
     }
 
-    /// Pressure predicates at the configured ceilings (task 4.2): at-or-above
+    /// Pressure predicates at the configured ceilings: at-or-above
     /// is pressure, unavailable signals are not.
     #[test]
     fn pressure_predicates_are_threshold_exact() {
@@ -738,7 +835,7 @@ mod tests {
         );
     }
 
-    /// Storage saturation reverts a probe that raised raw goodput (task 4.2):
+    /// Storage saturation reverts a probe that raised raw goodput:
     /// a saturated sink must not be fed harder, and recovery still probes.
     #[test]
     fn storage_saturation_reverts_a_probe_despite_raw_gain() {
@@ -769,7 +866,7 @@ mod tests {
     }
 
     /// One saturated window vetoes growth; sustained saturation reduces
-    /// (task 4.2 hysteresis).
+    ///.
     #[test]
     fn sustained_storage_pressure_reduces_after_the_configured_windows() {
         let config = AdaptiveConfig::default();
@@ -793,7 +890,7 @@ mod tests {
     }
 
     /// High RSS or CPU vetoes growth and never fabricates an unavailable
-    /// measurement into pressure (task 4.2).
+    /// measurement into pressure.
     #[test]
     fn process_resource_pressure_vetoes_growth() {
         let config = AdaptiveConfig::default();
@@ -811,8 +908,14 @@ mod tests {
         high_cpu.cpu_percent = Some(config.cpu_ceiling_percent + 100.0);
         assert_eq!(controller.decide(high_cpu, 1), Decision::Hold);
         assert_eq!(controller.last_reason(), DecisionReason::ResourcePressure);
-        // Recovery: a clean window with no resource data probes again.
+        // Recovery: smoothing must reconverge on clean windows before the
+        // controller probes again (the pressure window's own smoothed
+        // value decays out of the trend first).
         controller.cooldown_until = None;
+        assert_eq!(
+            controller.decide(instrumented_sample(950_000, 500), 1),
+            Decision::Hold
+        );
         assert_eq!(
             controller.decide(instrumented_sample(950_000, 500), 1),
             Decision::ProbeUp
@@ -820,7 +923,7 @@ mod tests {
     }
 
     /// Acknowledged-latency saturation is storage pressure on its own
-    /// (task 4.2): slow acknowledgements mean the sink is the bottleneck.
+    ///: slow acknowledgements mean the sink is the bottleneck.
     #[test]
     fn acknowledgement_latency_is_storage_pressure() {
         let config = AdaptiveConfig::default();
@@ -834,7 +937,16 @@ mod tests {
         assert_eq!(controller.decide(slow_ack, 1), Decision::Hold);
         assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
         // An in-flight probe under slow acknowledgements reverts too.
+        // Recovery: smoothing must reconverge before the controller probes
+        // again; the post-pressure smoothed value decays toward the steady
+        // level over several windows (halving each window).
         controller.cooldown_until = None;
+        for _ in 0..4 {
+            assert_eq!(
+                controller.decide(instrumented_sample(500_000, 500), 1),
+                Decision::Hold
+            );
+        }
         assert_eq!(
             controller.decide(instrumented_sample(500_000, 500), 1),
             Decision::ProbeUp
@@ -844,8 +956,8 @@ mod tests {
         assert_eq!(controller.last_reason(), DecisionReason::StoragePressure);
     }
 
-    /// Retry and 429/503 pressure still respond immediately (task 9.3
-    /// behavior preserved by task 4.2) and report their own reason.
+    /// Retry and 429/503 pressure still respond immediately and report
+    /// their own reason.
     #[test]
     fn retry_and_throttle_pressure_still_reduce_immediately() {
         let config = AdaptiveConfig::default();
@@ -865,7 +977,7 @@ mod tests {
         assert_eq!(controller.last_reason(), DecisionReason::RetryPressure);
     }
 
-    /// Noisy windows must not oscillate the level (task 4.3): near-band
+    /// Noisy windows must not oscillate the level: near-band
     /// alternating windows move the level at most one worker per window and
     /// oscillate at most one step around the floor instead of running away.
     #[test]
@@ -902,7 +1014,7 @@ mod tests {
     }
 
     /// Even strong alternating windows move the level at most one worker per
-    /// window (task 4.3): no jump-to-max reaction to a single spike.
+    /// window: no jump-to-max reaction to a single spike.
     #[test]
     fn strong_swings_move_at_most_one_worker_per_window() {
         let config = AdaptiveConfig::default();
@@ -926,7 +1038,7 @@ mod tests {
 
     /// Sub-band noise never climbs: at the floor the smoothed gain never
     /// reaches the hysteresis band, so the level stays within one probe
-    /// (task 4.3 no-oscillation).
+    ///.
     #[test]
     fn sub_band_noise_never_climbs_above_the_floor() {
         let config = AdaptiveConfig::default();
@@ -945,7 +1057,7 @@ mod tests {
         assert_eq!(level, 1, "the level settles back to the floor");
     }
 
-    /// Strict bounds (task 9.3): apply never leaves [min, max].
+    /// Strict bounds: apply never leaves [min, max].
     #[test]
     fn apply_respects_strict_bounds() {
         let config = AdaptiveConfig::default();

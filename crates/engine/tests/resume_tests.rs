@@ -13,14 +13,14 @@ use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use kdown_engine::resume::{DurabilityMode, FileCheckpointStore};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
-fn controller() -> SingleStreamController {
-    SingleStreamController::new(
+fn controller() -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         EngineConfig::default(),
     )
@@ -28,8 +28,8 @@ fn controller() -> SingleStreamController {
 
 /// Scripted orchestration controller (§32): network-neutral resume
 /// orchestration runs through the deterministic adapter — no sockets.
-fn scripted_controller(scripted: &ScriptedHttp) -> SingleStreamController {
-    SingleStreamController::with_execution(
+fn scripted_controller(scripted: &ScriptedHttp) -> DownloadController {
+    DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -42,8 +42,8 @@ fn tight_checkpoints() -> EngineConfig {
     }
 }
 
-fn controller_fast() -> SingleStreamController {
-    SingleStreamController::new(
+fn controller_fast() -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         tight_checkpoints(),
     )

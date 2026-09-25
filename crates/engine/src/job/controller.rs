@@ -1,7 +1,10 @@
-//! Job controller: the single-stream pipeline (§9, §47, tasks 3.7-3.9).
+//! Job controller: one orchestrator for sequential and segmented
+//! transfers (§9, §47).
 //!
-//! probe -> prepare -> sequential GET -> chunked positional writes with
-//! backpressure -> verify size/hash -> atomic commit -> Completed.
+//! Sequential pipeline: probe -> prepare -> sequential GET -> chunked
+//! positional writes with backpressure -> verify size/hash -> atomic
+//! commit -> Completed. Segmenting transfers reuse the same lifecycle
+//! with the segmented scheduler underneath the same controller API.
 //!
 //! Pause/cancel are cooperative via [`CancellationToken`]; retry uses
 //! [`RetryClassifier`] with structured classification (§17).
@@ -64,12 +67,16 @@ pub struct DownloadRequest {
 
 impl std::fmt::Debug for DownloadRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Sensitive fields (authorization, credential provider) never
-        // print their values (§35.3).
+        // Sensitive fields (authorization, credential provider) never print
+        // their values, and custom header values never appear at all (§35.3):
+        // credentials may travel under arbitrary header names.
+        // Only header NAMES are diagnostic and stay visible.
         f.debug_struct("DownloadRequest")
             .field("url", &self.url)
             .field("destination", &self.destination)
-            .field("headers", &self.headers)
+            // Header values can carry credentials under any name; only the
+            // names are diagnostic, so values are never formatted.
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
             .field("expected_size", &self.expected_size)
             .field("integrity", &self.integrity)
             .field("overwrite", &self.overwrite)
@@ -110,9 +117,9 @@ pub struct DownloadResult {
     pub final_path: Option<PathBuf>,
     pub bytes_downloaded_from_network: u64,
     pub bytes_reused_from_checkpoint: u64,
-    /// Unique newly completed file bytes (real `JobCounters` counter,
-    /// task 1.1): excludes reused checkpoint bytes and retransmitted
-    /// duplicates. This is the useful-goodput numerator for benchmarks.
+    /// Unique newly completed file bytes: excludes reused checkpoint
+    /// bytes and retransmitted duplicates. This is the useful-goodput
+    /// numerator for benchmarks.
     pub completed_bytes: u64,
     /// Wasted/retransmitted network bytes (real counter): payload received
     /// but not uniquely completed. Never derived from warning counts.
@@ -120,10 +127,10 @@ pub struct DownloadResult {
     /// Retry attempts charged by the transfer paths (real counter).
     pub retries: u64,
     /// Range requests issued by the segmented transfer (additive
-    /// diagnostic, task 3.5); `0` for single-stream transfers.
+    /// diagnostic); `0` for single-stream transfers.
     pub segment_requests: u64,
     /// Live-tail splits performed by the segmented scheduler (additive
-    /// diagnostic, task 3.5); `0` for single-stream transfers.
+    /// diagnostic); `0` for single-stream transfers.
     pub live_splits: u64,
     pub total_size: Option<u64>,
     pub elapsed: Duration,
@@ -133,7 +140,7 @@ pub struct DownloadResult {
 }
 
 impl DownloadResult {
-    /// Wire amplification (task 0.4 observability): total received payload
+    /// Wire amplification: total received payload
     /// divided by uniquely completed bytes. Received payload is the network
     /// counter plus re-received waste (this engine counts each wire byte
     /// once in `bytes_downloaded_from_network` and charges duplicates to
@@ -199,7 +206,7 @@ impl CancelMode {
     }
 }
 
-// hub/total_size are consumed by event-wiring refinements (task 3.8+).
+// hub/total_size are consumed by event-wiring refinements.
 #[allow(dead_code)]
 pub struct DownloadHandle {
     pub id: u64,
@@ -210,14 +217,17 @@ pub struct DownloadHandle {
     counters: Arc<JobCounters>,
     total_size: Arc<std::sync::atomic::AtomicU64>,
     total_known: Arc<std::sync::atomic::AtomicBool>,
-    /// Resolved once the run task creates the live SegmentedJob (task 5.8):
+    /// Resolved once the run task creates the live SegmentedJob:
     /// worker-concurrency reduction; `None` for single-stream jobs.
     segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
     /// Shared rate-limit bucket for the job (§18: runtime changeable).
-    /// Stable job-wide bucket (task 5.3): rate 0 = unlimited; runtime
+    /// Stable job-wide bucket: rate 0 = unlimited; runtime
     /// updates mutate it in place so the same object reaches the eventual
     /// job and its active workers.
     rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    /// Serializes runtime-control update+event pairs (see the field comment
+    /// at construction).
+    runtime_control: std::sync::Mutex<()>,
 }
 
 impl DownloadHandle {
@@ -245,7 +255,7 @@ impl DownloadHandle {
     /// Lift a pause.
     pub fn resume_now(&self) {
         self.cancel.unpause();
-        // Wake parked segmented workers (task 7.2): resume is a scheduler-
+        // Wake parked segmented workers: resume is a scheduler-
         // relevant transition for lease-less parked workers.
         if let Some(job) = self.segmented_cell.get() {
             job.notify_transition();
@@ -281,28 +291,45 @@ impl DownloadHandle {
         }
     }
 
-    /// Request a concurrency reduction for a segmented job (task 5.8, §7.3):
-    /// excess workers settle their leases safely and exit; no byte range
-    /// is lost. No-op for single-stream jobs.
+    /// Request a concurrency change for a segmented job: excess workers
+    /// settle their leases safely and exit; no byte range is lost. The
+    /// request is clamped to the job's configured worker bounds and the
+    /// APPLIED count is reported through exactly one
+    /// [`Event::ConcurrencyChanged`]; a concurrency-only change never
+    /// emits [`Event::RateLimitChanged`]. No-op and silent for
+    /// single-stream jobs or before a segmented job exists.
     pub fn set_concurrency(&self, workers: u64) {
         if let Some(job) = self.segmented_cell.get() {
-            job.set_desired_workers(workers);
+            // The lock pairs the state update with its event emission so
+            // concurrent callers' events cannot invert against the applied
+            // order; it guards only this control path.
+            let _guard = self.runtime_control.lock().expect("runtime control lock");
+            let applied = job.set_desired_workers(workers);
             self.hub
-                .emit_try(crate::metrics::events::Event::RateLimitChanged {
-                    bytes_per_second: None,
-                });
+                .emit_try(crate::metrics::events::Event::ConcurrencyChanged { workers: applied });
         }
     }
-
-    /// The live segmented job, when the run task created one (task 5.8).
+    /// The live segmented job, when the run task created one.
     #[must_use]
     pub fn segmented_job(&self) -> Option<&Arc<crate::job::segmented::SegmentedJob>> {
         self.segmented_cell.get()
     }
 
-    /// Change the job's rate limit at runtime (§18.2): takes effect on the
-    /// next acquire without restarting workers. `0` = unlimited.
+    /// Change the job's rate limit at runtime: takes effect on the next
+    /// acquire without restarting workers. `0` = unlimited. The stable
+    /// bucket is updated BEFORE the event is emitted, so a subscriber that
+    /// observes [`Event::RateLimitChanged`] already sees the new limit; a
+    /// rate-only change never emits a concurrency event.
     pub fn set_rate_limit(&self, bytes_per_second: u64) {
+        // Same update+event pairing as `set_concurrency`.
+        let _guard = self.runtime_control.lock().expect("runtime control lock");
+        // One stable bucket: pre-start updates mutate it in place so the
+        // SAME object reaches the eventual job; live updates mutate the
+        // running job's bucket through the same object.
+        self.rate_bucket.set_rate(bytes_per_second);
+        if let Some(job) = self.segmented_cell.get() {
+            job.set_rate(bytes_per_second);
+        }
         self.hub
             .emit_try(crate::metrics::events::Event::RateLimitChanged {
                 bytes_per_second: if bytes_per_second == 0 {
@@ -311,13 +338,6 @@ impl DownloadHandle {
                     Some(bytes_per_second)
                 },
             });
-        // One stable bucket: pre-start updates mutate it in place so the
-        // SAME object reaches the eventual job (task 5.3); live updates
-        // mutate the running job's bucket through the same object.
-        self.rate_bucket.set_rate(bytes_per_second);
-        if let Some(job) = self.segmented_cell.get() {
-            job.set_rate(bytes_per_second);
-        }
     }
 
     /// The active rate limit (`None` = unlimited).
@@ -335,8 +355,10 @@ impl DownloadHandle {
     }
 }
 
-/// The single-stream job controller (§47 run_job, sequential branch).
-pub struct SingleStreamController {
+/// The download job controller: starts and supervises both sequential and
+/// segmented range transfers behind one lifecycle and handle API (§47
+/// `run_job`, both branches).
+pub struct DownloadController {
     /// The substitutable HTTP execution seam (§32): semantic probe and
     /// transfer operations without concrete client response types. The
     /// production adapter is injected by [`new`]/[`with_metrics`]; tests and
@@ -348,7 +370,7 @@ pub struct SingleStreamController {
     /// per job before admission; the default creates destination-relative
     /// file sidecars so existing construction is unchanged.
     checkpoint_resolver: Arc<dyn CheckpointStoreResolver>,
-    /// Controller-shared origin registry (task 6.2, design D6): fair
+    /// Controller-shared origin registry: fair
     /// cancellable request admission plus shared throttle feedback, keyed by
     /// the normalized FINAL origin; one instance serves every job this
     /// controller starts.
@@ -362,7 +384,17 @@ pub struct SingleStreamController {
     global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 }
 
-impl SingleStreamController {
+/// Deprecated alias of [`DownloadController`], kept for source
+/// compatibility: the controller has always orchestrated BOTH sequential
+/// and segmented transfers, so the old name described only one of its two
+/// modes. New code must use [`DownloadController`]; this alias is a
+/// one-line mechanical rename for existing callers and adds nothing.
+#[deprecated(
+    note = "`SingleStreamController` starts both sequential and segmented downloads; rename to `DownloadController`"
+)]
+pub type SingleStreamController = DownloadController;
+
+impl DownloadController {
     /// Build a controller over the production Hyper wire adapter (§32:
     /// compatible construction — existing callers compile unchanged).
     #[must_use]
@@ -436,7 +468,7 @@ impl SingleStreamController {
         self
     }
 
-    /// Replace the shared origin registry (task 6.5 fallback variant): the
+    /// Replace the shared origin registry: the
     /// default is the enabled engine-shared registry; a
     /// [`OriginRegistry::disabled`] instance restores the per-job backoff
     /// fallback (no shared admission, no shared throttle feedback).
@@ -456,7 +488,7 @@ impl SingleStreamController {
         Self::with_execution_and_metrics(HttpExecution::from_adapter(transport), config, metrics)
     }
 
-    /// Admit one request to `origin` (task 6.2): waits out the origin's
+    /// Admit one request to `origin`: waits out the origin's
     /// shared throttle deadline and takes one fair request slot; the RAII
     /// permit releases on drop. `origin: None` (or a disabled registry)
     /// admits immediately.
@@ -471,7 +503,7 @@ impl SingleStreamController {
         }
     }
 
-    /// Shared throttle feedback (task 6.3): extends the origin's coordinated
+    /// Shared throttle feedback: extends the origin's coordinated
     /// deadline with the `RetryClassifier`-capped Retry-After (or the
     /// classifier's backoff delay when the server sent none).
     fn report_throttle_origin(
@@ -489,7 +521,7 @@ impl SingleStreamController {
         }
     }
 
-    /// Shared recovery accounting (task 6.3): one completed request against
+    /// Shared recovery accounting: one completed request against
     /// the origin — the post-cooldown probe signal.
     fn report_success_origin(&self, origin: Option<&str>) {
         if let Some(key) = origin {
@@ -530,7 +562,7 @@ impl SingleStreamController {
         let metrics_for_run = self.metrics.clone();
         let state = StateMachine::new();
         let cancel = CancellationToken::new();
-        // One counter shard per potential worker (task 5.4: per-worker
+        // One counter shard per potential worker (per-worker
         // attribution); mirrors the segmented job's worker-progress cells.
         let counters = Arc::new(JobCounters::new(self.config.transfer.max_workers.max(16)));
         let (hub, _stream) = EventHub::new(256, self.config.metrics_interval);
@@ -547,15 +579,20 @@ impl SingleStreamController {
             total_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_known: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             segmented_cell: Arc::new(std::sync::OnceLock::new()),
+            // Serializes each runtime-control update+event pair so two
+            // concurrent callers cannot invert the reported order against
+            // the applied order. Guards only these control paths — never
+            // scheduler or sink locks, and event emission is nonblocking.
+            runtime_control: std::sync::Mutex::new(()),
             // The configured per-job limit (§18) seeds the stable bucket so
             // a pre-start configured limit and later live updates share one
-            // object (task 7.1: the config value was previously never read).
+            // object (the config value was previously never read).
             rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(
                 self.config.network.rate_limit.unwrap_or(0),
             )),
         };
         // The run task publishes the live SegmentedJob into the same cell
-        // the handle reads (task 5.8).
+        // the handle reads.
         let handle_cell = handle.segmented_cell.clone();
         let rate_bucket_for_run = handle.rate_bucket.clone();
         let global_bucket_for_run = self.global_rate_bucket.clone();
@@ -605,7 +642,7 @@ impl SingleStreamController {
     /// Run with a control handle: blocks until terminal.
     ///
     /// # Errors
-    /// Same contract as [`SingleStreamController::run`].
+    /// Same contract as [`DownloadController::run`].
     pub async fn run_with_handle(
         &self,
         request: DownloadRequest,
@@ -767,7 +804,7 @@ impl SingleStreamController {
                     .terminal_cancelled(&state, request, counters, Duration::ZERO, &hub, vec![])
                     .await;
             }
-            // Shared-origin admission (task 6.2): one fair request slot for
+            // Shared-origin admission: one fair request slot for
             // the probe's dispatch, keyed by the request URL's origin — the
             // FINAL origin is only known after the probe resolves redirects.
             let probe_origin = normalized_origin(&request.url);
@@ -844,7 +881,7 @@ impl SingleStreamController {
                             }
                         }
                     }
-                    // Shared-origin throttle feedback (task 6.3): a 429/503
+                    // Shared-origin throttle feedback: a 429/503
                     // seen by this job delays every same-origin peer's next
                     // request, with the Retry-After capped by the classifier.
                     if matches!(
@@ -968,7 +1005,7 @@ impl SingleStreamController {
             )
             .map_err(|error| error.0)?
         };
-        // ---- Segmented mode dispatch (§12, task 5.5) ----
+        // ---- Segmented mode dispatch (§12) ----
         if eligible {
             let _ = state.transition(JobState::Running);
             hub.emit(Event::StateChanged {
@@ -1036,7 +1073,7 @@ impl SingleStreamController {
         })
         .await;
         let started = std::time::Instant::now();
-        // Final-origin identity (task 6.1/6.2): every transfer — and its
+        // Final-origin identity: every transfer — and its
         // throttle feedback — keys on the probe-resolved final URL's origin,
         // so a redirected resource coordinates with its ACTUAL serving
         // origin rather than the pre-redirect address.
@@ -1160,7 +1197,7 @@ impl SingleStreamController {
             } else {
                 TransferIntent::Full
             };
-            // Shared-origin admission (task 6.2): one fair request slot held
+            // Shared-origin admission: one fair request slot held
             // from dispatch until the body is fully consumed (or the attempt
             // fails/cancels); the RAII permit releases it on every exit path.
             let _origin_permit = match self.admit_origin(transfer_origin.as_deref(), &cancel).await
@@ -1272,7 +1309,7 @@ impl SingleStreamController {
                         }
                         continue 'download; // re-issue with provider headers
                     }
-                    // Shared-origin throttle feedback (task 6.3): 429/503
+                    // Shared-origin throttle feedback: 429/503
                     // seen by this job delays every same-origin peer's next
                     // request, with the Retry-After capped by the classifier.
                     if matches!(
@@ -1399,13 +1436,16 @@ impl SingleStreamController {
 
                         // Rate tokens first: payload bytes only (§18.2).
                         // The hierarchical limiter aggregates job and
-                        // engine-global levels; the slowest wait governs.
-                        // Waiting stops on cancellation (prompt pause/cancel
-                        // interruption); the next loop pass performs cleanup.
+                        // engine-global levels through the one shared
+                        // slowest-wait combiner, so this path cannot diverge
+                        // from the segmented path. Waiting stops on
+                        // cancellation (prompt pause/cancel interruption);
+                        // the next loop pass performs cleanup.
                         {
                             let job_wait = rate_bucket_shared.acquire(len).wait;
                             let global_wait = global_rate_bucket.acquire(len).wait;
-                            let wait = job_wait.into_iter().chain(global_wait).max();
+                            let wait =
+                                crate::control::rate_limit::dominant_wait([job_wait, global_wait]);
                             if let Some(wait) = wait {
                                 tokio::select! {
                                     _ = tokio::time::sleep(wait) => {}
@@ -1628,7 +1668,7 @@ impl SingleStreamController {
             }
 
             // Stream finished cleanly: record one successful origin request
-            // (task 6.3 recovery accounting), then proceed to verification.
+            //, then proceed to verification.
             self.report_success_origin(transfer_origin.as_deref());
             break 'download;
         }
@@ -2112,7 +2152,7 @@ mod completion_tests {
         .expect("open output session");
         sink.write_at(0, b"new").expect("write temp output");
         sink.fail_next_flush();
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(ScriptedHttp::new()),
             EngineConfig::default(),
         );
@@ -2266,7 +2306,7 @@ mod completion_tests {
             .fail_next(operation, injected_error(operation));
         let gate = (operation == OutputOperation::Publish)
             .then(|| registration.script().hold_next(OutputOperation::Publish));
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(scripted),
             fault_config(segmented),
         );
@@ -2422,7 +2462,7 @@ mod completion_tests {
             ]
         );
     }
-    /// Ordinary segmented chunks never flush (task 3.1): the flush operation
+    /// Ordinary segmented chunks never flush: the flush operation
     /// fires exactly once — the owner's finalization — not once per chunk.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn segmented_chunk_path_never_flushes() {
@@ -2439,7 +2479,7 @@ mod completion_tests {
         config.transfer.min_segment_size = 1;
         config.transfer.verify_range_support = false;
 
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(fault_http(
                 true,
                 &(0..FAULT_TOTAL)

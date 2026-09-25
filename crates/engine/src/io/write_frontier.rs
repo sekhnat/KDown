@@ -1,7 +1,7 @@
 // The frontier is defined and verified here; the segmented transfer paths
-// drive it when the executor is integrated (tasks 2.5-2.7).
+// drive it when the executor is integrated.
 #![allow(dead_code)]
-//! Generation-tagged per-lease write frontiers (design D3, task 2.4).
+//! Generation-tagged per-lease write frontiers .
 //!
 //! One frontier tracks one lease attempt's write pipeline through four
 //! distinct stages: network **receipt** (a high-watermark, since the server
@@ -37,7 +37,7 @@ pub(crate) enum CompletionStatus {
     StaleGeneration,
 }
 
-/// Per-lease, per-generation write frontier (design D3).
+/// Per-lease, per-generation write frontier.
 #[derive(Debug)]
 pub(crate) struct LeaseFrontier {
     lease_id: u64,
@@ -105,8 +105,7 @@ impl LeaseFrontier {
         self.end
     }
 
-    /// Record network receipt of `[offset, offset+len)` (task 0.4/3.2:
-    /// wire bytes are counted at receipt). The contiguous watermark
+    /// Record network receipt of `[offset, offset+len)` (    /// wire bytes are counted at receipt). The contiguous watermark
     /// advances only across touching bytes; the high-watermark records any
     /// position regardless of gaps.
     ///
@@ -380,7 +379,7 @@ mod tests {
         f.record_received(164, 64);
         assert_eq!(f.received_through(), 228);
         // A gap in receipt does not advance the contiguous watermark but
-        // does move the high-watermark (task 3.2: measured separately).
+        // does move the high-watermark (measured separately).
         f.record_received(250, 20);
         assert_eq!(f.received_through(), 228);
         assert_eq!(f.received_high_water(), 270);
@@ -412,7 +411,7 @@ mod tests {
         assert_eq!(f.acknowledged_through(), 100, "gap blocks publication");
     }
 
-    /// Integration (design D3 + task 2.4): frontier-published records feed
+    /// Integration (design D3): frontier-published records feed
     /// the scheduler's accepted-delta accounting; retries and splits must
     /// never double-credit unique coverage.
     #[test]

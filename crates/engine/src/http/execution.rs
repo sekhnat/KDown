@@ -180,7 +180,7 @@ impl From<DownloadError> for HttpFailure {
 /// parsed transport-neutral fields validation needs. Confined to the `http`
 /// module — job orchestration never sees it; adapters hand job code only
 /// semantic outcomes.
-#[allow(dead_code)] // wired by the production adapter migration (tasks 2.1-2.3)
+#[allow(dead_code)] // wired by the production adapter migration
 pub(crate) struct ResponseMetadata {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -191,7 +191,7 @@ pub(crate) struct ResponseMetadata {
     pub http_version: &'static str,
 }
 
-#[allow(dead_code)] // wired by the production adapter migration (tasks 2.1-2.3)
+#[allow(dead_code)] // wired by the production adapter migration
 impl ResponseMetadata {
     /// Case-insensitive header lookup.
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
@@ -288,7 +288,7 @@ impl ResponseHead for ResponseMetadata {
 /// transfer modes and the probe path use. Previously the sequential path
 /// mapped 407 to `Protocol` while the probe path mapped it to `Proxy`;
 /// this table makes them agree (allowed compatibility fix).
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn status_to_error(status: u16) -> DownloadError {
     match status {
         404 | 410 => DownloadError::NotFound { status },
@@ -304,7 +304,7 @@ pub(crate) fn status_to_error(status: u16) -> DownloadError {
 
 /// Retry-After extraction (§17.2): seconds form; HTTP-date unsupported in
 /// v1 and yields `None`.
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn retry_after(headers: &[(String, String)]) -> Option<Duration> {
     let value = headers
         .iter()
@@ -315,7 +315,7 @@ pub(crate) fn retry_after(headers: &[(String, String)]) -> Option<Duration> {
 
 /// Authentication challenge extraction (§29): 401/407 with
 /// WWW-Authenticate / Proxy-Authenticate headers.
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn challenge(status: u16, url: &str, headers: &[(String, String)]) -> Option<Challenge> {
     crate::control::auth::challenge_from_headers(status, url, headers)
 }
@@ -324,7 +324,7 @@ pub(crate) fn challenge(status: u16, url: &str, headers: &[(String, String)]) ->
 /// (`incomplete message`), connection closes, and read timeouts all land
 /// in the Connection family so the shared retry classifier sees identical
 /// categories from both adapters and both transfer modes.
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn classify_body_failure(msg: &str, is_timeout: bool) -> DownloadError {
     if msg.contains("incomplete") || msg.contains("connection closed") || msg.contains("reset") {
         DownloadError::Connection(msg.to_string())
@@ -337,14 +337,14 @@ pub(crate) fn classify_body_failure(msg: &str, is_timeout: bool) -> DownloadErro
 
 /// Hyper-specific body error classification, delegating to the shared
 /// table (production adapter only; Hyper never crosses the seam).
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn classify_hyper_body_error(e: &hyper::Error) -> DownloadError {
     classify_body_failure(&e.to_string(), e.is_timeout())
 }
 
 /// Range-overrun classification (§11.2): the body exceeded the accepted
 /// inclusive range; structured `InvalidRangeResponse` before delivery.
-#[allow(dead_code)] // wired by the seam migration (tasks 2.2-2.3, 4.5, 5.5)
+#[allow(dead_code)] // wired by the seam migration
 pub(crate) fn range_overrun_error(start: u64, end: u64) -> DownloadError {
     DownloadError::InvalidRangeResponse(format!(
         "response body exceeds accepted range [{start}, {end}]"
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(ranged.range(), Some((10, 19)));
     }
 
-    // ---- HttpBody semantics (task 1.2) ----
+    // ---- HttpBody semantics ----
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -843,7 +843,7 @@ mod tests {
         assert!(BodyEvent::Paused.data().is_none());
     }
 
-    // ---- Centralized classification (task 1.3, table-driven) ----
+    // ---- Centralized classification ----
 
     #[test]
     fn status_table_covers_error_families() {

@@ -19,6 +19,31 @@ pub const SENSITIVE_HEADER_NAMES: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// Fixed placeholder used wherever a credential-bearing value would
+/// otherwise be formatted.
+pub(crate) const REDACTED_VALUE: &str = "<redacted>";
+
+/// Debug formatter for request-header collections.
+///
+/// Header NAMES stay visible so support and debugging can see what was
+/// sent; every VALUE is replaced by a fixed placeholder. Callers can carry
+/// credentials under any header name (not only the well-known
+/// authorization ones), so no name-based list is consulted here: values
+/// are simply never formatted.
+pub(crate) struct RedactedHeaders<'a>(pub &'a [(String, String)]);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(name, _)| (name.as_str(), REDACTED_VALUE)),
+            )
+            .finish()
+    }
+}
+
 impl Redactor {
     #[must_use]
     pub fn new() -> Self {
@@ -131,4 +156,27 @@ mod tests {
             .contains(name));
         }
     }
+}
+
+#[test]
+fn redacted_headers_show_names_never_values() {
+    let headers = vec![
+        ("authorization".to_string(), "Bearer sentinel-a".to_string()),
+        ("x-api-key".to_string(), "sentinel-b".to_string()),
+    ];
+    let rendered = format!("{:?}", RedactedHeaders(&headers));
+    assert!(!rendered.contains("sentinel-a"));
+    assert!(!rendered.contains("sentinel-b"));
+    assert!(rendered.contains("authorization"));
+    assert!(rendered.contains("x-api-key"));
+}
+
+#[test]
+fn redact_url_strips_proxy_userinfo() {
+    // Proxy URLs can embed credentials; debug formatting of proxy
+    // configuration must not print them.
+    let r = Redactor::new();
+    let rendered = r.redact_url("http://user:proxy-secret@proxy.example:8080");
+    assert!(!rendered.contains("proxy-secret"));
+    assert!(rendered.contains("proxy.example:8080"));
 }

@@ -58,7 +58,7 @@ pub fn filename_from_disposition(cd: Option<&str>) -> Option<String> {
 
 /// Interpret a probe response into metadata (shared by HEAD and ranged
 /// GET paths).
-#[allow(dead_code)] // wired by job controller in task 3.7
+#[allow(dead_code)] // wired by job controller in
 pub(crate) fn interpret(
     status: u16,
     final_url: &str,

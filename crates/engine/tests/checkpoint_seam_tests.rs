@@ -18,7 +18,7 @@ use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::validators::ResourceValidators;
 use kdown_engine::http::HttpExecution;
 use kdown_engine::job::controller::{
-    CancelMode, DownloadRequest, ResultStatus, SingleStreamController,
+    CancelMode, DownloadController, DownloadRequest, ResultStatus,
 };
 use kdown_engine::job::JobState;
 use kdown_engine::metrics::events::Event;
@@ -252,7 +252,7 @@ async fn resolver_resolves_once_per_job_with_destination_context() {
         );
     let store = ScriptedCheckpointStore::new();
     let resolver = Arc::new(RecordingResolver::new(store.clone()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted),
         EngineConfig::default(),
     )
@@ -306,7 +306,7 @@ async fn resolver_resolves_once_per_job_with_destination_context() {
 #[tokio::test]
 async fn resolution_failure_fails_job_before_probing() {
     let scripted = fresh_download_script(b"hello");
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -342,17 +342,17 @@ async fn existing_construction_paths_remain_compatible() {
     // injection chains onto each of them (§34: no constructor matrix).
     let transport = HttpTransport::new(EngineConfig::default().network).expect("transport");
     let config = EngineConfig::default();
-    let _c1 = SingleStreamController::new(transport.clone(), config.clone());
-    let _c2 = SingleStreamController::with_metrics(transport.clone(), config.clone(), {
+    let _c1 = DownloadController::new(transport.clone(), config.clone());
+    let _c2 = DownloadController::with_metrics(transport.clone(), config.clone(), {
         use kdown_engine::EngineMetrics;
         EngineMetrics::shared()
     });
-    let _c3 = SingleStreamController::with_execution(
+    let _c3 = DownloadController::with_execution(
         HttpExecution::from_adapter(fresh_download_script(b"hi")),
         config.clone(),
     );
     let scripted = fresh_download_script(b"hi");
-    let _c4 = SingleStreamController::with_execution_and_metrics(
+    let _c4 = DownloadController::with_execution_and_metrics(
         HttpExecution::from_adapter(scripted),
         config.clone(),
         kdown_engine::EngineMetrics::shared(),
@@ -364,7 +364,7 @@ async fn existing_construction_paths_remain_compatible() {
     let store = ScriptedCheckpointStore::new();
     let resolver = Arc::new(RecordingResolver::new(store.clone()));
     let controller =
-        SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config)
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted), config)
             .with_checkpoint_resolver(resolver.clone());
     let dir = tempfile::tempdir().expect("tmp");
     let dest: PathBuf = dir.path().join("out.bin");
@@ -412,7 +412,7 @@ async fn custom_adapter_serves_load_save_delete_without_sidecar() {
     let scripted = pause_mid_body_script();
     let store = ScriptedCheckpointStore::new();
     let resolver = Arc::new(RecordingResolver::new(store.clone()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -474,7 +474,7 @@ async fn pause_save_failure_fails_job_and_preserves_partial_output() {
     let scripted = pause_mid_body_script();
     let store = ScriptedCheckpointStore::new();
     store.fail_next_save(CheckpointError::Corrupt("save boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted),
         EngineConfig::default(),
     )
@@ -526,7 +526,7 @@ async fn cadence_save_failure_fails_job_and_preserves_partial_output() {
         ..EngineConfig::default()
     };
     let controller =
-        SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config)
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted), config)
             .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("out.bin");
@@ -575,7 +575,7 @@ async fn resume_refresh_save_failure_preserves_previous_checkpoint() {
     std::fs::write(dir.path().join("out.bin.part"), vec![0u8; 5]).expect("temp");
     // The resume-refresh save fails.
     store.fail_next_save(CheckpointError::Corrupt("refresh boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted),
         EngineConfig::default(),
     )
@@ -622,7 +622,7 @@ async fn post_commit_delete_failure_retains_completed_with_warning() {
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("delete boom".into()));
     let delete_gate = store.hold_delete(1);
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -684,7 +684,7 @@ async fn cancellation_delete_failure_retains_cancelled_with_warning() {
     let scripted = pause_mid_body_script();
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("cancel delete boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -733,7 +733,7 @@ async fn cancellation_delete_failure_retains_cancelled_with_warning() {
 async fn keep_partial_cancellation_does_not_delete_checkpoint() {
     let scripted = pause_mid_body_script();
     let store = ScriptedCheckpointStore::new();
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -782,7 +782,7 @@ async fn keep_file_discard_checkpoint_delete_failure_warns() {
     let scripted = pause_mid_body_script();
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("keep-file boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -826,7 +826,7 @@ async fn admission_delete_failure_remains_fail_closed() {
     let store = ScriptedCheckpointStore::new();
     store.fail_next_load(CheckpointError::Corrupt("corrupt state".into()));
     store.fail_next_delete(CheckpointError::Corrupt("admission delete boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -908,7 +908,7 @@ fn recorded_saves(store: &ScriptedCheckpointStore) -> Vec<Vec<(u64, u64)>> {
 async fn segmented_pause_persists_absorbed_snapshot_monotonically() {
     let (scripted, _content) = segmented_script(true);
     let store = ScriptedCheckpointStore::new();
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         segmented_cfg(),
     )
@@ -983,7 +983,7 @@ async fn segmented_save_failure_converges_workers_to_failed() {
         ..segmented_cfg()
     };
     let controller =
-        SingleStreamController::with_execution(HttpExecution::from_adapter(scripted), config)
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted), config)
             .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("seg.bin");
@@ -1030,11 +1030,9 @@ async fn segmented_post_commit_delete_failure_retains_completed() {
         checkpoint_flush_interval: Duration::from_nanos(1),
         ..segmented_cfg()
     };
-    let controller = SingleStreamController::with_execution(
-        HttpExecution::from_adapter(scripted.clone()),
-        config,
-    )
-    .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
+    let controller =
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config)
+            .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("seg.bin");
     let (handle, join) = controller.start(DownloadRequest::new(
@@ -1100,7 +1098,7 @@ async fn segmented_cancellation_delete_failure_retains_cancelled() {
     let (scripted, _content) = segmented_script(true);
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("seg cancel boom".into()));
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         segmented_cfg(),
     )
@@ -1152,7 +1150,7 @@ async fn segmented_cancellation_delete_failure_retains_cancelled() {
 async fn segmented_keep_partial_cancellation_preserves_checkpoint() {
     let (scripted, _content) = segmented_script(true);
     let store = ScriptedCheckpointStore::new();
-    let controller = SingleStreamController::with_execution(
+    let controller = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         segmented_cfg(),
     )
@@ -1252,11 +1250,9 @@ async fn sequential_resume_cadence_and_commit_use_one_adapter() {
         checkpoint_flush_interval: Duration::from_nanos(1),
         ..EngineConfig::default()
     };
-    let controller = SingleStreamController::with_execution(
-        HttpExecution::from_adapter(scripted.clone()),
-        config,
-    )
-    .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
+    let controller =
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config)
+            .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let result = controller
         .run(DownloadRequest::new(
             "https://scripted/e2e-seq.bin",
@@ -1334,11 +1330,9 @@ async fn segmented_resume_cadence_and_commit_use_one_adapter() {
         checkpoint_flush_interval: Duration::from_nanos(1),
         ..segmented_cfg()
     };
-    let controller = SingleStreamController::with_execution(
-        HttpExecution::from_adapter(scripted.clone()),
-        config,
-    )
-    .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
+    let controller =
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config)
+            .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let result = controller
         .run(DownloadRequest::new(
             "https://scripted/e2e-seg.bin",

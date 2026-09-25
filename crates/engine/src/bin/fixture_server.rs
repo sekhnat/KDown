@@ -1,4 +1,4 @@
-//! Process-isolated fixture server (task 1.4).
+//! Process-isolated fixture server.
 //!
 //! A standalone HTTP/1.1 server for authoritative benchmark comparisons:
 //! the download client's CPU/RSS/syscall measurements are client-only
@@ -57,7 +57,7 @@ struct ServerConfig {
     change_etag_after: Option<u64>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
-    /// Loopback RTT approximation (task 0.3): delay applied before each
+    /// Loopback RTT approximation: delay applied before each
     /// response's headers (one full RTT per request; the handshake and
     /// kernel queues add their own, so this is a lower bound).
     rtt: Option<Duration>,
@@ -67,7 +67,7 @@ struct ServerConfig {
     retry_after_secs: u64,
 }
 
-/// Server-side wire accounting shared by every connection (task 0.2).
+/// Server-side wire accounting shared by every connection.
 #[derive(Debug, Default)]
 struct ServerStats {
     /// Payload bytes actually written to sockets (excludes /__stats).
@@ -272,7 +272,7 @@ struct ServerState {
     transient_status: u16,
     /// Served responses so far (for the validator flip).
     served: u64,
-    /// Deterministic loss-roll sequence (task 0.3).
+    /// Deterministic loss-roll sequence.
     loss_seq: u64,
     etag: String,
 }
@@ -623,7 +623,7 @@ async fn decide_response(
     // A transient failure consumes the "served" slot too.
     state.lock().await.served += 1;
     if status == 200 || status == 206 {
-        // Deterministic per-response connection loss (task 0.3): the roll
+        // Deterministic per-response connection loss: the roll
         // sequence is derived from the server seed so failures reproduce.
         let truncate = cfg.loss_percent > 0.0 && {
             let mut st = state.lock().await;

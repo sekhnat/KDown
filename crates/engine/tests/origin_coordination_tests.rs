@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -25,9 +25,9 @@ fn single_stream_cfg() -> EngineConfig {
     c
 }
 
-fn controller(cfg: EngineConfig) -> SingleStreamController {
+fn controller(cfg: EngineConfig) -> DownloadController {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    SingleStreamController::new(transport, cfg)
+    DownloadController::new(transport, cfg)
 }
 
 /// A throttling fixture: the first `fail_first` requests receive `status`

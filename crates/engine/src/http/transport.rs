@@ -112,7 +112,7 @@ pub(crate) struct HeadResponse {
     pub(crate) http_version: &'static str,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RequestSpec {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -123,6 +123,21 @@ pub struct RequestSpec {
     pub identity_encoding: bool,
     /// Credentials attached as Authorization header by the caller.
     pub sensitive: bool,
+}
+
+impl std::fmt::Debug for RequestSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Request headers carry caller credentials under arbitrary names;
+        // debug output keeps the names but never formats the values.
+        f.debug_struct("RequestSpec")
+            .field("url", &self.url)
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
+            .field("range", &self.range)
+            .field("validators", &self.validators)
+            .field("identity_encoding", &self.identity_encoding)
+            .field("sensitive", &self.sensitive)
+            .finish()
+    }
 }
 
 /// Hyper-based HTTP transport (D2, §24, §27, §28).
@@ -136,7 +151,7 @@ pub struct HttpTransport {
     clients: Vec<Arc<Client<EngineConnector, Full<bytes::Bytes>>>>,
     next_client: Arc<std::sync::atomic::AtomicUsize>,
     connector: Arc<EngineConnector>,
-    /// Protocol instrumentation shared with the connector (task 5.1):
+    /// Protocol instrumentation shared with the connector:
     /// logical requests/H2 streams counted separately from physical
     /// TCP/TLS establishments, labeled by negotiated protocol.
     stats: Arc<HttpProtocolStats>,
@@ -241,7 +256,7 @@ impl HttpTransport {
         self.connector.limits()
     }
 
-    /// Protocol instrumentation shared with the connector (task 5.1):
+    /// Protocol instrumentation shared with the connector:
     /// logical requests/H2 streams vs physical TCP/TLS establishments,
     /// each labeled with its negotiated protocol.
     #[must_use]
@@ -478,7 +493,7 @@ impl HttpTransport {
             .await
             .map_err(|_| DownloadError::ConnectTimeout)?
             .map_err(|e| classify_transport_error(&e))?;
-        // Logical request accounting (task 5.1): one completed request is
+        // Logical request accounting: one completed request is
         // one H2 stream when the connection negotiated HTTP/2, otherwise
         // one HTTP/1.x request on its own connection.
         let protocol = if resp.version() == hyper::Version::HTTP_2 {

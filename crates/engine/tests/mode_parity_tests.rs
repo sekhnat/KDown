@@ -15,7 +15,7 @@ use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::DownloadError;
 
 use kdown_engine::metrics::events::{Event, EventStream};
@@ -150,7 +150,7 @@ async fn run_mode(segmented: bool, scenario: &Scenario) -> (ResultStatus, Option
         scripted = scripted.expect_transfer(step);
     }
     let dir = tempfile::tempdir().expect("tmp");
-    let c = SingleStreamController::with_execution(
+    let c = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         mode_cfg(segmented),
     );
@@ -217,13 +217,18 @@ async fn run_completion_mode(
         config.transfer.max_segment_size = 1000;
         config.transfer.min_segment_size = 1;
     }
-    let scripted = ScriptedHttp::new().expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
-        status: 200,
-        total_size: Some(TOTAL),
-        accept_ranges: true,
-        range_verified: true,
-        ..ProbeMetadata::default()
-    }));
+    // The scripted body is zero-delay, so the run task could otherwise
+    // finish the integrity phase before the test subscribes to events.
+    // Park every call behind a gate until the subscription exists.
+    let scripted = ScriptedHttp::new()
+        .gate("subscribe")
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(TOTAL),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }));
     let scripted = if segmented {
         let ranges = (0..TOTAL)
             .step_by(1000)
@@ -250,10 +255,8 @@ async fn run_completion_mode(
     let dir = tempfile::tempdir().expect("tmp");
     let destination = dir.path().join("completion.bin");
     std::fs::write(&destination, b"previous destination").expect("seed old destination");
-    let controller = SingleStreamController::with_execution(
-        HttpExecution::from_adapter(scripted.clone()),
-        config,
-    );
+    let controller =
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config);
     let mut request = DownloadRequest::new("https://parity/completion.bin", destination.clone());
     request.expected_size = Some(TOTAL);
     request.overwrite = OverwritePolicy::Replace;
@@ -263,6 +266,8 @@ async fn run_completion_mode(
     };
     let (handle, task) = controller.start(request);
     let mut events = handle.events();
+    // Subscription is live: release the parked probe/transfer calls.
+    scripted.open_gate("subscribe");
     let result = task
         .await
         .expect("job task")
