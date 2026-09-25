@@ -1,16 +1,17 @@
 # KDown Engine
 
 `kdown-engine` is a Rust library for correct, resumable HTTP downloads.
-It supports single-stream and range-segmented transfers, HTTP/1.1 and HTTP/2,
-atomic temp-file commits, checkpoints with explicit durability boundaries,
-SHA-256/SHA-512 verification, pause/cancel controls, live progress and
-rate/concurrency updates, bounded retries, proxy hooks, TLS validation, and
-structured redacted errors.
+It supports single-stream and range-segmented transfers over HTTP/1.1 and
+HTTP/2, atomic temp-file commits, checkpoints with explicit durability
+boundaries, SHA-256/SHA-512 verification, pause/cancel controls, live
+progress and rate/concurrency updates, bounded retries, shared-origin
+throttle coordination, proxy hooks, TLS validation, and structured redacted
+errors.
 
-Segmented transfers write received bytes positionally (one blocking lane per
-worker, no global output lock), persist checkpoints through a single
-job-level coordinator, and account every byte exactly: useful goodput,
-wire throughput, and retransferred waste are reported separately.
+By default, segmented transfers write positionally through per-worker
+blocking lanes; an opt-in bounded shared write executor provides pipelined
+writes. A job-level coordinator persists checkpoints, and accounting
+separates unique completed bytes, wire throughput, and retransferred waste.
 
 ## Quickstart
 
@@ -106,6 +107,14 @@ HTTP/2 streams (`HttpProtocolStats::requests_h1()` / `h2_streams()` /
 are not exposed by the underlying client, so the corresponding accessor
 reports `None`: that axis is labeled unavailable rather than fabricated.
 
+A `SingleStreamController` also shares an origin registry across its jobs.
+Requests to the same final HTTP(S) origin use cancellable, fair admission;
+429/503 responses and capped `Retry-After` delay subsequent requests from
+peer jobs. Unrelated origins remain independent. This request-level gate
+does not replace the transport's physical connection limits. To coordinate
+jobs across separate controllers, inject the same registry with
+`with_origin_registry`; a new controller otherwise owns its own registry.
+
 ## Configuration reference
 
 Key `EngineConfig::transfer` fields (defaults are production-safe):
@@ -114,17 +123,20 @@ Key `EngineConfig::transfer` fields (defaults are production-safe):
 |---|---|---|
 | `initial_segment_size` | 8 MiB | First lease size in segmented mode |
 | `segment_sizing` | `Explicit` | Honors `initial_segment_size`; `Automatic` derives the target from remaining coverage ÷ (workers × `auto_oversubscription`) |
-| `min_segment_size` / `max_segment_size` | 256 KiB / 64 MiB | Lease clamp bounds |
+| `min_segment_size` / `max_segment_size` | 1 MiB / 64 MiB | Lease clamp bounds |
 | `min_workers` / `max_workers` | 1 / 8 | Worker pool bounds (runtime updates clamp here) |
 | `concurrency_mode` | `Fixed` | `Adaptive` starts at `min_workers` and probes on useful goodput |
 | `durability` | `Performance` | `Durable` syncs output data before ranges are persisted |
 | `checkpoint_flush_interval` | 2 s | Job-level checkpoint cadence |
 | `preallocate_output` | `true` | Logical `set_len` sizing of the temp file |
-| `preallocate_physical` | `false` | Opt-in fallocate-style reservation (silent fallback where unsupported; ~30 ms startup per 256 MiB on fast local storage, no measured throughput gain — keep off) |
+| `preallocate_physical` | `false` | Opt-in physical reservation where supported; keep off without filesystem-specific evidence |
 
+`EngineConfig::read_buffer_size` defaults to 128 KiB and sets the
+pipelined writer's reservation quantum, not Hyper's socket read size.
+`write_executor.pipeline_writes` is `false` by default: per-worker lanes
+remain the production path; enable it to try the shared bounded executor.
 The public `buffer_pool_max_bytes` budget (128 MiB default) bounds the
-standalone `BufferPool` only; the transfer path keeps one received frame
-per worker and does not consult it.
+standalone `BufferPool` only; the transfer path does not use that pool.
 
 ## Safety and durability
 
@@ -183,14 +195,15 @@ Defaults are production-safe and unchanged from earlier releases:
   `h2_policy = Additional` override retains its meaning). Storage pressure,
   retry/throttle signals and process-resource ceilings veto growth regardless
   of raw network throughput.
-- **Memory** — the transfer path writes received Hyper `Bytes` straight to
-  positional writes (one outstanding frame per worker, no pooled copies).
-  `buffer_pool_max_bytes` bounds the public `BufferPool` only, NOT Hyper's
-  internal ingress buffers.
+- **Memory** — the legacy writer holds one received frame per active
+  worker; the opt-in pipelined executor uses pre-read and queued-write
+  byte budgets to bound outstanding frames. Both paths avoid extra
+  `BufferPool` copies. `buffer_pool_max_bytes` bounds only the standalone
+  pool, NOT Hyper's internal ingress buffers.
 - **Preallocation** — `preallocate_output` sizes the temp file logically
-  (`set_len`); opt-in `preallocate_physical` attempts an fallocate-style
+  (`set_len`); opt-in `preallocate_physical` attempts a fallocate-style
   reservation where supported and falls back silently elsewhere. Real
-  out-of-space/permission failures always surface as errors; allocation is
+  out-of-space/permission failures surface as errors; allocation is
   never required for correctness.
 
 See [`docs/benchmark-profiling.md`](docs/benchmark-profiling.md) for
