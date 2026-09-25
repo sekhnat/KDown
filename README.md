@@ -87,6 +87,17 @@ handle.cancel_with(kdown_engine::CancelMode::KeepPartial);
 coverage), `bytes_reused_from_checkpoint`, `wasted_bytes`, and `retries`,
 so callers can distinguish useful progress from retransferred overhead.
 
+Beyond per-job counters, the transport exposes protocol-level
+instrumentation shared by every job it serves:
+`HttpTransport::connection_limits()` reports live physical connections
+(per origin), and `HttpTransport::protocol_stats()` reports logical HTTP
+requests separately from physical TCP/TLS establishments, each labeled
+with its actually negotiated protocol — HTTP/1.x requests vs multiplexed
+HTTP/2 streams (`HttpProtocolStats::requests_h1()` / `h2_streams()` /
+`establishments_*`). HTTP/2 flow-control stall data and peer stream limits
+are not exposed by the underlying client, so the corresponding accessor
+reports `None`: that axis is labeled unavailable rather than fabricated.
+
 ## Configuration reference
 
 Key `EngineConfig::transfer` fields (defaults are production-safe):
@@ -156,8 +167,14 @@ Defaults are production-safe and unchanged from earlier releases:
   and probes upward on useful (unique-byte) goodput with hysteresis and
   cooldown. Manual `set_concurrency` (clamped to
   `[min_workers, max_workers]`) overrides the controller for the job's
-  remainder. HTTP/2 connection policy is independent of stream-worker
-  concurrency.
+  remainder. Growth is protocol-aware: on HTTP/1 an additional active worker
+  means an additional physical connection, so adaptive probes never target
+  more concurrency than the configured connection limits allow; on HTTP/2
+  additional workers are multiplexed streams that keep the single healthy
+  connection (automatic extra H2 sockets stay off, and the explicit
+  `h2_policy = Additional` override retains its meaning). Storage pressure,
+  retry/throttle signals and process-resource ceilings veto growth regardless
+  of raw network throughput.
 - **Memory** — the transfer path writes received Hyper `Bytes` straight to
   positional writes (one outstanding frame per worker, no pooled copies).
   `buffer_pool_max_bytes` bounds the public `BufferPool` only, NOT Hyper's
@@ -169,4 +186,7 @@ Defaults are production-safe and unchanged from earlier releases:
   never required for correctness.
 
 See [`docs/benchmark-profiling.md`](docs/benchmark-profiling.md) for
-benchmark/profiling procedures and recorded results.
+benchmark/profiling procedures and recorded results, and
+[`crates/engine/benches/results/report-phase-5.md`](crates/engine/benches/results/report-phase-5.md)
+for the protocol-aware concurrency gate (H1 connection gating, H2
+single-socket stream growth, and request/socket accounting).

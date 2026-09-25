@@ -51,10 +51,10 @@ Every phase is independently verifiable. Before a behavior change, record its ba
 
 ## 5. Protocol-aware concurrency
 
-- [ ] 5.1 Instrument request/stream count separately from physical TCP/TLS establishments and negotiated protocol in `http/{transport,connect}.rs`; tests reconcile H1 connections and H2 streams with server-side counts and mark unavailable H2 flow-control data.
-- [ ] 5.2 Gate H1 additional connections by marginal *useful* benefit, retry/throttle and existing `ConnectionLimits`; test many H1 requests never exceed per-origin/global permits and revert when marginal gain disappears.
-- [ ] 5.3 Keep default H2 on one multiplexed socket while probing stream concurrency; test peer stream limits where exposed and `H2ConnectionPolicy::Additional` explicit override stays compatible. Permit automatic additional sockets only behind proven bottleneck and configured policy; otherwise record unsupported/unused state.
-- [ ] 5.4 Gate phase 5: compare shaped H1/H2 single/multi-job throughput, fairness, stream/socket counts, CPU/RSS with prior phase and record protocol-specific decision traces and fallback.
+- [x] 5.1 Instrument request/stream count separately from physical TCP/TLS establishments and negotiated protocol in `http/{transport,connect}.rs`; tests reconcile H1 connections and H2 streams with server-side counts and mark unavailable H2 flow-control data.
+- [x] 5.2 Gate H1 additional connections by marginal *useful* benefit, retry/throttle and existing `ConnectionLimits`; test many H1 requests never exceed per-origin/global permits and revert when marginal gain disappears.
+- [x] 5.3 Keep default H2 on one multiplexed socket while probing stream concurrency; test peer stream limits where exposed and `H2ConnectionPolicy::Additional` explicit override stays compatible. Permit automatic additional sockets only behind proven bottleneck and configured policy; otherwise record unsupported/unused state.
+- [x] 5.4 Gate phase 5: compare shaped H1/H2 single/multi-job throughput, fairness, stream/socket counts, CPU/RSS with prior phase and record protocol-specific decision traces and fallback.
 
 ## 6. Cross-job origin coordination
 
