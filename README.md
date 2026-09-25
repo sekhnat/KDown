@@ -77,11 +77,19 @@ println!(
 
 // All of these take effect on a running job:
 handle.set_rate_limit(4 * 1024 * 1024); // stable per-job token bucket
+controller.set_global_rate_limit(8 * 1024 * 1024); // engine-wide ceiling
 handle.set_concurrency(6);              // clamped to [min_workers, max_workers]
 handle.pause();                         // checkpoints absorbed progress first
 handle.resume_now();
 handle.cancel_with(kdown_engine::CancelMode::KeepPartial);
 ```
+
+Rate limits apply at two levels (§18): `EngineConfig::network.rate_limit`
+configures a per-job limit and `EngineConfig::global_rate_limit` an
+engine-wide ceiling shared by every job of the controller — the slowest
+level governs, burst is bounded (~250 ms of the rate), configured limits
+seed the live buckets, and rate waits stop promptly on cancellation.
+Unlimited jobs keep a lock-free fast path.
 
 `DownloadResult` carries `completed_bytes` (unique, scheduler-accepted
 coverage), `bytes_reused_from_checkpoint`, `wasted_bytes`, and `retries`,
@@ -112,7 +120,7 @@ Key `EngineConfig::transfer` fields (defaults are production-safe):
 | `durability` | `Performance` | `Durable` syncs output data before ranges are persisted |
 | `checkpoint_flush_interval` | 2 s | Job-level checkpoint cadence |
 | `preallocate_output` | `true` | Logical `set_len` sizing of the temp file |
-| `preallocate_physical` | `false` | Opt-in fallocate-style reservation (silent fallback where unsupported) |
+| `preallocate_physical` | `false` | Opt-in fallocate-style reservation (silent fallback where unsupported; ~30 ms startup per 256 MiB on fast local storage, no measured throughput gain — keep off) |
 
 The public `buffer_pool_max_bytes` budget (128 MiB default) bounds the
 standalone `BufferPool` only; the transfer path keeps one received frame
@@ -186,7 +194,14 @@ Defaults are production-safe and unchanged from earlier releases:
   never required for correctness.
 
 See [`docs/benchmark-profiling.md`](docs/benchmark-profiling.md) for
-benchmark/profiling procedures and recorded results, and
+benchmark/profiling procedures and recorded results, and the phase-gate
+reports
 [`crates/engine/benches/results/report-phase-5.md`](crates/engine/benches/results/report-phase-5.md)
-for the protocol-aware concurrency gate (H1 connection gating, H2
-single-socket stream growth, and request/socket accounting).
+through
+[`report-phase-9.md`](crates/engine/benches/results/report-phase-9.md):
+protocol-aware concurrency (H1 connection gating, H2 single-socket stream
+growth, request/socket accounting), shared-origin throttle coordination,
+evidence-gated hot-path tuning (rate limiting repaired end-to-end; token
+leasing, counter padding and buffer resizing rejected on measurements),
+physical-preallocation comparison and the final baseline-vs-optimized
+matrix.

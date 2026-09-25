@@ -238,7 +238,8 @@ any behavior change from this second optimization change. All comparisons for
   pending/active/completed coverage; stale generations rejected
   (`scheduler/core.rs`).
 - Write acknowledgement boundary: progress/counters advance only after a
-  positional write acks (`WriterLane` per worker, `OutputWriteHandle`).
+  positional write acks (legacy `WriterLane` per worker, or the shared
+  `WriteExecutor` completion when `write_executor.pipeline_writes` is on).
 - Checkpoint coordinator owns all saves; durable mode syncs data before
   `store.save_atomic`; failed sync prevents any save; generation-fence recheck.
 - Output lifecycle: exclusive reclaim before verify/publish; atomic
@@ -324,3 +325,41 @@ checkpoints do not yet record save latency (segmented coordinator only).
   shows 1.6–1.7× wire amplification (whole-file-lease split pattern) — the
   phase-3 gate (<1.10 on the clean split fixture, 2× unconditional failure)
   applies to both the reproducer and these groups.
+
+## Knob taxonomy, rollback switches and future options (task 9.5)
+
+**Stable (documented for ordinary callers):** everything under
+`EngineConfig::transfer` documented in the README table, `network.*`
+timeouts and per-job `rate_limit`, `global_rate_limit`, TLS/proxy/SSRF
+settings, retry policy, and the public result/metrics types.
+
+**Advanced (opt-in, measured):** `write_executor.pipeline_writes` (shared
+bounded executor: flat +8 writer threads vs +24 at 16 workers, at a small
+single-job H1@4 cost), `transfer.concurrency_mode = Adaptive`,
+`segment_sizing = Automatic | Duration`, `h2_policy = Additional`,
+`preallocate_physical`, `OriginRegistry` sharing.
+
+**Internal (not part of the compatibility surface):** the legacy
+`WriterLane` vs pipelined switch and its test aliases, registry
+`with_limits`, controller `with_origin_registry` /
+`with_global_rate_bucket`, `H2_FLOW_CONTROL_INSTRUMENTED`, checkpoint
+format internals.
+
+**Rollback switches (each gate keeps its fallback selectable):**
+- Write path: `write_executor.pipeline_writes = false` restores per-worker
+  lanes (phase-2 gate decision; `WriterLane` is retained deliberately as the
+  rollback path, not dead code).
+- Adaptive concurrency: `ConcurrencyMode::Fixed`.
+- Segment sizing: `SegmentSizing::Explicit`.
+- H2 extra sockets: `H2ConnectionPolicy::Single` (default).
+- Shared-origin feedback:
+  `SingleStreamController::with_origin_registry(OriginRegistry::disabled())`
+  restores per-job backoff only (phase-6 gate).
+- Physical preallocation: `preallocate_physical = false` (default, phase-8).
+
+**Known future options (not started, recorded for planning):** HTTP/3
+(QUIC) transport behind the same `HttpExecution` seam; io_uring (Linux) /
+IOCP (Windows) positional write backends behind `WriteExecutor`; PGO/BOLT
+profiles for the release CLI; dynamic per-origin request ceilings in
+`OriginRegistry` (phase-6 report); flow-control instrumentation if a hyper
+upgrade exposes it.
