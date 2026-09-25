@@ -13,6 +13,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::config::{EngineConfig, HashAlgorithm, IntegrityPolicy, OverwritePolicy, ResumePolicy};
+use crate::control::origin::{normalized_origin, OriginRegistry};
 use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
@@ -347,8 +348,18 @@ pub struct SingleStreamController {
     /// per job before admission; the default creates destination-relative
     /// file sidecars so existing construction is unchanged.
     checkpoint_resolver: Arc<dyn CheckpointStoreResolver>,
+    /// Controller-shared origin registry (task 6.2, design D6): fair
+    /// cancellable request admission plus shared throttle feedback, keyed by
+    /// the normalized FINAL origin; one instance serves every job this
+    /// controller starts.
+    origin_registry: Arc<OriginRegistry>,
     next_id: std::sync::atomic::AtomicU64,
     metrics: Arc<EngineMetrics>,
+    /// Engine-global payload rate bucket (§18): shared by every job of this
+    /// controller, above the per-job bucket. Created from
+    /// `config.global_rate_limit`; replaceable for tests via
+    /// [`Self::with_global_rate_bucket`].
+    global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 }
 
 impl SingleStreamController {
@@ -374,14 +385,45 @@ impl SingleStreamController {
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         let classifier = RetryClassifier::new(config.retry.clone());
+        let global_rate_bucket = Arc::new(crate::control::rate_limit::TokenBucket::new(
+            config.global_rate_limit.unwrap_or(0),
+        ));
         Self {
             execution,
             config,
             classifier,
             checkpoint_resolver: Arc::new(SidecarCheckpointResolver),
+            origin_registry: OriginRegistry::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
             metrics,
+            global_rate_bucket,
         }
+    }
+
+    /// Replace the shared global rate bucket (§18): opt-in sharing across
+    /// separately-constructed controllers (tests/benches); the default is
+    /// one bucket per controller from `config.global_rate_limit`.
+    #[must_use]
+    pub fn with_global_rate_bucket(
+        mut self,
+        bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    ) -> Self {
+        self.global_rate_bucket = bucket;
+        self
+    }
+
+    /// Change the engine-global rate limit at runtime (§18.2): takes
+    /// effect on the next acquire of every job sharing this controller.
+    /// `0` = unlimited.
+    pub fn set_global_rate_limit(&self, bytes_per_second: u64) {
+        self.global_rate_bucket.set_rate(bytes_per_second);
+    }
+
+    /// The active engine-global rate limit (`None` = unlimited).
+    #[must_use]
+    pub fn global_rate_limit(&self) -> Option<u64> {
+        let rate = self.global_rate_bucket.rate();
+        (rate != 0).then_some(rate)
     }
 
     /// Replace the checkpoint-store resolver (§34): one consuming
@@ -394,6 +436,16 @@ impl SingleStreamController {
         self
     }
 
+    /// Replace the shared origin registry (task 6.5 fallback variant): the
+    /// default is the enabled engine-shared registry; a
+    /// [`OriginRegistry::disabled`] instance restores the per-job backoff
+    /// fallback (no shared admission, no shared throttle feedback).
+    #[must_use]
+    pub fn with_origin_registry(mut self, registry: Arc<OriginRegistry>) -> Self {
+        self.origin_registry = registry;
+        self
+    }
+
     /// Build a controller sharing an engine-wide metrics registry (§19.5).
     #[must_use]
     pub fn with_metrics(
@@ -402,6 +454,47 @@ impl SingleStreamController {
         metrics: Arc<EngineMetrics>,
     ) -> Self {
         Self::with_execution_and_metrics(HttpExecution::from_adapter(transport), config, metrics)
+    }
+
+    /// Admit one request to `origin` (task 6.2): waits out the origin's
+    /// shared throttle deadline and takes one fair request slot; the RAII
+    /// permit releases on drop. `origin: None` (or a disabled registry)
+    /// admits immediately.
+    async fn admit_origin(
+        &self,
+        origin: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<crate::control::origin::OriginPermit>, DownloadError> {
+        match origin {
+            Some(key) => self.origin_registry.admit(key, cancel).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Shared throttle feedback (task 6.3): extends the origin's coordinated
+    /// deadline with the `RetryClassifier`-capped Retry-After (or the
+    /// classifier's backoff delay when the server sent none).
+    fn report_throttle_origin(
+        &self,
+        origin: Option<&str>,
+        retry_after: Option<Duration>,
+        attempt: u32,
+    ) {
+        if let Some(key) = origin {
+            self.origin_registry.report_throttle(
+                key,
+                self.classifier.honor_retry_after(retry_after),
+                self.classifier.backoff_delay(attempt),
+            );
+        }
+    }
+
+    /// Shared recovery accounting (task 6.3): one completed request against
+    /// the origin — the post-cooldown probe signal.
+    fn report_success_origin(&self, origin: Option<&str>) {
+        if let Some(key) = origin {
+            self.origin_registry.report_success(key);
+        }
     }
 
     /// Export a consistent metrics snapshot (§19.5).
@@ -454,12 +547,18 @@ impl SingleStreamController {
             total_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_known: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             segmented_cell: Arc::new(std::sync::OnceLock::new()),
-            rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
+            // The configured per-job limit (§18) seeds the stable bucket so
+            // a pre-start configured limit and later live updates share one
+            // object (task 7.1: the config value was previously never read).
+            rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(
+                self.config.network.rate_limit.unwrap_or(0),
+            )),
         };
         // The run task publishes the live SegmentedJob into the same cell
         // the handle reads (task 5.8).
         let handle_cell = handle.segmented_cell.clone();
         let rate_bucket_for_run = handle.rate_bucket.clone();
+        let global_bucket_for_run = self.global_rate_bucket.clone();
         let inner_state = state;
         let inner_cancel = cancel;
         let handle_cancel_mode = handle.cancel_mode_cell();
@@ -469,14 +568,17 @@ impl SingleStreamController {
         let config = self.config.clone();
         let checkpoint_resolver = self.checkpoint_resolver.clone();
         let classifier = RetryClassifier::new(self.config.retry.clone());
+        let origin_registry = self.origin_registry.clone();
         let join = tokio::spawn(async move {
             let this = Self {
                 execution,
                 config,
                 classifier,
                 checkpoint_resolver,
+                origin_registry,
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 metrics: metrics_for_run.clone(),
+                global_rate_bucket: global_bucket_for_run.clone(),
             };
             let terminal = this
                 .run_inner(
@@ -488,6 +590,7 @@ impl SingleStreamController {
                     inner_hub,
                     handle_cell.clone(),
                     rate_bucket_for_run,
+                    global_bucket_for_run,
                 )
                 .await;
             match &terminal {
@@ -526,6 +629,7 @@ impl SingleStreamController {
         hub: SharedHub,
         segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
         rate_bucket_shared: Arc<crate::control::rate_limit::TokenBucket>,
+        global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
     ) -> Result<DownloadResult, DownloadError> {
         // Overwrite policy pre-check (§14.6): FailIfExists rejects before
         // any network activity.
@@ -663,11 +767,51 @@ impl SingleStreamController {
                     .terminal_cancelled(&state, request, counters, Duration::ZERO, &hub, vec![])
                     .await;
             }
+            // Shared-origin admission (task 6.2): one fair request slot for
+            // the probe's dispatch, keyed by the request URL's origin — the
+            // FINAL origin is only known after the probe resolves redirects.
+            let probe_origin = normalized_origin(&request.url);
+            let _probe_permit = match self.admit_origin(probe_origin.as_deref(), &cancel).await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    if matches!(e, DownloadError::Cancelled) || cancel.is_cancelled() {
+                        return self
+                            .terminal_cancelled(
+                                &state,
+                                request,
+                                counters,
+                                Duration::ZERO,
+                                &hub,
+                                vec![],
+                            )
+                            .await;
+                    }
+                    let _ = state.transition(JobState::Failing);
+                    let _ = state.transition(JobState::Failed);
+                    return Ok(DownloadResult {
+                        status: ResultStatus::Failed,
+                        final_path: None,
+                        bytes_downloaded_from_network: 0,
+                        bytes_reused_from_checkpoint: 0,
+                        completed_bytes: 0,
+                        wasted_bytes: 0,
+                        retries: 0,
+                        segment_requests: 0,
+                        live_splits: 0,
+                        total_size: None,
+                        elapsed: Duration::ZERO,
+                        validators: ResourceValidators::default(),
+                        warnings: vec![],
+                        error: Some(e),
+                    });
+                }
+            };
             // Semantic probe (§32): the HTTP layer owns HEAD interpretation
             // and any configured validating range request; the controller
             // never sees raw statuses or headers.
             match self.execution.probe(probe_request.clone(), &cancel).await {
                 Ok(outcome) => {
+                    self.report_success_origin(probe_origin.as_deref());
                     meta = outcome.metadata;
                     probe_notices = outcome.notices;
                     break;
@@ -699,6 +843,16 @@ impl SingleStreamController {
                                 continue; // re-probe with credentials
                             }
                         }
+                    }
+                    // Shared-origin throttle feedback (task 6.3): a 429/503
+                    // seen by this job delays every same-origin peer's next
+                    // request, with the Retry-After capped by the classifier.
+                    if matches!(
+                        e.category(),
+                        crate::error::ErrorCategory::Server
+                            | crate::error::ErrorCategory::RateLimited
+                    ) {
+                        self.report_throttle_origin(probe_origin.as_deref(), retry_after, attempt);
                     }
                     match self.classifier.decide(&e, attempt, retry_after) {
                         RetryDecision::Retry {
@@ -855,6 +1009,8 @@ impl SingleStreamController {
                 started,
                 Some(segmented_cell.clone()),
                 initial_bucket,
+                self.origin_registry.clone(),
+                global_rate_bucket,
             )
             .await;
             return self
@@ -880,6 +1036,11 @@ impl SingleStreamController {
         })
         .await;
         let started = std::time::Instant::now();
+        // Final-origin identity (task 6.1/6.2): every transfer — and its
+        // throttle feedback — keys on the probe-resolved final URL's origin,
+        // so a redirected resource coordinates with its ACTUAL serving
+        // origin rather than the pre-redirect address.
+        let transfer_origin = normalized_origin(&meta.final_url);
         // Sequential view: only the contiguous [0, n) prefix is reused;
         // continue at n. Disjoint admitted ranges are rewritten by the
         // sequential stream, not skipped.
@@ -999,6 +1160,51 @@ impl SingleStreamController {
             } else {
                 TransferIntent::Full
             };
+            // Shared-origin admission (task 6.2): one fair request slot held
+            // from dispatch until the body is fully consumed (or the attempt
+            // fails/cancels); the RAII permit releases it on every exit path.
+            let _origin_permit = match self.admit_origin(transfer_origin.as_deref(), &cancel).await
+            {
+                Ok(permit) => permit,
+                Err(e) => {
+                    if matches!(e, DownloadError::Cancelled) || cancel.is_cancelled() {
+                        let elapsed = started.elapsed();
+                        let cleanup_warnings = Self::cleanup_cancelled(
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                            &mut sink,
+                            store.as_ref(),
+                            &identity,
+                        );
+                        return self
+                            .terminal_cancelled(
+                                &state,
+                                request,
+                                counters,
+                                elapsed,
+                                &hub,
+                                cleanup_warnings,
+                            )
+                            .await;
+                    }
+                    let _ = sink.abort();
+                    return self
+                        .terminal_failed(
+                            &state,
+                            request,
+                            counters,
+                            started.elapsed(),
+                            e,
+                            validators,
+                            warnings,
+                        )
+                        .map(|mut r| {
+                            r.final_path = None;
+                            r
+                        });
+                }
+            };
             // Semantic transfer (§32): failures carry classified errors,
             // server retry timing, and challenge data — no raw response.
             let response = match self
@@ -1065,6 +1271,20 @@ impl SingleStreamController {
                             }
                         }
                         continue 'download; // re-issue with provider headers
+                    }
+                    // Shared-origin throttle feedback (task 6.3): 429/503
+                    // seen by this job delays every same-origin peer's next
+                    // request, with the Retry-After capped by the classifier.
+                    if matches!(
+                        e.category(),
+                        crate::error::ErrorCategory::Server
+                            | crate::error::ErrorCategory::RateLimited
+                    ) {
+                        self.report_throttle_origin(
+                            transfer_origin.as_deref(),
+                            retry_after,
+                            attempt,
+                        );
                     }
                     // Retry classification (§17.1-§17.2) with server-provided
                     // retry timing; single-stream status/transport failures
@@ -1174,6 +1394,23 @@ impl SingleStreamController {
                                     validators,
                                     warnings,
                                 );
+                            }
+                        }
+
+                        // Rate tokens first: payload bytes only (§18.2).
+                        // The hierarchical limiter aggregates job and
+                        // engine-global levels; the slowest wait governs.
+                        // Waiting stops on cancellation (prompt pause/cancel
+                        // interruption); the next loop pass performs cleanup.
+                        {
+                            let job_wait = rate_bucket_shared.acquire(len).wait;
+                            let global_wait = global_rate_bucket.acquire(len).wait;
+                            let wait = job_wait.into_iter().chain(global_wait).max();
+                            if let Some(wait) = wait {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(wait) => {}
+                                    _ = cancel.cancelled() => {}
+                                }
                             }
                         }
 
@@ -1390,7 +1627,9 @@ impl SingleStreamController {
                 }
             }
 
-            // Stream finished cleanly: proceed to verification.
+            // Stream finished cleanly: record one successful origin request
+            // (task 6.3 recovery accounting), then proceed to verification.
+            self.report_success_origin(transfer_origin.as_deref());
             break 'download;
         }
 

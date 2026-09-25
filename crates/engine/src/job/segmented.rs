@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{DurabilityMode, EngineConfig};
+use crate::control::origin::OriginRegistry;
 use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
@@ -56,6 +57,9 @@ pub struct SegmentedJob {
     /// mutate the bucket in place — active workers never see the object
     /// replaced, and unlimited chunks take no outer lock.
     rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    /// Engine-global payload bucket above the job bucket (§18, task 7.1).
+    /// Unlimited by default; `acquire` early-returns without the lock.
+    global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
     total_size: u64,
     validators: crate::http::validators::ResourceValidators,
     /// Durable-mode data-sync capability over the output file (task 3.3):
@@ -130,6 +134,12 @@ pub struct SegmentedJob {
     /// Engine-global physical connection allowance (task 5.2): also gates
     /// HTTP/1 growth probes alongside the per-origin cap.
     global_connection_cap: u32,
+    /// Controller-shared origin registry (task 6.2, design D6): request
+    /// admission and shared throttle feedback, keyed by the normalized
+    /// FINAL origin of the probe-resolved URL. A `None` key (unparseable
+    /// origin) skips admission; the per-job backoff gate remains.
+    origin_registry: Arc<OriginRegistry>,
+    origin_key: Option<String>,
     /// Ready-work sizing (task 3.3): the opt-in Automatic selector keeps
     /// `ready_work_factor × desired` unclaimed leases pending; disabled for
     /// Explicit sizing (which keeps its configured meaning).
@@ -488,7 +498,20 @@ impl SegmentedJob {
     /// gates (§18.2: payload bytes only, no busy wait, no outer lock —
     /// the bucket checks its atomic limit before the internal state lock).
     async fn acquire_rate(&self, len: u64) {
-        self.rate_bucket.acquire_async(len).await;
+        // Aggregate job and engine-global levels (§18, task 7.1): the
+        // slowest level's wait governs; both `acquire` calls early-return
+        // without touching their mutex while unlimited. Waiting stops on
+        // cancellation (prompt pause/cancel interruption); the worker loop
+        // observes the cancel on its next check.
+        let job_wait = self.rate_bucket.acquire(len).wait;
+        let global_wait = self.global_rate_bucket.acquire(len).wait;
+        let wait = job_wait.into_iter().chain(global_wait).max();
+        if let Some(wait) = wait {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.cancel.cancelled() => {}
+            }
+        }
     }
 
     #[must_use]
@@ -643,6 +666,8 @@ pub(crate) async fn run_segmented(
     started: Instant,
     handle_cell: Option<Arc<std::sync::OnceLock<Arc<SegmentedJob>>>>,
     initial_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    origin_registry: Arc<OriginRegistry>,
+    global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
 ) -> SegmentedOutcome {
     let mut warnings: Vec<String> = vec![];
     // Lease sizing per configuration (task 6.1): the explicit
@@ -734,6 +759,7 @@ pub(crate) async fn run_segmented(
         hub: hub.clone(),
         counters: counters.clone(),
         rate_bucket: initial_rate_bucket,
+        global_rate_bucket,
         total_size,
         validators: meta.validators.clone(),
         sync: sync_capability,
@@ -761,6 +787,8 @@ pub(crate) async fn run_segmented(
         max_workers: u64::from(config.transfer.max_workers.max(1)),
         protocol_is_h2: meta.http_version == "HTTP/2.0",
         per_origin_connection_cap: config.max_connections_per_origin,
+        origin_registry,
+        origin_key: crate::control::origin::normalized_origin(&meta.final_url),
         global_connection_cap: config.max_connections_total,
         ready_work_sizing: matches!(
             config.transfer.segment_sizing,
@@ -1441,11 +1469,19 @@ async fn worker_cycle(
                 ) {
                     // Throttle signal for the adaptive controller (task 9.2).
                     job.throttle_events.fetch_add(1, Ordering::Relaxed);
-                    let earliest = retry_after.unwrap_or_else(|| classifier.backoff_delay(attempt));
+                    // RetryClassifier-capped Retry-After (task 6.3): the
+                    // coordinated window — per job AND shared across
+                    // same-origin peers — never exceeds policy.
+                    let capped = classifier.honor_retry_after(retry_after);
+                    let earliest = capped.unwrap_or_else(|| classifier.backoff_delay(attempt));
                     let until = Instant::now() + earliest;
                     let mut gate = job.origin_backoff_until.lock().await;
                     if gate.is_none_or(|g| until > g) {
                         *gate = Some(until);
+                    }
+                    drop(gate);
+                    if let (registry, Some(key)) = (&job.origin_registry, &job.origin_key) {
+                        registry.report_throttle(key, capped, classifier.backoff_delay(attempt));
                     }
                 }
                 // Tail-only retry (§17.3): the lease was already failed
@@ -1561,6 +1597,29 @@ async fn transfer_lease(
         break;
     }
 
+    // Shared-origin request admission (task 6.2, design D6): wait out the
+    // origin's coordinated throttle deadline (shared with every peer job)
+    // and take one fair FIFO request slot; the RAII permit releases on
+    // success, failure and cancellation alike. The per-job gate above stays
+    // as the compatibility fallback (design D6).
+    let _origin_permit = match (&job.origin_registry, &job.origin_key) {
+        (registry, Some(key)) => match registry.admit(key, &job.cancel).await {
+            Ok(permit) => Some(permit),
+            Err(e) => {
+                return Err(if matches!(e, DownloadError::Cancelled) {
+                    WorkerError::Fatal(e)
+                } else {
+                    WorkerError::Retryable {
+                        error: e,
+                        retry_after: None,
+                        wasted: 0,
+                    }
+                });
+            }
+        },
+        _ => None,
+    };
+
     // Range-request diagnostic (task 3.5): one counter per issued request
     // (attempts included; retries are visible separately).
     job.segment_requests.fetch_add(1, Ordering::Relaxed);
@@ -1669,6 +1728,11 @@ async fn transfer_lease(
             end: validated_end,
         })
         .await;
+    // One completed origin request (task 6.3 recovery accounting): the
+    // post-cooldown probe signal for the shared registry.
+    if let (registry, Some(key)) = (&job.origin_registry, &job.origin_key) {
+        registry.report_success(key);
+    }
     Ok(())
 }
 
@@ -2744,6 +2808,7 @@ mod durability_tests {
             hub: std::sync::Arc::new(hub),
             counters: Arc::new(JobCounters::new(1)),
             rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
+            global_rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
             total_size: 100,
             validators: crate::http::validators::ResourceValidators::default(),
             sync: Some(sync),
@@ -2770,6 +2835,8 @@ mod durability_tests {
             applied_ready_divisor: AtomicU64::new(u64::MAX),
             protocol_is_h2: false,
             per_origin_connection_cap: 1,
+            origin_registry: crate::control::origin::OriginRegistry::disabled(),
+            origin_key: None,
             global_connection_cap: 1,
             worker_progress: vec![Arc::new(LeaseProgress::default())],
         };

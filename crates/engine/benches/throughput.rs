@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use criterion::{black_box, Criterion, Throughput};
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsConfig};
+use kdown_engine::control::origin::OriginRegistry;
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::job::controller::{
     DownloadRequest, DownloadResult, ResultStatus, SingleStreamController,
@@ -1067,6 +1068,32 @@ fn main() {
         run_protocol_compare();
         return;
     }
+    // Phase-6 gate (task 6.5): shared-origin coordination comparison —
+    // shared registry vs per-job backoff fallback, same-origin and
+    // mixed-origin job pairs under server throttling:
+    //   throughput --origin-compare
+    if args.iter().any(|a| a == "--origin-compare") {
+        run_origin_compare();
+        return;
+    }
+    // Phase-7 gate (task 7.4): read_buffer_size (write-pipelining frame
+    // quantum) sweep — H1/H2 x LAN/WAN x 64/128/256/512 KiB, goodput,
+    // CPU/RSS/context-switch cost; 128 KiB stays default unless a size wins
+    // beyond dispersion and resource cost.
+    //   throughput --buffer-sweep
+    if args.iter().any(|a| a == "--buffer-sweep") {
+        run_buffer_sweep();
+        return;
+    }
+    // Phase-8 gate (task 8.1): logical-only vs opt-in physical
+    // preallocation across tmpfs (fallocate-unsupported fallback) and the
+    // project filesystem (NVMe-class), recording startup latency
+    // (start -> first credited byte), throughput and resource cost.
+    //   throughput --alloc-compare
+    if args.iter().any(|a| a == "--alloc-compare") {
+        run_alloc_compare();
+        return;
+    }
     // Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
     // executor across H1/H2 and shaped/unshaped shapes.
     if args.iter().any(|a| a == "--write-path-compare") {
@@ -1498,6 +1525,365 @@ fn run_duration_sweep() {
 /// Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
 /// executor across H1/H2, shaped/unshaped, with repetitions and process
 /// thread-count deltas (writer-thread scaling evidence).
+/// Server-side accounting for the throttled origin fixture (task 6.5).
+#[derive(Debug, Default)]
+struct ThrottledServerStats {
+    arrivals: std::sync::Mutex<Vec<Instant>>,
+    failures: std::sync::atomic::AtomicU64,
+    accepts: std::sync::atomic::AtomicU64,
+}
+
+impl ThrottledServerStats {
+    fn record_arrival(&self) {
+        self.arrivals.lock().expect("arrivals").push(Instant::now());
+    }
+
+    fn arrival_count(&self) -> usize {
+        self.arrivals.lock().expect("arrivals").len()
+    }
+
+    fn failure_count(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn accept_count(&self) -> u64 {
+        self.accepts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// HTTP/1.1 fixture with first-N throttling: the first `fail_first` requests
+/// receive `503` + `Retry-After: <secs>`, then normal ranged service.
+async fn start_throttled_h1_server(
+    content: ContentSource,
+    fail_first: u32,
+    retry_after_secs: u64,
+    stats: Arc<ThrottledServerStats>,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    // The throttle budget is GLOBAL across connections: exactly `fail_first`
+    // failures total, not per connection (per-connection re-arming would
+    // multiply the injected failures and blur the comparison).
+    let global_remaining = Arc::new(std::sync::atomic::AtomicU32::new(fail_first));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            stats
+                .accepts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let content = content.clone();
+            let stats = stats.clone();
+            let remaining = global_remaining.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    stats.record_arrival();
+                    let is_head = req.starts_with("HEAD");
+                    let range = req
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            if !name.eq_ignore_ascii_case("range") {
+                                return None;
+                            }
+                            let value = value.trim().strip_prefix("bytes=")?;
+                            value.split_once('-')
+                        })
+                        .and_then(|(s, e)| {
+                            Some((s.trim().parse::<u64>().ok()?, e.trim().parse::<u64>().ok()?))
+                        });
+                    if remaining.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                        remaining.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        stats
+                            .failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let head = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nretry-after: {retry_after_secs}\r\ncontent-length: 0\r\n\r\n"
+                        );
+                        if socket.write_all(head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    let (status, extra, range) = match range {
+                        Some((s, e)) => {
+                            let end = e.min(content.len() - 1);
+                            (
+                                "206 Partial Content",
+                                format!("content-range: bytes {s}-{end}/{}\r\n", content.len()),
+                                Some((s, end)),
+                            )
+                        }
+                        None => ("200 OK", String::new(), Some((0, content.len() - 1))),
+                    };
+                    let body_len = range.map_or(0, |(s, e)| e - s + 1);
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\n{extra}etag: \"throttled\"\r\naccept-ranges: bytes\r\ncontent-length: {body_len}\r\n\r\n",
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if is_head {
+                        continue;
+                    }
+                    if let Some((s, e)) = range {
+                        let mut off = s;
+                        while off <= e {
+                            let take = (e - off + 1).min(64 * 1024);
+                            if socket
+                                .write_all(&content.read_range(off, off + take - 1))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            off += take;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// One origin-compare cell (task 6.5).
+struct OriginCellRecord {
+    label: String,
+    job_goodput_mib_s: Vec<f64>,
+    job_wall_secs: Vec<f64>,
+    aggregate_goodput_mib_s: f64,
+    server_failures: u64,
+    server_requests: usize,
+    server_connections: u64,
+    registry_throttles: u64,
+    registry_successes: u64,
+    verify: Vec<String>,
+}
+
+/// Phase-6 gate (task 6.5): shared registry vs per-job backoff fallback
+/// under server throttling, on one shared origin and on separate origins.
+/// The shared registry is injected explicitly so the cell owns its counters.
+fn run_origin_compare() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 64 * mib;
+    let reps = 3;
+    let mut cells: Vec<OriginCellRecord> = Vec::new();
+    rt.block_on(async {
+        for variant in ["shared", "fallback"] {
+            for topology in ["same", "mixed"] {
+                for job_count in [1usize, 2] {
+                    if topology == "mixed" && job_count == 1 {
+                        continue; // mixed needs a peer to demonstrate isolation
+                    }
+                    for rep in 0..reps {
+                        let label = format!("origin/{variant}/{topology}/{job_count}job/rep{rep}");
+                        cells.push(
+                            origin_compare_cell(&label, variant, topology, job_count, size).await,
+                        );
+                    }
+                }
+            }
+        }
+    });
+    emit_origin_report("phase-6/origin-compare", &cells);
+}
+
+/// One origin-compare cell: throttle each involved origin once (503 +
+/// `Retry-After: 1`), run 1-2 jobs, and record coordination outcomes.
+async fn origin_compare_cell(
+    label: &str,
+    variant: &str,
+    topology: &str,
+    job_count: usize,
+    size: u64,
+) -> OriginCellRecord {
+    let content = synthetic_fixture(size);
+    let expected_hash = content.sha256();
+    let stats_a = Arc::new(ThrottledServerStats::default());
+    let addr_a = start_throttled_h1_server(content.clone(), 1, 1, stats_a.clone()).await;
+    let url_a = format!("http://{addr_a}/f.bin");
+    let (stats_b, url_b) = if topology == "mixed" {
+        let stats_b = Arc::new(ThrottledServerStats::default());
+        let addr_b = start_throttled_h1_server(content.clone(), 1, 1, stats_b.clone()).await;
+        (Some(stats_b), Some(format!("http://{addr_b}/f.bin")))
+    } else {
+        (None, None)
+    };
+
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.max_segment_size = 8 * 1024 * 1024;
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+    cfg.retry.base_delay = Duration::from_millis(20);
+    cfg.retry.max_delay = Duration::from_millis(100);
+
+    let registry = if variant == "shared" {
+        OriginRegistry::new()
+    } else {
+        OriginRegistry::disabled()
+    };
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller =
+        SingleStreamController::new(transport, cfg.clone()).with_origin_registry(registry.clone());
+
+    let dir = tempfile::tempdir().expect("cell tmpdir");
+    let urls = match (topology, job_count) {
+        ("same", 1) => vec![url_a.clone()],
+        ("same", _) => vec![url_a.clone(), url_a.clone()],
+        ("mixed", _) => vec![url_a.clone(), url_b.clone().expect("mixed url b")],
+        _ => unreachable!("topology"),
+    };
+
+    let started = Instant::now();
+    let mut handles = Vec::new();
+    let mut joins = Vec::new();
+    // Per-job wall measured start->join: `DownloadResult.elapsed` begins
+    // after the probe, which would hide probe-phase throttle latency.
+    for (j, url) in urls.iter().enumerate() {
+        let job_started = Instant::now();
+        let req = DownloadRequest::new(url.clone(), dir.path().join(format!("job{j}.bin")));
+        let (handle, join) = controller.start(req);
+        handles.push(handle);
+        joins.push(tokio::spawn(async move {
+            let result = join.await;
+            (job_started.elapsed(), result)
+        }));
+    }
+    let mut job_goodput = Vec::new();
+    let mut job_wall = Vec::new();
+    let mut verify = Vec::new();
+    for join in joins.into_iter() {
+        let (wall, outcome) = tokio::time::timeout(Duration::from_secs(120), join)
+            .await
+            .expect("no hang")
+            .expect("job task");
+        let result = outcome.expect("join").expect("terminal");
+        let (published, size_ok, hash_ok) = verify_output(&result, size, &expected_hash);
+        let error_note = result
+            .error
+            .as_ref()
+            .map(|e| format!(" error={e}"))
+            .unwrap_or_default();
+        verify.push(format!(
+            "published={published} size_ok={size_ok} hash_ok={hash_ok}{error_note}"
+        ));
+        job_wall.push(wall.as_secs_f64());
+        job_goodput.push(
+            result.completed_bytes as f64
+                / wall.as_secs_f64().max(f64::EPSILON)
+                / (1024.0 * 1024.0),
+        );
+    }
+    let cell_wall = started.elapsed().as_secs_f64().max(f64::EPSILON);
+    let aggregate = (size * job_count as u64) as f64 / cell_wall / (1024.0 * 1024.0);
+
+    // Registry traces (task 6.5): throttle/success events per involved
+    // origin, aggregated over the cell.
+    let (mut throttles, mut successes) = (0u64, 0u64);
+    for url in &urls {
+        if let Some(key) = kdown_engine::control::origin::normalized_origin(url) {
+            let (t, s) = registry.throttle_trace(&key);
+            throttles += t;
+            successes += s;
+        }
+    }
+
+    let stats = match topology {
+        "same" => stats_a,
+        _ => {
+            // Mixed: report both origins' load summed.
+            let b = stats_b.expect("mixed stats b");
+            let merged_failures = stats_a.failure_count() + b.failure_count();
+            let merged_accepts = stats_a.accept_count() + b.accept_count();
+            let mut merged_arrivals = stats_a.arrivals.lock().expect("arrivals").clone();
+            merged_arrivals.extend(b.arrivals.lock().expect("arrivals").iter().copied());
+            Arc::new(ThrottledServerStats {
+                arrivals: std::sync::Mutex::new(merged_arrivals),
+                failures: std::sync::atomic::AtomicU64::new(merged_failures),
+                accepts: std::sync::atomic::AtomicU64::new(merged_accepts),
+            })
+        }
+    };
+    OriginCellRecord {
+        label: label.to_string(),
+        job_goodput_mib_s: job_goodput,
+        job_wall_secs: job_wall,
+        aggregate_goodput_mib_s: aggregate,
+        server_failures: stats.failure_count(),
+        server_requests: stats.arrival_count(),
+        server_connections: stats.accept_count(),
+        registry_throttles: throttles,
+        registry_successes: successes,
+        verify,
+    }
+}
+
+/// Report emitter for origin-compare cells (task 6.5).
+fn emit_origin_report(group: &str, cells: &[OriginCellRecord]) {
+    let mut out = String::new();
+    out.push_str("# Origin-compare cells (task 6.5)\n\n");
+    out.push_str("| Cell | Job goodput (MiB/s) | Job wall (s) | Aggregate (MiB/s) | 503s | Requests | Connections | Registry thr/ok | Verify |\n|---|---|---|---|---|---|---|---|---|\n");
+    for c in cells {
+        let goods = c
+            .job_goodput_mib_s
+            .iter()
+            .map(|g| format!("{g:.2}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let walls = c
+            .job_wall_secs
+            .iter()
+            .map(|w| format!("{w:.2}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let fairness = if c.job_goodput_mib_s.len() == 2 {
+            let a = c.job_goodput_mib_s[0];
+            let b = c.job_goodput_mib_s[1];
+            format!(" {:.3}", a.min(b) / a.max(b).max(f64::EPSILON))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "| {} | {goods} | {walls} | {:.2} | {} | {} | {} | {}/{} | {} |{}\n",
+            c.label,
+            c.aggregate_goodput_mib_s,
+            c.server_failures,
+            c.server_requests,
+            c.server_connections,
+            c.registry_throttles,
+            c.registry_successes,
+            c.verify.join(" ; "),
+            fairness
+        ));
+    }
+    eprintln!("{out}");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/results")
+        .join(group);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("records.md"), &out);
+}
+
 /// One job inside a protocol-compare cell (task 5.4).
 struct ProtocolJobRecord {
     label: String,
@@ -1720,6 +2106,336 @@ async fn protocol_compare_cell(
         peak_rss_kib: peak_rss_kib(),
         jobs,
     }
+}
+
+/// Task 7.4: sweep the write-pipelining frame quantum (`read_buffer_size`)
+/// across H1/H2 and LAN/WAN shapes; single job, fixed-4 workers.
+fn run_buffer_sweep() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 64 * mib;
+    let reps = 3;
+    let mut rows: Vec<BufferSweepRow> = Vec::new();
+    rt.block_on(async {
+        for protocol in ["h1", "h2"] {
+            let content = synthetic_fixture(size);
+            let expected_hash = content.sha256();
+            for (shape_label, pacing) in [
+                ("lan", None),
+                ("wan", Some(Duration::from_micros(4_000))), // ~16 MiB/s
+            ] {
+                let (url, ca_dir) = if protocol == "h1" {
+                    let addr = start_h1_server_paced(content.clone(), pacing).await;
+                    (format!("http://{addr}/f.bin"), None)
+                } else {
+                    let (addr, ca_pem) =
+                        start_h2_tls_server_paced(content.clone(), pacing, true).await;
+                    let dir = tempfile::tempdir().expect("ca tmpdir");
+                    let ca_path = dir.path().join("ca.pem");
+                    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+                    (
+                        format!("https://localhost:{}/f.bin", addr.port()),
+                        Some(dir),
+                    )
+                };
+                for quantum_kib in [64u64, 128, 256, 512] {
+                    for rep in 0..reps {
+                        let label =
+                            format!("buffer/{protocol}/{shape_label}/{}k/rep{rep}", quantum_kib);
+                        let row = buffer_sweep_cell(
+                            &url,
+                            ca_dir.as_ref(),
+                            quantum_kib * 1024,
+                            size,
+                            &expected_hash,
+                            &label,
+                        )
+                        .await;
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+    });
+    emit_buffer_report(&rows);
+}
+
+/// One buffer-sweep cell: single fixed-4 job at a given frame quantum.
+async fn buffer_sweep_cell(
+    url: &str,
+    ca_dir: Option<&tempfile::TempDir>,
+    read_buffer_size: u64,
+    size: u64,
+    expected_hash: &str,
+    label: &str,
+) -> BufferSweepRow {
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 4;
+    cfg.transfer.max_segment_size = 8 * 1024 * 1024;
+    cfg.read_buffer_size = u32::try_from(read_buffer_size).expect("quantum fits u32");
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+    if let Some(ca) = ca_dir {
+        cfg.tls.custom_ca_bundle = Some(ca.path().join("ca.pem"));
+        cfg.h2_policy = H2ConnectionPolicy::Single;
+    }
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let dir = tempfile::tempdir().expect("cell tmpdir");
+    let cpu0 = cpu_time();
+    let ctx0 = context_switches();
+    let rss0 = peak_rss_kib();
+    let started = Instant::now();
+
+    let req = DownloadRequest::new(url.to_string(), dir.path().join("job0.bin"));
+    let (_handle, join) = controller.start(req);
+    let result = tokio::time::timeout(Duration::from_secs(300), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    let wall = started.elapsed();
+    let (published, size_ok, hash_ok) = verify_output(&result, size, expected_hash);
+
+    BufferSweepRow {
+        label: label.to_string(),
+        read_buffer_kib: read_buffer_size / 1024,
+        goodput_mib_s: result.completed_bytes as f64
+            / wall.as_secs_f64().max(f64::EPSILON)
+            / (1024.0 * 1024.0),
+        wall_secs: wall.as_secs_f64(),
+        completed_bytes: result.completed_bytes,
+        retries: result.retries,
+        segment_requests: result.segment_requests,
+        cpu_percent: if wall.as_secs_f64() > 0.0 {
+            (cpu_time().saturating_sub(cpu0).as_secs_f64() / wall.as_secs_f64()) * 100.0
+        } else {
+            0.0
+        },
+        peak_rss_kib: peak_rss_kib(),
+        rss0_kib: rss0,
+        context_switches: context_switches().saturating_sub(ctx0),
+        verify: format!("published={published} size_ok={size_ok} hash_ok={hash_ok}"),
+    }
+}
+
+/// Report emitter for the buffer sweep (task 7.4).
+fn emit_buffer_report(rows: &[BufferSweepRow]) {
+    let mut out = String::new();
+    out.push_str("# Buffer-sweep cells (task 7.4)\n\n");
+    out.push_str(
+        "| Cell | read_buffer KiB | Goodput (MiB/s) | Wall (s) | CPU % | ctx/s | Peak RSS KiB | Retries | SegReqs | Verify |\n|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        let wall = if r.wall_secs > 0.0 { r.wall_secs } else { 1.0 };
+        out.push_str(&format!(
+            "| {} | {} | {:.2} | {:.2} | {:.1} | {} | {} | {} | {} | {} |\n",
+            r.label,
+            r.read_buffer_kib,
+            r.goodput_mib_s,
+            r.wall_secs,
+            r.cpu_percent,
+            (r.context_switches as f64 / wall) as u64,
+            r.peak_rss_kib,
+            r.retries,
+            r.segment_requests,
+            r.verify
+        ));
+    }
+    out.push_str(
+        "\nUnavailable axes (labeled, not fabricated): syscall counts and allocation counts are not\ninstrumented; context switches (in+vol, client process) stand in as scheduling-pressure proxy;\npeak RSS is the monotonic process VmHWM (coarse per-cell caveat).\n",
+    );
+    eprintln!("{out}");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/results/phase-7/buffer-sweep");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("records.md"), &out);
+}
+
+/// Task 8.1: logical-only vs opt-in physical preallocation comparison.
+fn run_alloc_compare() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 256 * mib;
+    let reps = 3;
+    let mut rows: Vec<AllocCompareRow> = Vec::new();
+    rt.block_on(async {
+        let content = synthetic_fixture(size);
+        let expected_hash = content.sha256();
+        // tmpfs (/dev/shm): fallocate-unsupported -> silent logical fallback.
+        // project fs: the repo's own filesystem (NVMe-class on this host).
+        for (storage_label, root) in [
+            ("tmpfs", Some(std::path::Path::new("/dev/shm"))),
+            ("project-fs", None),
+        ] {
+            if let Some(root) = root {
+                if !root.is_dir() {
+                    eprintln!("[alloc-compare] {root:?} unavailable; axis labeled not run");
+                    continue;
+                }
+            }
+            let addr = start_h1_server_paced(content.clone(), None).await;
+            let url = format!("http://{addr}/f.bin");
+            for (policy_label, physical) in [("logical", false), ("physical", true)] {
+                for rep in 0..reps {
+                    let label = format!("alloc/{storage_label}/{policy_label}/rep{rep}");
+                    let row =
+                        alloc_compare_cell(&url, root, physical, size, &expected_hash, &label)
+                            .await;
+                    rows.push(row);
+                }
+            }
+        }
+    });
+    emit_alloc_report(&rows);
+}
+
+/// One alloc-compare cell: single fixed-4 job under one prealloc policy,
+/// measuring start -> first credited byte (where the reservation cost lands)
+/// plus wall, goodput and CPU.
+async fn alloc_compare_cell(
+    url: &str,
+    storage_root: Option<&std::path::Path>,
+    physical: bool,
+    size: u64,
+    expected_hash: &str,
+    label: &str,
+) -> AllocCompareRow {
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 4;
+    cfg.transfer.max_segment_size = 8 * 1024 * 1024;
+    cfg.transfer.preallocate_output = true; // logical sizing in both arms
+    cfg.transfer.preallocate_physical = physical;
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+
+    // Destination under the storage axis root (tempdir inside it).
+    let dir = match storage_root {
+        Some(root) => tempfile::Builder::new()
+            .prefix("alloc-compare-")
+            .tempdir_in(root)
+            .expect("storage tmpdir"),
+        None => tempfile::tempdir().expect("cell tmpdir"),
+    };
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let cpu0 = cpu_time();
+    let started = Instant::now();
+
+    let req = DownloadRequest::new(url.to_string(), dir.path().join("job0.bin"));
+    let (handle, join) = controller.start(req);
+    // The join moves into a helper task so the poll loop can timeout on it
+    // without consuming it; the task's handle is polled with a 2 ms timeout.
+    let mut join_task = tokio::spawn(async move { join.await.expect("join").expect("terminal") });
+    // Startup latency: first poll tick where any byte is credited (the
+    // reservation cost lands before the first byte). A 2 ms poll overshoots
+    // by < 2 ms — far below the effects being measured.
+    let mut first_byte: Option<Duration> = None;
+    let mut result: Option<DownloadResult> = None;
+    loop {
+        if first_byte.is_none() && handle.snapshot().completed_bytes > 0 {
+            first_byte = Some(started.elapsed());
+        }
+        if let Ok(outcome) = tokio::time::timeout(Duration::from_millis(2), &mut join_task).await {
+            first_byte.get_or_insert(started.elapsed());
+            result = Some(outcome.expect("job task"));
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(300) {
+            break;
+        }
+    }
+    let result = result.expect("job completed");
+    let wall = started.elapsed();
+    let (published, size_ok, hash_ok) = verify_output(&result, size, expected_hash);
+
+    AllocCompareRow {
+        label: label.to_string(),
+        physical,
+        first_byte_ms: first_byte.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX),
+        goodput_mib_s: result.completed_bytes as f64
+            / wall.as_secs_f64().max(f64::EPSILON)
+            / (1024.0 * 1024.0),
+        wall_secs: wall.as_secs_f64(),
+        cpu_percent: if wall.as_secs_f64() > 0.0 {
+            (cpu_time().saturating_sub(cpu0).as_secs_f64() / wall.as_secs_f64()) * 100.0
+        } else {
+            0.0
+        },
+        verify: format!("published={published} size_ok={size_ok} hash_ok={hash_ok}"),
+    }
+}
+
+/// Report emitter for the alloc comparison (task 8.1).
+fn emit_alloc_report(rows: &[AllocCompareRow]) {
+    let mut out = String::new();
+    out.push_str("# Alloc-compare cells (task 8.1)\n\n");
+    out.push_str(
+        "| Cell | physical | first byte (ms) | Goodput (MiB/s) | Wall (s) | CPU % | Verify |\n|---|---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {:.2} | {:.2} | {:.1} | {} |\n",
+            r.label,
+            r.physical,
+            r.first_byte_ms,
+            r.goodput_mib_s,
+            r.wall_secs,
+            r.cpu_percent,
+            r.verify
+        ));
+    }
+    out.push_str(
+        "\nUnavailable axes (labeled, not fabricated): fragmentation (FIEMAP extents) and device-level\nENOSPC injection are not plumbed; ENOSPC/permission surfacing is covered by sink error-path tests.\nCancellation cleanup is covered by the suites re-run in task 8.2, not re-measured here.\n",
+    );
+    eprintln!("{out}");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/results/phase-8/alloc-compare");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("records.md"), &out);
+}
+
+/// One alloc-compare measurement row (task 8.1).
+struct AllocCompareRow {
+    label: String,
+    physical: bool,
+    first_byte_ms: u64,
+    goodput_mib_s: f64,
+    wall_secs: f64,
+    cpu_percent: f64,
+    verify: String,
+}
+
+/// One buffer-sweep measurement row (task 7.4).
+struct BufferSweepRow {
+    label: String,
+    read_buffer_kib: u64,
+    goodput_mib_s: f64,
+    wall_secs: f64,
+    #[allow(dead_code)]
+    completed_bytes: u64,
+    retries: u64,
+    segment_requests: u64,
+    cpu_percent: f64,
+    peak_rss_kib: u64,
+    #[allow(dead_code)]
+    rss0_kib: u64,
+    context_switches: u64,
+    verify: String,
 }
 
 /// Report emitter for protocol-compare cells (task 5.4).
