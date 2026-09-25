@@ -269,14 +269,20 @@ async fn start_h1_server(content: ContentSource) -> std::net::SocketAddr {
 }
 
 fn parse_range(v: &str) -> Option<(u64, u64)> {
-    let (s, e) = v.split_once('-')?;
-    Some((s.parse().ok()?, e.parse().ok()?))
+    // Range headers arrive as "bytes=S-E" (RFC 9110 §14.1.2); the
+    // bytes= prefix must be stripped before parsing (task 5.4: the
+    // unprefixed parse silently rejected every real Range header, so H2
+    // bench fixtures answered range requests with full 200 responses and
+    // the engine's safe fallback downgraded those cells to single stream).
+    let rest = v.trim().strip_prefix("bytes=")?;
+    let (s, e) = rest.split_once('-')?;
+    Some((s.trim().parse().ok()?, e.trim().parse().ok()?))
 }
 
 /// HTTPS/2 (or HTTP/1.1 via ALPN) fixture server with a self-signed
 /// certificate; returns `(addr, ca_pem)`.
 async fn start_h2_tls_server(content: ContentSource) -> (std::net::SocketAddr, Vec<u8>) {
-    start_h2_tls_server_paced(content, None).await
+    start_h2_tls_server_paced(content, None, false).await
 }
 
 /// Paced variant: optional per-64KiB-chunk delay (shaped comparisons,
@@ -284,6 +290,7 @@ async fn start_h2_tls_server(content: ContentSource) -> (std::net::SocketAddr, V
 async fn start_h2_tls_server_paced(
     content: ContentSource,
     pacing: Option<Duration>,
+    advertise_ranges: bool,
 ) -> (std::net::SocketAddr, Vec<u8>) {
     use tokio_rustls::rustls;
 
@@ -347,6 +354,12 @@ async fn start_h2_tls_server_paced(
                                     .status(status)
                                     .header("content-length", body_len)
                                     .header("etag", "\"bench-h2\"");
+                                // Task 5.4 protocol-compare fixture: advertise
+                                // ranges so the HEAD probe marks the resource
+                                // segmentable (segmented H2 comparison).
+                                if advertise_ranges {
+                                    resp = resp.header("accept-ranges", "bytes");
+                                }
                                 if let Some(cr) = cr {
                                     resp = resp.header("content-range", cr);
                                 }
@@ -1045,6 +1058,15 @@ fn main() {
         run_adaptive_compare(dest_root);
         return;
     }
+    // Phase-5 gate (task 5.4): protocol-aware concurrency comparison —
+    // shaped H1/H2, single-job and two same-origin jobs, fixed-4 vs
+    // adaptive-1-4, recording stream/socket counts, desired/active decision
+    // traces, fairness and fallback:
+    //   throughput --protocol-compare
+    if args.iter().any(|a| a == "--protocol-compare") {
+        run_protocol_compare();
+        return;
+    }
     // Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
     // executor across H1/H2 and shaped/unshaped shapes.
     if args.iter().any(|a| a == "--write-path-compare") {
@@ -1476,6 +1498,276 @@ fn run_duration_sweep() {
 /// Phase-2 gate (task 2.8): legacy writer lanes vs the pipelined shared
 /// executor across H1/H2, shaped/unshaped, with repetitions and process
 /// thread-count deltas (writer-thread scaling evidence).
+/// One job inside a protocol-compare cell (task 5.4).
+struct ProtocolJobRecord {
+    label: String,
+    goodput_mib_s: f64,
+    wall_secs: f64,
+    completed_bytes: u64,
+    network_bytes: u64,
+    retries: u64,
+    segment_requests: u64,
+    verify: String,
+    max_desired: u64,
+    max_active: u64,
+    desired_trace: String,
+    fallback: String,
+}
+
+/// One protocol-compare cell: per-cell transport protocol counters plus the
+/// per-job records sharing that transport.
+struct ProtocolCellRecord {
+    label: String,
+    establishments_h1: u64,
+    establishments_h2: u64,
+    requests_h1: u64,
+    h2_streams: u64,
+    cpu_percent: f64,
+    peak_rss_kib: u64,
+    jobs: Vec<ProtocolJobRecord>,
+}
+
+/// Protocol-aware concurrency gate (task 5.4): shaped H1/H2 x single/dual
+/// same-origin jobs x fixed-4/adaptive-1-4. Each cell uses a fresh transport
+/// so the task-5.1 protocol counters (physical establishments vs
+/// requests/streams) describe exactly that cell; jobs within a cell share
+/// one transport (one engine), which is the same-origin fairness scenario.
+fn run_protocol_compare() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mib = 1024u64 * 1024;
+    let size = 128 * mib;
+    let reps = 3;
+    let mut cells: Vec<ProtocolCellRecord> = Vec::new();
+    rt.block_on(async {
+        for protocol in ["h1", "h2"] {
+            let content = synthetic_fixture(size);
+            let expected_hash = content.sha256();
+            // 16 MiB/s per connection (H1) / per socket chunk (H2) shaping.
+            let pacing = Some(Duration::from_micros(4_000));
+            let (url, ca_dir) = if protocol == "h1" {
+                let addr = start_h1_server_paced(content.clone(), pacing).await;
+                (format!("http://{addr}/f.bin"), None)
+            } else {
+                let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing, true).await;
+                let dir = tempfile::tempdir().expect("ca tmpdir");
+                let ca_path = dir.path().join("ca.pem");
+                std::fs::write(&ca_path, &ca_pem).expect("write ca");
+                (
+                    format!("https://localhost:{}/f.bin", addr.port()),
+                    Some(dir),
+                )
+            };
+            for job_count in [1usize, 2] {
+                for (mode_label, adaptive) in [("fixed-4", false), ("adaptive-1-4", true)] {
+                    for rep in 0..reps {
+                        let label =
+                            format!("protocol/{protocol}/{}job/{mode_label}/rep{rep}", job_count);
+                        let cell = protocol_compare_cell(
+                            &url,
+                            ca_dir.as_ref(),
+                            job_count,
+                            adaptive,
+                            size,
+                            &expected_hash,
+                            &label,
+                        )
+                        .await;
+                        cells.push(cell);
+                    }
+                }
+            }
+        }
+    });
+    emit_protocol_report("phase-5/protocol-compare", &cells);
+}
+
+/// One protocol-compare cell (task 5.4): start 1..2 jobs on one shared
+/// transport, sample desired/active decision traces while they run, then
+/// verify and record goodput, fairness and protocol counters.
+async fn protocol_compare_cell(
+    url: &str,
+    ca_dir: Option<&tempfile::TempDir>,
+    job_count: usize,
+    adaptive: bool,
+    size: u64,
+    expected_hash: &str,
+    label: &str,
+) -> ProtocolCellRecord {
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.max_segment_size = 8 * 1024 * 1024;
+    if adaptive {
+        cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    }
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+    if let Some(ca) = ca_dir {
+        cfg.tls.custom_ca_bundle = Some(ca.path().join("ca.pem"));
+        cfg.h2_policy = H2ConnectionPolicy::Single;
+    }
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let stats = transport.protocol_stats().clone();
+    let controller = SingleStreamController::new(transport, cfg.clone());
+
+    let dir = tempfile::tempdir().expect("cell tmpdir");
+    let cpu0 = cpu_time();
+    let cell_started = Instant::now();
+
+    let mut handles = Vec::new();
+    let mut joins = Vec::new();
+    // Join-completion counter: the job handle stays published after a job
+    // finishes, so the sampler below stops on completions, not on the
+    // handle disappearing.
+    let completed_jobs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for j in 0..job_count {
+        let req = DownloadRequest::new(url.to_string(), dir.path().join(format!("job{j}.bin")));
+        let (handle, join) = controller.start(req);
+        handles.push(handle);
+        let completed_jobs = completed_jobs.clone();
+        let started = Instant::now();
+        joins.push(tokio::spawn(async move {
+            let outcome = join.await;
+            completed_jobs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (started.elapsed(), outcome)
+        }));
+    }
+
+    // Decision-trace sampling (task 5.4): desired/active transitions per job.
+    let mut max_desired = vec![0u64; job_count];
+    let mut max_active = vec![0u64; job_count];
+    let mut traces = vec![Vec::<String>::new(); job_count];
+    let mut last_desired = vec![0u64; job_count];
+    let sample_started = Instant::now();
+    loop {
+        for (j, handle) in handles.iter().enumerate() {
+            if let Some(job) = handle.segmented_job() {
+                let desired = job.desired_workers();
+                let active = job.active_workers();
+                max_desired[j] = max_desired[j].max(desired);
+                max_active[j] = max_active[j].max(active);
+                if desired != last_desired[j] {
+                    traces[j].push(format!(
+                        "{}@{:.2}s",
+                        desired,
+                        sample_started.elapsed().as_secs_f64()
+                    ));
+                    last_desired[j] = desired;
+                }
+            }
+        }
+        if completed_jobs.load(std::sync::atomic::Ordering::Relaxed) >= job_count
+            || sample_started.elapsed() > Duration::from_secs(300)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut jobs = Vec::new();
+    for (j, join) in joins.into_iter().enumerate() {
+        let (wall, outcome) = join.await.expect("job task");
+        let result = outcome.expect("join").expect("terminal result");
+        let (published, size_ok, hash_ok) = verify_output(&result, size, expected_hash);
+        let verify = format!("published={published} size_ok={size_ok} hash_ok={hash_ok}");
+        let fallback = if result.warnings.is_empty() {
+            "none".to_string()
+        } else {
+            result.warnings.join("; ")
+        };
+        jobs.push(ProtocolJobRecord {
+            label: format!("{label}/job{j}"),
+            goodput_mib_s: result.completed_bytes as f64
+                / wall.as_secs_f64().max(f64::EPSILON)
+                / (1024.0 * 1024.0),
+            wall_secs: wall.as_secs_f64(),
+            completed_bytes: result.completed_bytes,
+            network_bytes: result.bytes_downloaded_from_network,
+            retries: result.retries,
+            segment_requests: result.segment_requests,
+            verify,
+            max_desired: max_desired[j],
+            max_active: max_active[j],
+            desired_trace: if traces[j].is_empty() {
+                format!("{}@start", last_desired[j])
+            } else {
+                traces[j].join("→")
+            },
+            fallback,
+        });
+    }
+
+    let cell_wall = cell_started.elapsed();
+    let cpu = cpu_time().saturating_sub(cpu0);
+    let cpu_percent = if cell_wall.as_secs_f64() > 0.0 {
+        (cpu.as_secs_f64() / cell_wall.as_secs_f64()) * 100.0
+    } else {
+        0.0
+    };
+    ProtocolCellRecord {
+        label: label.to_string(),
+        establishments_h1: stats.establishments_h1(),
+        establishments_h2: stats.establishments_h2(),
+        requests_h1: stats.requests_h1(),
+        h2_streams: stats.h2_streams(),
+        cpu_percent,
+        peak_rss_kib: peak_rss_kib(),
+        jobs,
+    }
+}
+
+/// Report emitter for protocol-compare cells (task 5.4).
+fn emit_protocol_report(group: &str, cells: &[ProtocolCellRecord]) {
+    let mut out = String::new();
+    out.push_str("# Protocol-compare cells (task 5.4)\n\n");
+    out.push_str("| Cell | estab H1 | estab H2 | req H1 | H2 streams | CPU % | Peak RSS KiB |\n|---|---|---|---|---|---|---|\n");
+    for c in cells {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {:.1} | {} |\n",
+            c.label,
+            c.establishments_h1,
+            c.establishments_h2,
+            c.requests_h1,
+            c.h2_streams,
+            c.cpu_percent,
+            c.peak_rss_kib
+        ));
+    }
+    out.push_str("\n## Per-job records\n\n");
+    out.push_str("| Job | Goodput (MiB/s) | Wall (s) | Completed | Network | Retries | SegReqs | Verify | maxDesired | maxActive | Desired trace | Fallback |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for c in cells {
+        for j in &c.jobs {
+            out.push_str(&format!(
+                "| {} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                j.label,
+                j.goodput_mib_s,
+                j.wall_secs,
+                j.completed_bytes,
+                j.network_bytes,
+                j.retries,
+                j.segment_requests,
+                j.verify,
+                j.max_desired,
+                j.max_active,
+                j.desired_trace,
+                j.fallback
+            ));
+        }
+    }
+    eprintln!("{out}");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/results")
+        .join(group);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("records.md"), &out);
+}
+
 fn run_write_path_compare() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
@@ -1616,7 +1908,7 @@ fn compare_run(
             let addr = start_h1_server_paced(content.clone(), pacing).await;
             (format!("http://{addr}/f.bin"), None)
         } else {
-            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing).await;
+            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing, false).await;
             let dir = tempfile::tempdir().expect("ca tmpdir");
             let ca_path = dir.path().join("ca.pem");
             std::fs::write(&ca_path, &ca_pem).expect("write ca");
@@ -1809,7 +2101,7 @@ fn sweep_run(
             let addr = start_h1_server_paced(content.clone(), pacing).await;
             (format!("http://{addr}/f.bin"), None)
         } else {
-            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing).await;
+            let (addr, ca_pem) = start_h2_tls_server_paced(content.clone(), pacing, false).await;
             let dir = tempfile::tempdir().expect("ca tmpdir");
             let ca_path = dir.path().join("ca.pem");
             std::fs::write(&ca_path, &ca_pem).expect("write ca");
