@@ -1,15 +1,15 @@
 // The seam is defined and verified here; the segmented transfer paths
-// consume it with the byte budgets (task 2.2), shared pool (task 2.3),
-// ack frontiers (task 2.4) and H1/H2 integration (tasks 2.5-2.7).
+// consume it with the byte budgets, shared pool,
+// ack frontiers and H1/H2 integration.
 #![allow(dead_code)]
-//! Internal write-executor boundary (design D2, tasks 2.1-2.3).
+//! Internal write-executor boundary .
 //!
 //! Decouples network workers from blocking filesystem work: a worker
 //! submits a positional write (job, lease id/generation, absolute offset,
 //! payload) and keeps receiving the next bounded payload while the write
 //! executes on a blocking thread. Completion is reported back
 //! asynchronously, so *acknowledgement* — not submission — defines
-//! published progress (task 2.4).
+//! published progress.
 //!
 //! Every submitted write is executed through [`WriteBackend::write_blocking`],
 //! i.e. the existing checked positional adapter (`write_all_at`: short
@@ -19,7 +19,7 @@
 //! for the legacy writer lanes, and the platform cfg selection
 //! (Unix `write_at` / Windows `seek_write`) is inherited unchanged.
 //!
-//! Execution core (task 2.3): a small fixed-size pool of blocking writer
+//! Execution core: a small fixed-size pool of blocking writer
 //! threads is shared by every attached job — blocking filesystem threads
 //! never scale with `jobs × workers`. Admission is fair per job: a shared
 //! round-robin cursor pops from the next job's queue every dispatch, so
@@ -58,7 +58,7 @@ use crate::error::DownloadError;
 /// Identifies the submitting job (fair per-job admission).
 pub(crate) type JobId = u64;
 
-/// The blocking positional write primitive the executor drives (design D2).
+/// The blocking positional write primitive the executor drives.
 ///
 /// The production backend is [`super::output_session::OutputWriteHandle`]
 /// through its existing `write_blocking`; tests may script short,
@@ -80,15 +80,15 @@ impl WriteBackend for super::output_session::OutputWriteHandle {
     }
 }
 
-/// One positional write submitted for execution (design D2).
+/// One positional write submitted for execution.
 #[derive(Debug)]
 pub(crate) struct WriteSubmission {
     /// Submitting job; the shared executor uses this for fair admission.
     pub job: JobId,
-    /// Lease the payload belongs to (generation-tagged frontier, task 2.4).
+    /// Lease the payload belongs to (generation-tagged frontier).
     pub lease_id: u64,
     /// Lease generation at submission; completions for invalidated
-    /// generations are discardable (tasks 2.4/2.7).
+    /// generations are discardable.
     pub generation: u64,
     /// Absolute output offset; positional, no shared cursor is touched.
     pub offset: u64,
@@ -105,12 +105,12 @@ pub(crate) enum WriteOutcome {
     Completed,
     /// Structured sink error; the write did not fully reach the output.
     Failed(SinkError),
-    /// Dropped before executing (detach discard disposition, task 2.7);
+    /// Dropped before executing (detach discard disposition);
     /// no bytes reached the output.
     Discarded,
 }
 
-/// One completed write, tagged for per-lease frontier accounting (task 2.4).
+/// One completed write, tagged for per-lease frontier accounting.
 #[derive(Debug)]
 pub(crate) struct WriteCompletion {
     /// Lease the payload belonged to.
@@ -134,7 +134,7 @@ pub(crate) enum WriteExecutorError {
 }
 
 /// What a detached session does with its queued-but-unstarted writes
-/// (task 2.7 maps pause/retry to drain and cancellation to discard).
+///.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionDisposition {
     /// Execute every queued write before the session settles.
@@ -144,12 +144,12 @@ pub(crate) enum SessionDisposition {
     Discard,
 }
 
-/// Submit end of one job's executor attachment (design D2): workers submit
+/// Submit end of one job's executor attachment: workers submit
 /// positional writes here and keep receiving payload. Detaching the session
 /// (or dropping it without detaching, which drains) releases its output
 /// capability; the executor stays usable by other sessions until it is shut
 /// down.
-/// Submit end of one job's executor attachment (design D2): workers submit
+/// Submit end of one job's executor attachment: workers submit
 /// positional writes here and keep receiving payload. Cloning shares the
 /// same session (same job, same completion stream). Detaching the session
 /// (or dropping every handle without detaching, which drains) releases its
@@ -166,7 +166,7 @@ pub(crate) struct WriteSession {
     completions_tx: mpsc::UnboundedSender<WriteCompletion>,
 }
 
-/// Shared write executor (design D2, tasks 2.1-2.3).
+/// Shared write executor .
 ///
 /// Cloning the executor shares one core; each job attaches a session with
 /// its own write-only capability and completion stream.
@@ -217,12 +217,12 @@ struct ExecutorCore {
     state: Mutex<ExecutorState>,
     /// Blocking workers park here while no queued work exists.
     work_available: Condvar,
-    /// Executor-wide bound on queued+executing payload bytes (design D2,
-    /// task 2.3) — defense in depth beyond the caller-held reservations.
+    /// Executor-wide bound on queued+executing payload bytes — defense in
+    /// depth beyond the caller-held reservations.
     queued_bytes: OutstandingByteBudget,
     /// Whole-executor close: no new submissions; workers drain and exit.
     closed: AtomicBool,
-    /// Blocking worker thread identities (diagnostics, task 0.4: writer
+    /// Blocking worker thread identities (diagnostics, : writer
     /// thread count must never scale with jobs × workers).
     writer_ids: Mutex<Vec<std::thread::ThreadId>>,
     /// Per-worker exit signals for deterministic shutdown: a worker sends
@@ -317,7 +317,7 @@ impl WriteExecutor {
     }
 
     /// Payload bytes currently queued or executing inside the executor
-    /// (diagnostics, task 0.4).
+    /// (diagnostics).
     #[must_use]
     pub fn queued_bytes_outstanding(&self) -> u64 {
         self.core.queued_bytes.outstanding()
@@ -374,7 +374,7 @@ impl WriteSession {
     /// Submit one positional write for execution. The payload moves into
     /// the executor; exactly one completion arrives on this session's
     /// stream when the write settles. Submission does NOT acknowledge the
-    /// write — callers advance progress only on completions (task 2.4).
+    /// write — callers advance progress only on completions.
     ///
     /// The executor-wide queued+executing byte cap is acquired before
     /// enqueueing (cancellation-aware), so admission backpressures the
@@ -545,7 +545,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 impl ExecutorCore {
-    /// Pop the next write, fair round-robin across sessions (task 2.3):
+    /// Pop the next write, fair round-robin across sessions:
     /// every dispatch advances the cursor past the served session, so a
     /// heavy job cannot starve others. Parks on the condvar while no work
     /// exists; exits only after the executor closed AND everything settled.
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(std::fs::read(output.temp_path()).expect("content"), b"ab");
     }
 
-    /// Task 2.3 verification: many jobs (16 "async workers" worth of
+    /// Contention verification: many jobs (16 "async workers" worth of
     /// sessions) hammering one executor must be served by exactly the
     /// configured number of blocking writer threads — never one per
     /// worker — and every job must make byte-exact progress.
@@ -1186,7 +1186,7 @@ mod tests {
         output.reclaim_exclusive().expect("reclaim");
     }
 
-    /// Fair per-job admission (task 2.3): with one writer thread and a
+    /// Fair per-job admission: with one writer thread and a
     /// slow sink, a queued interleave of two jobs must be served
     /// round-robin — job B's first write precedes job A's second.
     #[tokio::test]
@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     /// Detach with `Drain` executes every queued write before the session
-    /// settles (pause semantics, task 2.7).
+    /// settles (pause semantics).
     #[tokio::test]
     async fn drain_disposition_executes_queued_writes_before_settling() {
         let directory = tempfile::tempdir().expect("tmpdir");

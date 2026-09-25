@@ -9,10 +9,12 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{
+    DownloadController, DownloadHandle, DownloadRequest, ResultStatus,
+};
+use kdown_engine::metrics::Event;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
-
 fn segmented_cfg() -> EngineConfig {
     let mut c = EngineConfig {
         transfer: TransferPolicy {
@@ -29,8 +31,8 @@ fn segmented_cfg() -> EngineConfig {
     c
 }
 
-fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(
+fn controller(cfg: EngineConfig) -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     )
@@ -1268,7 +1270,7 @@ async fn h1_adaptive_growth_never_exceeds_connection_permits() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let limits = transport.connection_limits().clone();
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
     let (handle, join) = controller.start(DownloadRequest::new(server.url("/h1cap"), dest.clone()));
 
     let origin_key = format!("http://{}", server.socket_addr());
@@ -1308,18 +1310,23 @@ async fn h1_adaptive_growth_never_exceeds_connection_permits() {
     );
 }
 
-/// H1 marginal-gain revert (task 5.2): additional connections that stop
-/// improving useful goodput must be reverted. The fixture makes every
-/// distinct connection beyond the first strictly harmful — the per-request
-/// header delay triples with each distinct connection the server has seen —
-/// so aggregate useful goodput always DROPS when the controller grows the
-/// connection count. The adaptive probe must first raise desired above 1,
-/// then revert it to 1 once the marginal gain disappears.
+/// H1 marginal-gain revert: additional connections that stop improving
+/// useful goodput must be reverted. The fixture makes every distinct
+/// connection beyond the first strictly harmful: the per-request header
+/// delay triples with each distinct connection the server has seen, from a
+/// base (80 ms) large enough that per-request server cost dominates any
+/// plausible per-chunk client cost. With a 64 KiB chunk the premise
+/// (aggregate useful goodput strictly DROPS with each added connection)
+/// holds while one chunk costs under ~80 ms to receive and write — a
+/// margin no supported runner load is expected to break. The premise must
+/// not depend on how fast the host serves loopback bytes. The adaptive
+/// probe must first raise desired above 1, then revert it to 1 once the
+/// marginal gain disappears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
     use std::collections::HashSet;
 
-    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 5101));
+    let content = Arc::new(deterministic_bytes(4 * 1024 * 1024, 5101));
     let conns_seen: Arc<std::sync::Mutex<HashSet<u64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
     let server = {
@@ -1328,14 +1335,16 @@ async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
         TestServer::new().serve_handler("/marginal", move |req| {
             let total = content.len() as u64;
             // Distinct-connection count drives the penalty: delay triples
-            // per distinct connection (capped), so an added connection
-            // always lowers aggregate goodput below the prior level.
+            // per distinct connection and stays superlinear across the
+            // whole worker range (capped at the 4-connection delay), so
+            // aggregate goodput strictly decreases with each added
+            // connection regardless of host speed.
             let distinct = {
                 let mut set = conns_seen.lock().expect("conns seen lock");
                 set.insert(req.conn_id);
                 set.len() as u32
             };
-            let delay_ms = 8u64.saturating_mul(3u64.pow(distinct.saturating_sub(1).min(5)));
+            let delay_ms = 80u64.saturating_mul(3u64.pow(distinct.saturating_sub(1).min(3)));
             let base = if req.method == "HEAD" {
                 ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
             } else if let Some((s, e)) = req.range {
@@ -1364,17 +1373,23 @@ async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
     cfg.transfer.min_segment_size = 64 * 1024;
     cfg.transfer.max_segment_size = 64 * 1024;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let (handle, join) =
         controller.start(DownloadRequest::new(server.url("/marginal"), dest.clone()));
 
     let mut saw_two = false;
     let mut reverted_to_one = false;
+    let mut desired_history: Vec<u64> = vec![];
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if let Some(job) = handle.segmented_job() {
             let desired = job.desired_workers();
+            // Record only level changes so a failure report shows the
+            // controller's trajectory without thousands of duplicates.
+            if desired_history.last() != Some(&desired) {
+                desired_history.push(desired);
+            }
             if desired >= 2 {
                 saw_two = true;
             }
@@ -1393,9 +1408,235 @@ async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 
-    assert!(saw_two, "probe must first raise desired above 1");
+    assert!(
+        saw_two,
+        "probe must first raise desired above 1 (desired history: {desired_history:?})"
+    );
     assert!(
         reverted_to_one,
-        "desired must revert to 1 once the additional connection stops helping"
+        "desired must revert to 1 once the additional connection stops helping \
+         (desired history: {desired_history:?})"
     );
+}
+
+// ---- Runtime-control event semantics ----
+
+/// Collect control events for a fixed observation window after a control
+/// call, so each assertion covers both the presence of the expected event
+/// and the absence of the wrong event kind in the same window.
+async fn collect_control_events(
+    events: &mut kdown_engine::metrics::EventStream,
+    window: Duration,
+) -> Vec<Event> {
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), events.next()).await {
+            Ok(Some(event)) => match &event {
+                Event::ConcurrencyChanged { .. } | Event::RateLimitChanged { .. } => {
+                    out.push(event);
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+async fn wait_for_segmented_job(handle: &DownloadHandle) {
+    let mut waited = Duration::ZERO;
+    while handle.segmented_job().is_none() && waited < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+    assert!(
+        handle.segmented_job().is_some(),
+        "segmented job must be live for the control event"
+    );
+}
+
+/// A concurrency-only change must publish exactly one ConcurrencyChanged
+/// carrying the applied worker count and never a RateLimitChanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrency_update_emits_concurrency_changed_only() {
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 6100));
+    let server = paced_range_server(content.clone(), "/cc-event", Duration::from_millis(10))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("cc-event.bin");
+    let mut cfg = segmented_cfg();
+    cfg.transfer.max_workers = 8;
+    let c = controller(cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/cc-event"), dest.clone()));
+    let mut events = handle.events();
+    wait_for_segmented_job(&handle).await;
+
+    handle.set_concurrency(6);
+    assert_eq!(
+        handle.segmented_job().expect("job").desired_workers(),
+        6,
+        "applied concurrency must be visible immediately"
+    );
+    let control = collect_control_events(&mut events, Duration::from_millis(600)).await;
+    let concurrency: Vec<u64> = control
+        .iter()
+        .filter_map(|event| match event {
+            Event::ConcurrencyChanged { workers } => Some(*workers),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        concurrency,
+        vec![6],
+        "exactly one applied-count event expected: {control:?}"
+    );
+    assert!(
+        !control
+            .iter()
+            .any(|event| matches!(event, Event::RateLimitChanged { .. })),
+        "a concurrency-only change must not emit a rate-limit event: {control:?}"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// A request above the configured bounds must report the CLAMPED count,
+/// not the requested value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clamped_concurrency_update_reports_applied_count() {
+    let content = Arc::new(deterministic_bytes(6 * 1024 * 1024, 6103));
+    let server = paced_range_server(content.clone(), "/cc-clamp", Duration::from_millis(10))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("cc-clamp.bin");
+    // segmented_cfg bounds workers to [1, 4].
+    let c = controller(segmented_cfg());
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/cc-clamp"), dest.clone()));
+    let mut events = handle.events();
+    wait_for_segmented_job(&handle).await;
+
+    handle.set_concurrency(99);
+    assert_eq!(handle.segmented_job().expect("job").desired_workers(), 4);
+    let control = collect_control_events(&mut events, Duration::from_millis(600)).await;
+    let concurrency: Vec<u64> = control
+        .iter()
+        .filter_map(|event| match event {
+            Event::ConcurrencyChanged { workers } => Some(*workers),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        concurrency,
+        vec![4],
+        "event must carry the applied clamped count: {control:?}"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+}
+
+/// Without a segmented job (sequential transfer), a concurrency request
+/// cannot be applied and must not publish an event claiming it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrency_update_without_segmented_job_is_silent() {
+    // 256 KiB is below the 1 MiB segmentation threshold: sequential job.
+    let content = Arc::new(deterministic_bytes(256 * 1024, 6101));
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("cc-sequential.bin");
+    let c = controller(segmented_cfg());
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/ratelimit"), dest.clone()));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        handle.segmented_job().is_none(),
+        "this transfer must stay sequential for the no-op assertion"
+    );
+    let mut events = handle.events();
+
+    handle.set_concurrency(3);
+    let control = collect_control_events(&mut events, Duration::from_millis(400)).await;
+    assert!(
+        control.is_empty(),
+        "an unapplied concurrency request must emit nothing: {control:?}"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(30), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+}
+
+/// Rate-limit updates publish RateLimitChanged with the effective value
+/// (None = unlimited) after the change is applied, and never a
+/// concurrency event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limit_updates_emit_rate_limit_changed_only() {
+    let content = Arc::new(deterministic_bytes(4 * 1024 * 1024, 6102));
+    let server = rate_limit_server(content.clone())
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("rl-event.bin");
+    let c = controller(segmented_cfg());
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/ratelimit"), dest.clone()));
+    let mut events = handle.events();
+
+    // Pre-start update: applies to the stable bucket before the job exists.
+    handle.set_rate_limit(1024 * 1024);
+    assert_eq!(handle.rate_limit(), Some(1024 * 1024));
+    wait_for_segmented_job(&handle).await;
+    // Live update to unlimited while workers are running.
+    handle.set_rate_limit(0);
+    assert_eq!(handle.rate_limit(), None);
+
+    let control = collect_control_events(&mut events, Duration::from_millis(600)).await;
+    let rates: Vec<Option<u64>> = control
+        .iter()
+        .filter_map(|event| match event {
+            Event::RateLimitChanged { bytes_per_second } => Some(*bytes_per_second),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rates,
+        vec![Some(1024 * 1024), None],
+        "both rate updates must be reported in order: {control:?}"
+    );
+    assert!(
+        !control
+            .iter()
+            .any(|event| matches!(event, Event::ConcurrencyChanged { .. })),
+        "a rate-only change must not emit a concurrency event: {control:?}"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(60), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }

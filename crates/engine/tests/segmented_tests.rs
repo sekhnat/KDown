@@ -15,7 +15,7 @@ use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{RangeMode, ScriptedResponse, TestServer};
@@ -37,8 +37,8 @@ fn cfg(threshold: u64) -> EngineConfig {
     c
 }
 
-fn controller(cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::new(
+fn controller(cfg: EngineConfig) -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     )
@@ -46,8 +46,8 @@ fn controller(cfg: EngineConfig) -> SingleStreamController {
 
 /// Scripted orchestration controller (§32): network-neutral cases run
 /// through the deterministic adapter — no sockets, no delays.
-fn scripted_controller(scripted: &ScriptedHttp, cfg: EngineConfig) -> SingleStreamController {
-    SingleStreamController::with_execution(HttpExecution::from_adapter(scripted.clone()), cfg)
+fn scripted_controller(scripted: &ScriptedHttp, cfg: EngineConfig) -> DownloadController {
+    DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), cfg)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

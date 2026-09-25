@@ -1,10 +1,22 @@
-# Benchmarking and profiling guide (§37, milestone 1)
+# Benchmarking and profiling guide
 
 Repeatable procedures for measuring the segmented download pipeline, plus the
 recorded pre-optimization baseline. Every command is reproducible from this
 repository; results land in `crates/engine/benches/results/`.
 
-## Baseline environment (same-host comparisons only)
+**What these numbers mean (and do not mean):** all recorded throughput in
+this guide and in `benches/results/` is loopback/synthetic regression
+evidence for the exact host, storage, and fixture listed below. It measures
+the engine's efficiency, not Internet download performance. It is NOT a
+promise of WAN speedup, and it does not imply segmented downloading
+outperforms sequential downloading on arbitrary remote servers: real-world
+outcomes depend on the server's `Range` implementation and correctness,
+server/CDN throttling, round-trip latency (RTT), available bandwidth, HTTP
+version (1.1 vs 2) and per-origin connection limits, the engine's own
+connection caps, local disk/storage behavior, CPU capacity, and general
+environment load. Treat cross-host comparisons as invalid by construction.
+GitHub-hosted runners run smoke-only by design (no absolute threshold,
+no cross-host comparison).
 
 | Setting | Value |
 |---|---|
@@ -353,7 +365,7 @@ format internals.
 - Segment sizing: `SegmentSizing::Explicit`.
 - H2 extra sockets: `H2ConnectionPolicy::Single` (default).
 - Shared-origin feedback:
-  `SingleStreamController::with_origin_registry(OriginRegistry::disabled())`
+  `DownloadController::with_origin_registry(OriginRegistry::disabled())`
   restores per-job backoff only (phase-6 gate).
 - Physical preallocation: `preallocate_physical = false` (default, phase-8).
 

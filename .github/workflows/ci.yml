@@ -23,11 +23,24 @@ jobs:
           components: clippy
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets
+      # --locked keeps every platform on the reviewed, tracked dependency
+      # set: a resolution drift fails loudly here instead of silently
+      # changing what the MSRV and platform jobs verify.
+      - run: cargo build --workspace --all-targets --locked
       # Full matrix includes positional writes, rename-over-existing,
       # preallocation, crash/resume, segmented, and security tests.
-      - run: cargo test --workspace --all-targets
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          toolchain: 1.98.1
+      - run: cargo fmt --all -- --check
 
   docs:
     runs-on: ubuntu-latest
@@ -37,6 +50,20 @@ jobs:
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    # Verifies the Rust version advertised in Cargo metadata, on the exact
+    # tracked dependency set. RUSTUP_TOOLCHAIN (set by the action) overrides
+    # rust-toolchain.toml, so this job cannot silently drift onto the newer
+    # pinned toolchain; the matrix above keeps testing that toolchain.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
 
   bench-check:
     # GitHub-hosted hardware/load differs from the local benchmark baseline;

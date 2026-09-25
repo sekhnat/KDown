@@ -14,7 +14,7 @@ use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::resume::{
     CheckpointError, CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver,
     SidecarCheckpointResolver,
@@ -22,8 +22,8 @@ use kdown_engine::resume::{
 use support::fixtures::{assert_bytes_exact, deterministic_bytes, sha256_hex};
 use support::test_server::{ScriptedResponse, TestServer};
 
-fn controller() -> SingleStreamController {
-    SingleStreamController::new(
+fn controller() -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         EngineConfig::default(),
     )
@@ -31,8 +31,8 @@ fn controller() -> SingleStreamController {
 
 /// Scripted orchestration controller (§32): network-neutral cases run
 /// through the deterministic adapter — no sockets, no delays.
-fn scripted_controller(scripted: &ScriptedHttp) -> SingleStreamController {
-    SingleStreamController::with_execution(
+fn scripted_controller(scripted: &ScriptedHttp) -> DownloadController {
+    DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         EngineConfig::default(),
     )
@@ -212,7 +212,7 @@ async fn concurrent_different_urls_cannot_touch_the_same_partial_output() {
         );
     let mut config = EngineConfig::default();
     config.transfer.preallocate_output = false;
-    let first_controller = SingleStreamController::with_execution(
+    let first_controller = DownloadController::with_execution(
         HttpExecution::from_adapter(first_script.clone()),
         config.clone(),
     );
@@ -237,7 +237,7 @@ async fn concurrent_different_urls_cannot_touch_the_same_partial_output() {
 
     let second_script = ScriptedHttp::new();
     let resolver_calls = Arc::new(AtomicUsize::new(0));
-    let second_controller = SingleStreamController::with_execution(
+    let second_controller = DownloadController::with_execution(
         HttpExecution::from_adapter(second_script.clone()),
         config,
     )

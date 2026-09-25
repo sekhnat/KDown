@@ -146,7 +146,7 @@ mod tests {
     use crate::http::probe::ProbeMetadata;
     use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
     use crate::http::HttpExecution;
-    use crate::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+    use crate::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 
     fn write_temp(directory: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = directory.join(name);
@@ -350,7 +350,7 @@ mod tests {
             .expect_transfer(
                 TransferStep::new().ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
             );
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(scripted.clone()),
             EngineConfig::default(),
         );
@@ -412,7 +412,7 @@ mod tests {
             .expect_transfer(
                 TransferStep::new().ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
             );
-        let controller = SingleStreamController::with_execution(
+        let controller = DownloadController::with_execution(
             HttpExecution::from_adapter(scripted.clone()),
             EngineConfig::default(),
         );

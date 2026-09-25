@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
-use kdown_engine::job::controller::{DownloadHandle, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadHandle};
 use kdown_engine::{DownloadRequest, ResultStatus};
 
 mod support;
@@ -60,7 +60,7 @@ async fn single_stream_path_applies_job_rate_limit() {
     let mut c = cfg(64 * MIB); // below threshold: single-stream
     c.network.rate_limit = Some(MIB);
     let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
-    let controller = SingleStreamController::new(transport, c);
+    let controller = DownloadController::new(transport, c);
 
     let request = DownloadRequest::new(
         server.url("/f.bin"),
@@ -95,7 +95,7 @@ async fn segmented_path_global_limit_binds_alongside_job_limit() {
     c.network.rate_limit = Some(4 * MIB);
     c.global_rate_limit = Some(2 * MIB);
     let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
-    let controller = SingleStreamController::new(transport, c);
+    let controller = DownloadController::new(transport, c);
 
     let request = DownloadRequest::new(
         server.url("/f.bin"),
@@ -129,7 +129,7 @@ async fn global_limit_is_shared_across_jobs() {
     let mut c = cfg(1); // segmented: both jobs in parallel
     c.global_rate_limit = Some(2 * MIB);
     let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
-    let controller = SingleStreamController::new(transport, c);
+    let controller = DownloadController::new(transport, c);
 
     let (h1, _j1) = controller.start(DownloadRequest::new(
         server.url("/f.bin"),
@@ -167,7 +167,7 @@ async fn rate_update_applies_live_on_running_single_stream_job() {
     let mut c = cfg(64 * MIB);
     c.network.rate_limit = Some(MIB);
     let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
-    let controller = SingleStreamController::new(transport, c);
+    let controller = DownloadController::new(transport, c);
 
     let request = DownloadRequest::new(
         server.url("/f.bin"),
@@ -208,7 +208,7 @@ async fn cancel_stops_rate_wait_promptly() {
     let mut c = cfg(1); // segmented
     c.network.rate_limit = Some(1024);
     let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
-    let controller = SingleStreamController::new(transport, c);
+    let controller = DownloadController::new(transport, c);
 
     let request = DownloadRequest::new(
         server.url("/f.bin"),
@@ -227,6 +227,43 @@ async fn cancel_stops_rate_wait_promptly() {
     assert!(
         outcome.is_ok(),
         "cancellation waited out the rate sleep instead of stopping promptly ({elapsed:?})"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(4),
+        "terminal took too long after cancel: {elapsed:?}"
+    );
+}
+
+/// Sequential-path mirror of the segmented cancellation test: a running
+/// single-stream job must also stop promptly out of a long combined
+/// rate-limit wait (the shared combiner must not change cancellation
+/// semantics).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_stops_sequential_rate_wait_promptly() {
+    let size = MIB; // below any segmentation threshold: single-stream
+    let server = start_server(vec![0x33; size as usize]).await;
+    let mut c = cfg(64 * MIB);
+    c.network.rate_limit = Some(1024); // 1 KiB/s: one chunk waits minutes
+    let transport = kdown_engine::http::HttpTransport::from_config(&c).expect("transport");
+    let controller = DownloadController::new(transport, c);
+
+    let request = DownloadRequest::new(
+        server.url("/f.bin"),
+        std::env::temp_dir().join(format!("rl-cancel-seq-{}", std::process::id())),
+    );
+
+    let (handle, join) = controller.start(request);
+
+    // The first chunk is inside its long rate wait by now.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    handle.cancel();
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), join).await;
+    let elapsed = started.elapsed();
+    assert!(
+        outcome.is_ok(),
+        "sequential cancellation waited out the rate sleep ({elapsed:?})"
     );
     assert!(
         elapsed <= Duration::from_secs(4),

@@ -27,13 +27,13 @@ Start a job from an async application:
 
 ```rust,no_run
 use std::path::PathBuf;
-use kdown_engine::{DownloadRequest, EngineConfig, HttpTransport, SingleStreamController};
+use kdown_engine::{DownloadRequest, EngineConfig, HttpTransport, DownloadController};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = EngineConfig::default();
     let transport = HttpTransport::from_config(&config)?;
-    let controller = SingleStreamController::new(transport, config);
+    let controller = DownloadController::new(transport, config);
     let request = DownloadRequest::new(
         "https://example.test/archive.tar.zst",
         PathBuf::from("archive.tar.zst"),
@@ -107,7 +107,7 @@ HTTP/2 streams (`HttpProtocolStats::requests_h1()` / `h2_streams()` /
 are not exposed by the underlying client, so the corresponding accessor
 reports `None`: that axis is labeled unavailable rather than fabricated.
 
-A `SingleStreamController` also shares an origin registry across its jobs.
+A `DownloadController` also shares an origin registry across its jobs.
 Requests to the same final HTTP(S) origin use cancellable, fair admission;
 429/503 responses and capped `Retry-After` delay subsequent requests from
 peer jobs. Unrelated origins remain independent. This request-level gate
@@ -154,6 +154,9 @@ standalone `BufferPool` only; the transfer path does not use that pool.
 
 ## Verification
 
+Minimum supported Rust: **1.85** (`rust-version` in workspace metadata,
+verified by a dedicated CI job on the tracked `Cargo.lock` dependency set).
+
 ```sh
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -161,9 +164,22 @@ RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
 ```
 
 See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
+See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
 mapping and [`crates/engine/benches/results/baseline.md`](crates/engine/benches/results/baseline.md)
 for the loopback benchmark baseline.
 
+**Reading benchmark numbers:** recorded loopback/synthetic throughput is
+regression evidence for the specific machine and fixture it was measured on.
+It is NOT a promise of Internet download speed, and it does not imply that
+segmented downloading will beat sequential downloading for a given remote
+server. Real-world results depend on the server's range (`Range`) support
+and correctness, server/CDN throttling, round-trip latency, available
+bandwidth, HTTP version and connection behavior, the engine's connection
+limits, local disk and CPU capacity, and overall environment load. CI runs
+benchmarks as a smoke check only and never compares hosted-runner numbers
+against a workstation baseline; compare like-for-like hosts only. See
+[`docs/benchmark-profiling.md`](docs/benchmark-profiling.md) for the
+measurement procedures and their scope.
 ## Segmented transfer tuning and durability
 
 Defaults are production-safe and unchanged from earlier releases:

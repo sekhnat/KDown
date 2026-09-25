@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ProxyConfig};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 
 mod support;
 use support::fixtures;
@@ -177,7 +177,7 @@ async fn https_through_connect_proxy_with_credentials() {
     cfg.network.read_idle_timeout = std::time::Duration::from_secs(30);
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/f.bin", origin.port()),
@@ -210,7 +210,7 @@ async fn plain_http_through_proxy_uses_absolute_form() {
         url: format!("http://{proxy}/"),
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
     let result = controller.run(req).await.expect("run");
@@ -238,7 +238,7 @@ async fn proxy_auth_failure_fails_structured() {
         url: format!("http://{proxy}/"),
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
     let result = controller.run(req).await.expect("run");
@@ -273,7 +273,7 @@ async fn credential_provider_satisfies_challenge_once() {
 
     let cfg = EngineConfig::default();
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let mut req = DownloadRequest::new(
         format!("http://{origin_addr}/f.bin"),
         dir.path().join("out.bin"),
@@ -305,7 +305,7 @@ async fn bad_credentials_fail_without_loop() {
 
     let cfg = EngineConfig::default();
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let mut req = DownloadRequest::new(
         format!("http://{origin_addr}/f.bin"),
         dir.path().join("out.bin"),

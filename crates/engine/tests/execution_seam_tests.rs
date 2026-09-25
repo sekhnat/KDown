@@ -17,7 +17,7 @@ use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::{HttpExecution, HttpFailure};
 use kdown_engine::job::controller::{
-    DownloadHandle, DownloadRequest, ResultStatus, SingleStreamController,
+    DownloadController, DownloadHandle, DownloadRequest, ResultStatus,
 };
 use kdown_engine::DownloadError;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
@@ -43,8 +43,8 @@ fn cfg(threshold: u64) -> EngineConfig {
     c
 }
 
-fn scripted_controller(scripted: &ScriptedHttp, config: EngineConfig) -> SingleStreamController {
-    SingleStreamController::with_execution(HttpExecution::from_adapter(scripted.clone()), config)
+fn scripted_controller(scripted: &ScriptedHttp, config: EngineConfig) -> DownloadController {
+    DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config)
 }
 
 fn ok_probe(total: u64) -> ProbeStep {

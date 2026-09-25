@@ -83,7 +83,7 @@ impl TokenBucket {
         let burst = self.burst.load(Ordering::Relaxed) as f64;
         let mut st = self.state.lock().expect("bucket lock");
         refill(&mut st, rate, burst);
-        // Negative-balance accounting (task 7.1): the balance may go below
+        // Negative-balance accounting: the balance may go below
         // zero by the requested bytes; the caller sleeps the deficit off
         // while refill climbs back. Keeping the debit inside the balance
         // (instead of zeroing it and leaving the wait's accrual for the
@@ -173,22 +173,18 @@ impl RateLimiter {
     }
 
     /// Account payload bytes through every level; the slowest level's wait
-    /// governs.
+    /// governs (see `dominant_wait` in this module). Each applicable bucket
+    /// accounts for the bytes exactly once per call, so later callers wait
+    /// for the balance the earlier callers left behind.
     pub fn acquire(&self, bytes: u64) -> Acquisition {
-        let mut worst = Acquisition { wait: None };
-        if let Some(g) = &self.global {
-            let a = g.acquire(bytes);
-            if a.wait.is_some() {
-                worst = a;
-            }
+        let global_wait = self
+            .global
+            .as_ref()
+            .map(|bucket| bucket.acquire(bytes).wait);
+        let job_wait = self.job.as_ref().map(|bucket| bucket.acquire(bytes).wait);
+        Acquisition {
+            wait: dominant_wait([global_wait.unwrap_or(None), job_wait.unwrap_or(None)]),
         }
-        if let Some(j) = &self.job {
-            let a = j.acquire(bytes);
-            if a.wait.is_some() {
-                worst = a;
-            }
-        }
-        worst
     }
 
     pub async fn acquire_async(&self, bytes: u64) {
@@ -198,9 +194,103 @@ impl RateLimiter {
     }
 }
 
+/// The effective wait when several buckets gate the same payload: the
+/// slowest (largest) required delay governs, and unlimited/absent buckets
+/// contribute nothing. Evaluation order must never change the result. Both
+/// transfer paths and the hierarchical limiter share this function so they
+/// cannot silently disagree on which wait wins.
+pub(crate) fn dominant_wait(
+    waits: [Option<std::time::Duration>; 2],
+) -> Option<std::time::Duration> {
+    match waits {
+        [Some(a), Some(b)] => Some(a.max(b)),
+        [Some(a), None] => Some(a),
+        [None, b] => b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Order-independence and max semantics of the shared wait combiner,
+    /// independent of any wall clock.
+    #[test]
+    fn dominant_wait_takes_the_maximum() {
+        let d = |ms: u64| Some(std::time::Duration::from_millis(ms));
+        assert_eq!(dominant_wait([d(2_000), d(1_000)]), d(2_000));
+        assert_eq!(dominant_wait([d(1_000), d(2_000)]), d(2_000));
+        assert_eq!(dominant_wait([d(1_000), d(1_000)]), d(1_000));
+        assert_eq!(dominant_wait([d(1_000), None]), d(1_000));
+        assert_eq!(dominant_wait([None, d(1_000)]), d(1_000));
+        assert_eq!(dominant_wait([None, None]), None);
+    }
+
+    #[test]
+    fn hierarchy_global_slower_than_job() {
+        // Zero burst: every acquire waits for the full debit at the rate.
+        let global = Arc::new(TokenBucket::with_burst(1_000, 0));
+        let job = Arc::new(TokenBucket::with_burst(1_000_000, 0));
+        let limiter = RateLimiter::with_global(global).with_job(job);
+        let a = limiter.acquire(1_000);
+        let wait = a.wait.expect("global limit must gate");
+        assert!(
+            wait >= Duration::from_millis(900) && wait <= Duration::from_secs(1),
+            "slowest (global) wait must govern: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn hierarchy_job_slower_than_global() {
+        let global = Arc::new(TokenBucket::with_burst(1_000_000, 0));
+        let job = Arc::new(TokenBucket::with_burst(1_000, 0));
+        let limiter = RateLimiter::with_global(global).with_job(job);
+        let a = limiter.acquire(1_000);
+        let wait = a.wait.expect("job limit must gate");
+        assert!(
+            wait >= Duration::from_millis(900) && wait <= Duration::from_secs(1),
+            "slowest (job) wait must govern: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn hierarchy_equal_waits_and_single_debit_per_bucket() {
+        let global = Arc::new(TokenBucket::with_burst(1_000, 0));
+        let job = Arc::new(TokenBucket::with_burst(1_000, 0));
+        let limiter = RateLimiter::with_global(global).with_job(job);
+        let first = limiter.acquire(1_000).wait.expect("must wait");
+        assert!(
+            first >= Duration::from_millis(900) && first <= Duration::from_secs(1),
+            "equal waits must combine to that wait: {first:?}"
+        );
+        // Each bucket debited the bytes exactly once: the next identical
+        // acquire owes ~2 s, not ~3 s (double debit) or ~1 s (missed debit).
+        let second = limiter.acquire(1_000).wait.expect("must wait");
+        assert!(
+            second >= Duration::from_millis(1_900) && second <= Duration::from_millis(2_100),
+            "second acquire must reflect one debit per bucket: {second:?}"
+        );
+    }
+
+    #[test]
+    fn hierarchy_only_one_level_active() {
+        let only_global = RateLimiter::with_global(Arc::new(TokenBucket::with_burst(1_000, 0)));
+        let wait = only_global.acquire(1_000).wait.expect("global must gate");
+        assert!(wait >= Duration::from_millis(900), "{wait:?}");
+
+        let only_job =
+            RateLimiter::unlimited().with_job(Arc::new(TokenBucket::with_burst(1_000, 0)));
+        let wait = only_job.acquire(1_000).wait.expect("job must gate");
+        assert!(wait >= Duration::from_millis(900), "{wait:?}");
+    }
+
+    #[test]
+    fn hierarchy_both_unlimited_never_waits() {
+        let limiter = RateLimiter::with_global(Arc::new(TokenBucket::new(0)))
+            .with_job(Arc::new(TokenBucket::new(0)));
+        assert_eq!(limiter.acquire(u64::MAX / 2).wait, None);
+    }
 
     #[test]
     fn unlimited_has_zero_overhead_path() {
@@ -263,7 +353,7 @@ mod tests {
         assert_eq!(limiter.acquire(u64::MAX / 2).wait, None);
     }
 
-    /// Contended limited-mode probe (task 7.2, #[ignore]: run explicitly
+    /// Contended limited-mode probe (run explicitly
     /// with `cargo test -p kdown-engine --lib -- --ignored --nocapture`).
     /// Measures ns/acquire for N workers hammering a shared limited bucket
     /// with 64 KiB acquires — the segmented worker pattern (one acquire per

@@ -15,7 +15,7 @@ use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::DownloadError;
 
 use kdown_engine::metrics::events::{Event, EventStream};
@@ -150,7 +150,7 @@ async fn run_mode(segmented: bool, scenario: &Scenario) -> (ResultStatus, Option
         scripted = scripted.expect_transfer(step);
     }
     let dir = tempfile::tempdir().expect("tmp");
-    let c = SingleStreamController::with_execution(
+    let c = DownloadController::with_execution(
         HttpExecution::from_adapter(scripted.clone()),
         mode_cfg(segmented),
     );
@@ -250,10 +250,8 @@ async fn run_completion_mode(
     let dir = tempfile::tempdir().expect("tmp");
     let destination = dir.path().join("completion.bin");
     std::fs::write(&destination, b"previous destination").expect("seed old destination");
-    let controller = SingleStreamController::with_execution(
-        HttpExecution::from_adapter(scripted.clone()),
-        config,
-    );
+    let controller =
+        DownloadController::with_execution(HttpExecution::from_adapter(scripted.clone()), config);
     let mut request = DownloadRequest::new("https://parity/completion.bin", destination.clone());
     request.expected_size = Some(TOTAL);
     request.overwrite = OverwritePolicy::Replace;

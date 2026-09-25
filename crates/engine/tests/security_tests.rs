@@ -17,7 +17,7 @@ use std::sync::Arc;
 use kdown_engine::config::{ConnectionTarget, EngineConfig, NetworkPolicy};
 use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::{config::AddressFilter, io::sanitize_filename};
 
 mod support;
@@ -122,7 +122,7 @@ async fn invalid_certificate_fails_by_default() {
     let mut cfg = EngineConfig::default();
     cfg.tls.custom_ca_bundle = None; // platform roots: self-signed not trusted
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
@@ -153,7 +153,7 @@ async fn custom_ca_bundle_honored() {
     let mut cfg = EngineConfig::default();
     cfg.tls.custom_ca_bundle = Some(ca_path);
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
@@ -175,7 +175,7 @@ async fn hostname_validation_enforced_with_custom_ca() {
     let mut cfg = EngineConfig::default();
     cfg.tls.custom_ca_bundle = Some(ca_path);
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
@@ -251,7 +251,7 @@ async fn redirect_to_other_host_strips_credentials() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = EngineConfig::default();
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let mut req = DownloadRequest::new(server.url("/start"), dir.path().join("out.bin"));
     req.headers.push((
         "Authorization".to_string(),
@@ -335,7 +335,7 @@ async fn endless_headers_bounded() {
     let mut cfg = EngineConfig::default();
     cfg.network.response_header_timeout = std::time::Duration::from_secs(5);
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(format!("http://{addr}/f.bin"), dir.path().join("out.bin"));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
@@ -377,7 +377,7 @@ async fn ssrf_hook_blocks_disallowed_targets() {
         ..EngineConfig::default()
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(server.url("/f.bin"), dir.path().join("out.bin"));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Failed);
@@ -422,7 +422,7 @@ async fn ssrf_hook_allows_permitted_targets() {
         ..EngineConfig::default()
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(server.url("/f.bin"), dir.path().join("out.bin"));
     let result = controller.run(req).await.expect("run");
     assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);

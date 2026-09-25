@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 
 mod support;
 use support::fixtures;
@@ -139,7 +139,7 @@ async fn h2_segmented_download_is_byte_exact() {
     let mut cfg = h2_cfg(&ca_path);
     cfg.h2_policy = H2ConnectionPolicy::Single;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
@@ -172,7 +172,7 @@ async fn h2_additional_connections_policy_hook() {
     cfg.pool.max_per_origin = 4;
     cfg.max_connections_per_origin = 4;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
@@ -211,7 +211,7 @@ async fn h2_single_connection_default_multiplexes() {
 
     let cfg = h2_cfg(&ca_path);
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
@@ -252,7 +252,7 @@ async fn h2_pipelined_segmented_download_is_byte_exact_on_one_connection() {
     cfg.write_executor.pipeline_writes = true;
     cfg.write_executor.writer_threads = 2;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
@@ -297,7 +297,7 @@ async fn h2_pipelined_respects_additional_connections_policy() {
     cfg.write_executor.pipeline_writes = true;
     cfg.write_executor.writer_threads = 2;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
@@ -450,7 +450,7 @@ async fn h2_adaptive_growth_not_capped_by_connection_limits() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let (handle, join) = controller.start(DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
         dest.clone(),
@@ -530,7 +530,7 @@ async fn h2_additional_policy_stays_compatible_with_adaptive() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let (handle, join) = controller.start(DownloadRequest::new(
         format!("https://localhost:{}/file.bin", addr.port()),
         dest.clone(),

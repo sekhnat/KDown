@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::metrics::EngineMetrics;
 
 mod support;
@@ -23,7 +23,7 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
     let cfg = EngineConfig::default();
     let metrics = EngineMetrics::shared();
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::with_metrics(transport, cfg, metrics.clone());
+    let controller = DownloadController::with_metrics(transport, cfg, metrics.clone());
 
     let ok = controller
         .run(DownloadRequest::new(

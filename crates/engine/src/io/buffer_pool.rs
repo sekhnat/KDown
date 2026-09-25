@@ -94,7 +94,7 @@ impl BufferPool {
         self.outstanding() * self.buffer_size
     }
 
-    /// Try to take a buffer WITHOUT blocking (task 10.2): `None` when the
+    /// Try to take a buffer WITHOUT blocking: `None` when the
     /// pool is at its byte budget with nothing idle — the caller decides
     /// how to wait. Never allocates beyond the budget, never blocks.
     #[must_use]
@@ -108,7 +108,7 @@ impl BufferPool {
     }
 
     /// Take a buffer, waiting async-safely when the pool is exhausted
-    /// (task 10.2): the wait happens in ONE blocking task on the condvar —
+    ///: the wait happens in ONE blocking task on the condvar —
     /// never a polling loop on the async executor.
     pub async fn acquire(self: &Arc<Self>) -> PooledBuffer {
         // Fast path: available right now (no extra task).
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(pool.outstanding(), 8);
         assert_eq!(pool.bytes_outstanding(), 1024 * 1024);
         // Budget exhausted: try_acquire is GENUINELY nonblocking and
-        // returns None (task 10.2) — no sentinel, no wait.
+        // returns None — no sentinel, no wait.
         assert!(
             pool.try_acquire().is_none(),
             "exhausted pool reports None immediately"

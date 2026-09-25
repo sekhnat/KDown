@@ -1,4 +1,4 @@
-//! Resume admission protocol (§15.5, §26, tasks 4.4-4.6).
+//! Resume admission protocol (§15.5, §26).
 //!
 //! Admission is one deep decision owned by this module: the controller
 //! begins admission (policy-aware checkpoint loading) before probing and
@@ -358,7 +358,7 @@ fn validate_temp_file(cp: &Checkpoint, temp_path: &Path) -> Result<(), DownloadE
 /// # Errors
 /// [`DownloadError`] on I/O failure, unsupported algorithm, or digest
 /// mismatch.
-#[allow(dead_code)] // consumed in task 4.4 controller wiring
+#[allow(dead_code)] // consumed in  controller wiring
 pub(crate) fn verify_digests(
     path: &Path,
     algorithms: &[(String, String)],

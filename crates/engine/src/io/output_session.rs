@@ -1,7 +1,7 @@
 //! Crate-private owner for one temporary output's open handle and partial-file policy.
 //!
-//! The session is the sole lifecycle owner of the temp file (design D1,
-//! task 2.2): it prepares, synchronizes, aborts and publishes. During
+//! The session is the sole lifecycle owner of the temp file (design D1):
+//! it prepares, synchronizes, aborts and publishes. During
 //! segmented transfer it lends bounded, cloneable **write-only** capabilities
 //! over the shared immutable file handle — each capability writes complete
 //! buffers at absolute offsets through the checked positional adapter, with
@@ -59,7 +59,7 @@ impl std::fmt::Debug for SharedOutput {
 }
 
 /// A worker-scoped, clonable write-only capability over the shared handle
-/// (task 2.2). It can positionally write complete buffers at absolute
+///. It can positionally write complete buffers at absolute
 /// offsets; it cannot flush, synchronize, resize, abort or publish.
 /// Dropping the capability releases its lease on the handle.
 pub(crate) struct OutputWriteHandle {
@@ -76,7 +76,7 @@ impl Drop for OutputWriteHandle {
 }
 
 impl OutputWriteHandle {
-    /// Explicit counted clone (task 1.4): the dynamic writer-lane lifecycle
+    /// Explicit counted clone: the dynamic writer-lane lifecycle
     /// lends the capability to a lane on activation and gets it back on
     /// shutdown, so `writers_alive` tracks every live clone.
     #[must_use]
@@ -90,7 +90,7 @@ impl OutputWriteHandle {
         }
     }
 
-    /// Synchronous positional write used by blocking writer lanes (task 2.3).
+    /// Synchronous positional write used by blocking writer lanes.
     /// Scripted output faults apply at this capability boundary.
     ///
     /// # Errors
@@ -104,7 +104,7 @@ impl OutputWriteHandle {
     }
 }
 
-/// Synchronization capability over the shared output file (task 3.3).
+/// Synchronization capability over the shared output file.
 /// Does not move any cursor and does not require exclusivity: concurrent
 /// positional writers keep writing while the sync flushes everything
 /// acknowledged so far.
@@ -227,7 +227,7 @@ impl OutputSession {
         }
     }
 
-    /// Lend write-only capabilities to segmented workers (task 2.2). The
+    /// Lend write-only capabilities to segmented workers. The
     /// session retains lifecycle/sync ownership and cannot finalize, abort,
     /// resize or publish until `reclaim_exclusive` succeeds.
     pub(crate) fn share_write_handles(
@@ -499,7 +499,7 @@ mod tests {
     }
 
     /// Exclusive operations are blocked while any writer capability is alive;
-    /// dropping all capabilities restores reclaim/finalize/publish (task 2.2).
+    /// dropping all capabilities restores reclaim/finalize/publish.
     #[tokio::test]
     async fn cannot_publish_while_writers_live() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -526,7 +526,7 @@ mod tests {
         assert!(session.flush(FlushLevel::PageCache).is_err());
 
         // Both capabilities can write concurrently at disjoint offsets
-        // through their blocking writer lanes (task 2.3).
+        // through their blocking writer lanes.
         let lane1 = super::super::writer_lane::WriterLane::spawn(first);
         let lane2 = super::super::writer_lane::WriterLane::spawn(second);
         let (h1, h2) = (lane1.handle(), lane2.handle());
@@ -551,7 +551,7 @@ mod tests {
 
     /// Write-only capabilities expose no flush/sync/size/abort authority:
     /// the type simply has no such methods (compile-time separation), and
-    /// out-of-order disjoint positional writes land exactly (task 2.2/2.3).
+    /// out-of-order disjoint positional writes land exactly.
     #[tokio::test]
     async fn capabilities_write_out_of_order_at_disjoint_offsets() {
         let directory = tempfile::tempdir().expect("tempdir");

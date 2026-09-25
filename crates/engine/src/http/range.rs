@@ -1,4 +1,4 @@
-//! Range request framing and response validation (§11.2, task 5.4).
+//! Range request framing and response validation (§11.2).
 //!
 //! The validation gate accepts metadata *before* any body byte is written:
 //! a 206 must carry a `Content-Range` starting exactly at the requested

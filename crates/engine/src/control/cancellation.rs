@@ -16,7 +16,7 @@ struct Inner {
     /// Separate pause flag: pause must stop network reads (§9.3) but is
     /// distinct from terminal cancellation.
     paused: AtomicBool,
-    /// Versioned state signal (task 7.2): 0 = running, 1 = paused,
+    /// Versioned state signal: 0 = running, 1 = paused,
     /// 2 = cancelled. Published AFTER every flag change so parked waiters
     /// wake on transitions without fixed-duration polling. The atomics stay
     /// the synchronous fast path; the watch is the wake mechanism.
@@ -46,7 +46,7 @@ impl CancellationToken {
         self.publish_state(2);
     }
 
-    /// Publish the versioned state after a flag change (task 7.2): waiters
+    /// Publish the versioned state after a flag change: waiters
     /// registered before the change are woken.
     fn publish_state(&self, state: u8) {
         let _ = self.inner.state_tx.send(state);
@@ -78,7 +78,7 @@ impl CancellationToken {
     /// Resolve when cancelled (or paused, optionally) — async wait point
     /// for workers between chunk reads/writes. Watches the versioned state
     /// signal: register-before-check, then wait for the next transition —
-    /// no fixed-duration polling (task 7.2).
+    /// no fixed-duration polling.
     pub async fn cancelled_or_paused(&self) -> CancellationReason {
         let mut rx = self.inner.state_tx.subscribe();
         loop {
@@ -106,7 +106,7 @@ impl CancellationToken {
     }
 
     /// Resolve only on terminal cancellation (not pause) — the parked-worker
-    /// wait (task 7.2): wakes via the versioned state signal, no polling.
+    /// wait: wakes via the versioned state signal, no polling.
     pub async fn cancelled(&self) {
         let mut rx = self.inner.state_tx.subscribe();
         loop {
@@ -127,7 +127,7 @@ impl CancellationToken {
     }
 
     /// Wait until the pause lifts (`true`) or the token is cancelled
-    /// (`false`) — the parked-worker resume wait (task 7.2): wakes on
+    /// (`false`) — the parked-worker resume wait: wakes on
     /// unpause/cancel via the versioned signal, never by fixed polling.
     pub async fn wait_for_resume(&self) -> bool {
         let mut rx = self.inner.state_tx.subscribe();

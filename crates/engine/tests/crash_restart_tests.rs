@@ -16,7 +16,7 @@ use std::time::Duration;
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::io::sink::Sink as _;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::resume::checkpoint_store::CheckpointStore as _;
 use kdown_engine::resume::{job_identity, DurabilityMode, FileCheckpointStore};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
@@ -29,20 +29,20 @@ fn fast_config() -> EngineConfig {
     }
 }
 
-fn controller() -> SingleStreamController {
+fn controller() -> DownloadController {
     let mut cfg = fast_config();
     // Roomier attempts for the multi-kill runs.
     cfg.retry.max_attempts_per_segment = 16;
-    SingleStreamController::new(
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     )
 }
 
-fn sequential_controller() -> SingleStreamController {
+fn sequential_controller() -> DownloadController {
     let mut cfg = fast_config();
     cfg.transfer.segmentation_threshold = u64::MAX;
-    SingleStreamController::new(
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     )
@@ -285,7 +285,7 @@ async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
     let mut cfg = fast_config();
     cfg.transfer.durability = kdown_engine::config::DurabilityMode::Durable;
     {
-        let c = SingleStreamController::new(
+        let c = DownloadController::new(
             HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
             cfg.clone(),
         );
@@ -318,7 +318,7 @@ async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
     assert!(leftovers.is_empty(), "no temp residue: {leftovers:?}");
 
     // Fresh controller resumes byte-exact (§36.3).
-    let c2 = SingleStreamController::new(
+    let c2 = DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     );
@@ -515,7 +515,7 @@ async fn pipelined_kill_during_segment_write_then_resume() {
     // Tiny read-ahead churns executor reservations across retries, so any
     // permit leak would stall the pipeline instead of completing.
     cfg.write_budget.worker_read_ahead_bytes = 2 * u64::from(cfg.read_buffer_size);
-    let c = SingleStreamController::new(
+    let c = DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     );
@@ -570,7 +570,7 @@ async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
         cfg.write_executor.pipeline_writes = true;
         cfg.write_executor.writer_threads = 2;
         {
-            let c = SingleStreamController::new(
+            let c = DownloadController::new(
                 HttpTransport::new(kdown_engine::config::NetworkPolicy::default())
                     .expect("transport"),
                 cfg.clone(),
@@ -601,7 +601,7 @@ async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
         }
         assert!(!dest.exists(), "{durability:?}: no published output");
 
-        let c = SingleStreamController::new(
+        let c = DownloadController::new(
             HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
             cfg,
         );

@@ -1,4 +1,4 @@
-//! Fuzz entry points (§36.5, task 7.4) shared by `cargo fuzz` targets and
+//! Fuzz entry points (§36.5) shared by `cargo fuzz` targets and
 //! the corpus smoke test.
 //!
 //! Malformed metadata must fail safely: no panics, no memory corruption,

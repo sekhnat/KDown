@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, NetworkPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 
 mod support;
 use support::fixtures;
@@ -43,7 +43,7 @@ async fn per_origin_limit_holds_with_two_jobs() {
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let limits = transport.connection_limits().clone();
-    let controller = SingleStreamController::new(transport, cfg.clone());
+    let controller = DownloadController::new(transport, cfg.clone());
 
     let dir = tempfile::tempdir().expect("tmpdir");
     let dest_a = dir.path().join("a.bin");
@@ -125,7 +125,7 @@ async fn other_origin_unaffected_by_first_origin_limit() {
     cfg.pool.max_per_origin = 2;
     cfg.max_connections_per_origin = 2;
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
 
     let dir = tempfile::tempdir().expect("tmpdir");
     let req = DownloadRequest::new(format!("{base}one.bin"), dir.path().join("one.bin"));
@@ -156,7 +156,7 @@ async fn stale_pooled_connection_retried_safely() {
         ..EngineConfig::default()
     };
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
-    let controller = SingleStreamController::new(transport, cfg);
+    let controller = DownloadController::new(transport, cfg);
     let dir = tempfile::tempdir().expect("tmpdir");
 
     // Sequential downloads reuse the pooled connection between requests;

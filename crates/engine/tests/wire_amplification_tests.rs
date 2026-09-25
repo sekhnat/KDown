@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, SegmentSizing, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -89,7 +89,7 @@ async fn live_tail_split_never_doubles_wire_payload() {
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("amp.bin");
 
-    let c = SingleStreamController::new(
+    let c = DownloadController::new(
         HttpTransport::new(cfg(len).network).expect("transport"),
         cfg(len),
     );
@@ -358,7 +358,7 @@ async fn run_h2_split_case(seed: u64, pipeline: bool, label: &str) {
         config.write_executor.pipeline_writes = true;
         config.write_executor.writer_threads = 2;
     }
-    let c = SingleStreamController::new(
+    let c = DownloadController::new(
         HttpTransport::from_config(&config).expect("transport"),
         config,
     );
@@ -411,7 +411,7 @@ async fn live_tail_split_pipelined_duration_holds_amplification_bound() {
     config.write_executor.pipeline_writes = true;
     config.write_executor.writer_threads = 2;
     config.transfer.segment_sizing = SegmentSizing::Duration { duration_ms: 1_000 };
-    let c = SingleStreamController::new(
+    let c = DownloadController::new(
         HttpTransport::from_config(&config).expect("transport"),
         config,
     );

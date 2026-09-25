@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadRequest, ResultStatus, SingleStreamController};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::job::state::JobState;
 use support::fixtures::deterministic_bytes;
 use support::test_server::{ScriptedResponse, TestServer};
 
-fn controller() -> SingleStreamController {
-    SingleStreamController::new(
+fn controller() -> DownloadController {
+    DownloadController::new(
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         EngineConfig::default(),
     )

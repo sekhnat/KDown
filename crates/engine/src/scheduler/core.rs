@@ -16,7 +16,7 @@ use crate::resume::checkpoint::ByteRange;
 use crate::scheduler::interval_set::IntervalSet;
 use crate::scheduler::lease::{LeaseId, SegmentLease};
 
-/// How initial lease sizes are chosen (task 6.1).
+/// How initial lease sizes are chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetSelector {
     /// No target: carve up to `max_segment_size` (pre-change carving; used
@@ -25,14 +25,14 @@ pub enum TargetSelector {
     /// Explicit target: honor the configured `initial_segment_size`
     /// (design D5: fix the ignored behavior; clamped to [min, max]).
     Explicit(u64),
-    /// Opt-in automatic target (task 6.1, spec: initial candidate is
+    /// Opt-in automatic target (initial candidate is
     /// `ceil(remaining / (initial workers × oversubscription))` clamped to
     /// bounds; remaining computed from validated intervals, not total).
     Automatic {
         initial_workers: u64,
         oversubscription: u64,
     },
-    /// Opt-in duration-informed target (task 3.4, design D4): each new
+    /// Opt-in duration-informed target: each new
     /// lease aims to hold the connection for about `duration_ms`, sized
     /// from the smoothed per-lease unique goodput the scheduler itself
     /// samples at acquire/complete. Until enough samples stabilize the
@@ -42,17 +42,17 @@ pub enum TargetSelector {
     Duration { duration_ms: u64, seed_size: u64 },
 }
 
-/// Scheduler shaping parameters (§12.2-§12.3, task 6.1).
+/// Scheduler shaping parameters (§12.2-§12.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerPolicy {
     pub min_segment_size: u64,
     pub max_segment_size: u64,
-    /// Initial-lease target selector (task 6.1).
+    /// Initial-lease target selector.
     pub target: TargetSelector,
-    /// Minimum tail worth splitting (task 6.2): scheduler-owned split
+    /// Minimum tail worth splitting: scheduler-owned split
     /// policy replaces the worker's hard-coded 256 KiB constant.
     pub split_threshold: u64,
-    /// Ready-work divisor (task 3.3, design D4): when nonzero, each carve
+    /// Ready-work divisor: when nonzero, each carve
     /// is capped at `gap_len / divisor` (bounded below by the minimum
     /// segment within the gap) so roughly `divisor` unclaimed leases stay
     /// pending behind the active ones — workers acquire pending work
@@ -78,7 +78,7 @@ impl SchedulerPolicy {
         }
     }
 
-    /// Full policy (task 6.1): explicit/automatic target plus split
+    /// Full policy: explicit/automatic target plus split
     /// threshold, clamped safely.
     #[must_use]
     pub fn with_target(
@@ -94,7 +94,7 @@ impl SchedulerPolicy {
     }
 
     /// The resolved target for a selector against `pending_bytes` of
-    /// remaining coverage (task 6.1). Computed once at initialization: the
+    /// remaining coverage. Computed once at initialization: the
     /// automatic target derives from the INITIAL remaining (validated
     /// intervals — including resumed state), never the total length.
     #[must_use]
@@ -118,15 +118,15 @@ impl SchedulerPolicy {
                 pending_bytes.max(1).div_ceil(workers.max(1))
             }
             // Duration mode seeds from the explicit size until per-lease
-            // samples stabilize (task 3.4).
+            // samples stabilize.
             TargetSelector::Duration { seed_size, .. } => *seed_size,
         };
         Some(raw.clamp(min_segment_size, max_segment_size))
     }
 
     /// The target lease length for the next carve from a gap of `gap_len`
-    /// bytes (task 6.1): the resolved target clamped to the gap, further
-    /// capped by the ready-work divisor when enabled (task 3.3) — where the
+    /// bytes: the resolved target clamped to the gap, further
+    /// capped by the ready-work divisor when enabled — where the
     /// remaining gap permits (≥ divisor × minimum segment), the carve
     /// leaves roughly `divisor` unclaimed leases of pending work behind.
     #[must_use]
@@ -139,9 +139,9 @@ impl SchedulerPolicy {
         self.apply_ready_work_cap(want, gap_len)
     }
 
-    /// Ready-work cap (task 3.3): reserve roughly (divisor - 1)
+    /// Ready-work cap: reserve roughly (divisor - 1)
     /// minimum-sized unclaimed leases behind a carve while the gap permits
-    /// (design D4) — workers acquire pending ranges instead of splitting
+    /// — workers acquire pending ranges instead of splitting
     /// live tails.
     #[must_use]
     pub fn apply_ready_work_cap(&self, want: u64, gap_len: u64) -> u64 {
@@ -175,19 +175,19 @@ pub struct SegmentScheduler {
     next_lease: LeaseId,
     generation: u64,
     policy: SchedulerPolicy,
-    /// The target resolved once at initialization (task 6.1); `None` =
+    /// The target resolved once at initialization; `None` =
     /// carve up to max (legacy behavior).
     resolved_target: Option<u64>,
-    /// Duration-target state (task 3.4): EWMA of observed per-lease unique
+    /// Duration-target state: EWMA of observed per-lease unique
     /// goodput (bytes/ms) plus the last allocation size for the bounded
     /// step change. `None` when the selector is not duration-informed.
     duration_target: Option<DurationTarget>,
     /// When each active lease was acquired (or last resized by a split) —
-    /// the duration sampler's denominator (task 3.4).
+    /// the duration sampler's denominator.
     acquired_at: HashMap<LeaseId, std::time::Instant>,
 }
 
-/// EWMA state for the duration-informed selector (task 3.4). Samples are
+/// EWMA state for the duration-informed selector. Samples are
 /// per-lease: unique accepted bytes divided by the wall time the lease was
 /// held (acquire/resize → complete), which includes the HTTP request setup
 /// — the RTT/request-cost guard falls out of the measurement instead of a
@@ -240,7 +240,7 @@ impl DurationTarget {
     }
 
     /// The next allocation size (bytes), clamped to `[min, max]` and to a
-    /// 2× step change from the previous allocation (design D4).
+    /// 2× step change from the previous allocation.
     fn next_size(&self, min: u64, max: u64, gap_len: u64) -> u64 {
         if self.samples < DURATION_STABLE_SAMPLES {
             // Not stabilized: fall back to the explicit seed size.
@@ -333,9 +333,9 @@ impl SegmentScheduler {
         self.generation
     }
 
-    /// The target lease length for the next carve (task 3.4): the
+    /// The target lease length for the next carve: the
     /// duration-informed allocation when enabled, otherwise the resolved
-    /// policy target — both then bounded by the ready-work cap (task 3.3).
+    /// policy target — both then bounded by the ready-work cap.
     #[must_use]
     fn target_len_for_gap(&self, gap_len: u64) -> u64 {
         let want = if let Some(duration_target) = &self.duration_target {
@@ -398,7 +398,7 @@ impl SegmentScheduler {
     }
 
     /// Reconcile lock-free worker progress cells into active leases
-    /// (§13.3, task 6.3). Each worker publishes `(lease_id, generation,
+    /// (§13.3). Each worker publishes `(lease_id, generation,
     /// durable_through)` with atomics on the chunk path; this pulls those
     /// into the scheduler at lease-boundary moments (complete/fail/split,
     /// checkpoint cadence). Cells for unknown/expired leases are skipped.
@@ -409,7 +409,7 @@ impl SegmentScheduler {
         cells
             .iter()
             .map(|cell| {
-                // One coherent record per cell (task 3.2): id, generation and
+                // One coherent record per cell: id, generation and
                 // written-through always come from the same publication.
                 let Some(record) = cell.snapshot() else {
                     return 0;
@@ -422,7 +422,7 @@ impl SegmentScheduler {
                     return 0; // stale generation: rejected, no coverage
                 }
                 let after = self.lease_next_offset(record.lease_id).unwrap_or(before);
-                // The accepted delta (task 5.4): only bytes the scheduler
+                // The accepted delta: only bytes the scheduler
                 // ACCEPTED within the validated lease count as unique
                 // completed coverage — writes beyond a shrunk (split) lease
                 // end are clamped away here, never double-counted.
@@ -460,7 +460,7 @@ impl SegmentScheduler {
         true
     }
 
-    /// Fold one settled lease into the duration sampler (task 3.4): unique
+    /// Fold one settled lease into the duration sampler: unique
     /// accepted bytes over the wall time the lease was held. Completion
     /// samples the full span; a failed lease samples only its acknowledged
     /// prefix (re-receiving the tail is not useful goodput).
@@ -520,7 +520,7 @@ impl SegmentScheduler {
     /// Split: take the unconsumed tail of an active lease for an idle
     /// worker (§12.3). Only bytes at/after `max(next_offset,
     /// received_through)` may move — bytes read, queued or already received
-    /// for write by the original worker are excluded (task 3.2): the split
+    /// for write by the original worker are excluded: the split
     /// boundary is the original request's receipt high-watermark, so the
     /// new lease never re-requests payload the original already pulled.
     /// Returns the new lease covering the tail. Stale generations are
@@ -586,14 +586,14 @@ impl SegmentScheduler {
         self.generation
     }
 
-    /// Refresh the ready-work divisor (task 3.3): the job recomputes
+    /// Refresh the ready-work divisor: the job recomputes
     /// `ready_factor × desired_workers` when the desired count changes.
     /// Zero disables the ready-work cap.
     pub fn set_ready_work_divisor(&mut self, divisor: u64) {
         self.policy.ready_work_divisor = divisor;
     }
 
-    /// The live acknowledged frontier of an active lease (task 5.4: the
+    /// The live acknowledged frontier of an active lease (the
     /// reconciliation's accepted-delta accounting needs the before/after).
     #[must_use]
     pub fn lease_next_offset(&self, lease_id: LeaseId) -> Option<u64> {
@@ -601,7 +601,7 @@ impl SegmentScheduler {
     }
 
     /// The live (possibly split-shrunk) inclusive end of an active lease
-    /// (task 3.2): the owning worker stops consuming its body at this
+    ///: the owning worker stops consuming its body at this
     /// boundary so a shrunken request never streams past its shrunken
     /// ownership. `None` for unknown/expired leases.
     #[must_use]
@@ -614,21 +614,21 @@ impl SegmentScheduler {
     }
 
     /// Whether any lease is active — a direct state query that allocates
-    /// nothing (task 6.2; replaces `active_leases().is_empty()` idle checks).
+    /// nothing (; replaces `active_leases().is_empty()` idle checks).
     #[must_use]
     pub fn has_active(&self) -> bool {
         !self.active.is_empty()
     }
 
     /// Whether the scheduler is finished: no pending bytes and no active
-    /// leases (task 6.2, direct query).
+    /// leases.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.pending.is_empty() && self.active.is_empty()
     }
 
     /// The largest active lease whose tail exceeds `min_tail` — the direct
-    /// split-eligibility query (task 6.2): no allocating vector, no
+    /// split-eligibility query: no allocating vector, no
     /// worker-side max_by_key.
     #[must_use]
     pub fn largest_splittable(&self, min_tail: u64) -> Option<SegmentLease> {
@@ -743,7 +743,7 @@ mod tests {
         SegmentScheduler::initialize(total, &[], SchedulerPolicy::new(1024, 64 * 1024))
     }
 
-    /// §13.3/§15.4 (task 6.3): chunk-path progress is published lock-free
+    /// §13.3/§15.4: chunk-path progress is published lock-free
     /// into worker cells; the scheduler only reconciles at boundary
     /// moments. Absorb must advance the lease without the worker taking a
     /// scheduler lock, and a fail after absorb must complete the prefix
@@ -922,7 +922,7 @@ mod tests {
         let mut s = sched(10_000);
         let l = s.acquire().expect("lease");
         // The worker acknowledged 2,000 bytes but has RECEIVED up to 5,000
-        // (queued/in-flight writes, task 3.2).
+        // (queued/in-flight writes).
         assert!(s.report_progress(l.id, l.generation, 2_000));
         let tail = s
             .split_tail(l.id, l.generation, 100, 5_000)
@@ -1055,7 +1055,7 @@ mod tests {
 mod target_policy_tests {
     use super::*;
 
-    /// Explicit target (task 6.1): the configured initial segment size is
+    /// Explicit target: the configured initial segment size is
     /// honored — not silently replaced by max_segment_size.
     #[test]
     fn explicit_target_is_honored() {
@@ -1091,7 +1091,7 @@ mod target_policy_tests {
         assert_eq!(l2.end - l2.start + 1, 4 * mib, "short gap: whole gap");
     }
 
-    /// Automatic target (task 6.1): ceil(remaining / (workers ×
+    /// Automatic target: ceil(remaining / (workers ×
     /// oversubscription)), clamped to bounds, computed from validated
     /// remaining intervals — enabling multiple work units per worker.
     #[test]
@@ -1126,7 +1126,7 @@ mod target_policy_tests {
     }
 
     /// Automatic target on a resumed job derives from the REMAINING
-    /// intervals, not the total length (task 6.1, spec: validated intervals).
+    /// intervals, not the total length (validated intervals).
     #[test]
     fn automatic_target_uses_remaining_after_resume() {
         let mib = 1024u64 * 1024;
@@ -1195,7 +1195,7 @@ mod target_policy_tests {
         assert_eq!(h.end - h.start + 1, 64 * mib, "huge job: clamped to max");
     }
 
-    /// Split eligibility is a scheduler-owned direct query (task 6.2): the
+    /// Split eligibility is a scheduler-owned direct query: the
     /// largest splittable lease respects the policy threshold without
     /// allocating lease vectors.
     #[test]
@@ -1215,7 +1215,7 @@ mod target_policy_tests {
         );
     }
 
-    /// is_finished (task 6.2): no pending and no active — the direct idle
+    /// is_finished: no pending and no active — the direct idle
     /// exit condition.
     #[test]
     fn is_finished_tracks_completion() {

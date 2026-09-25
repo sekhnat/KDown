@@ -1,4 +1,4 @@
-//! Bounded long-lived blocking writer lanes (task 2.3, design D1).
+//! Bounded long-lived blocking writer lanes.
 //!
 //! Each active segmented worker owns one long-lived `spawn_blocking` lane
 //! (not one per chunk): the worker submits an owned [`Bytes`] chunk and its
@@ -41,7 +41,7 @@ impl LaneHandle {
     /// Submit one payload chunk at its absolute offset and await the
     /// acknowledgment. The worker must not publish progress or read the next
     /// chunk before this resolves — one outstanding payload per worker
-    /// (task 2.3), so retained memory is one chunk.
+    ///, so retained memory is one chunk.
     ///
     /// # Errors
     /// Structured sink error from the write, or a lane-closed error when the
@@ -158,7 +158,7 @@ mod tests {
         drop(hb);
         drop(ha);
 
-        // Join lanes before reclaim (design D1).
+        // Join lanes before reclaim.
         lane_a.shutdown().await.expect("join a");
         lane_b.shutdown().await.expect("join b");
         lane_c.shutdown().await.expect("join c");

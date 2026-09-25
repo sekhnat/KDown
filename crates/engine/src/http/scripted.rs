@@ -207,19 +207,37 @@ impl ObservedCall {
             s.push_str(&format!(" full_response={p:?}"));
         }
         if !self.headers.is_empty() {
-            s.push_str(&format!(" headers={:?}", self.headers));
+            s.push_str(&format!(
+                " headers={:?}",
+                crate::redact::RedactedHeaders(&self.headers)
+            ));
         }
         s
     }
 }
 
 /// One consumed call in the request log (§32).
-#[derive(Debug, Clone)]
+/// One consumed call in the request log (§32).
+#[derive(Clone)]
 pub struct CallRecord {
     pub kind: CallKind,
     pub url: String,
     pub range: Option<(u64, u64)>,
     pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for CallRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Call records mirror the request as sent, including credential
+        // headers attached by the caller or a credential provider; debug
+        // output keeps header names but never formats their values.
+        f.debug_struct("CallRecord")
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("range", &self.range)
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
+            .finish()
+    }
 }
 
 /// Scripted body event (§32): stored chunks are yielded as `Bytes` in
@@ -487,7 +505,10 @@ impl ProbeStep {
             s.push_str(&format!(" segmentation_threshold={t}"));
         }
         if !self.headers.is_empty() {
-            s.push_str(&format!(" headers={:?}", self.headers));
+            s.push_str(&format!(
+                " headers={:?}",
+                crate::redact::RedactedHeaders(&self.headers)
+            ));
         }
         s
     }
@@ -705,7 +726,10 @@ impl TransferStep {
             s.push_str(&format!(" full_response={p:?}"));
         }
         if !self.headers.is_empty() {
-            s.push_str(&format!(" headers={:?}", self.headers));
+            s.push_str(&format!(
+                " headers={:?}",
+                crate::redact::RedactedHeaders(&self.headers)
+            ));
         }
         s
     }
@@ -719,7 +743,13 @@ fn header_mismatches(expected: &[(String, String)], actual: &[(String, String)])
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case(name) && v == value);
         if !found {
-            why.push(format!("expected header {name}: {value:?} to be present"));
+            // Expectation values may be credentials (test fixtures attach
+            // bearer tokens here); a mismatch names the header but never
+            // prints the value that was expected.
+            why.push(format!(
+                "expected header {name}: {} to be present",
+                crate::redact::REDACTED_VALUE
+            ));
         }
     }
     why
@@ -1347,7 +1377,7 @@ mod tests {
         }
     }
 
-    // ---- Task 3.1: ordering, matching, log, mismatch, assertion ----
+    // ---- Call ordering, matching, log, mismatch, assertion ----
 
     #[tokio::test]
     async fn probe_and_transfer_outcomes_follow_script_order() {
@@ -1618,7 +1648,7 @@ mod tests {
         ScriptedHttp::assert_all_consumed(&scripted);
     }
 
-    // ---- Task 3.2: outcomes, body events, gates, unordered phases ----
+    // ---- Outcomes, body events, gates, unordered phases ----
 
     #[tokio::test]
     async fn body_events_deliver_in_order_without_sockets_or_delay() {
