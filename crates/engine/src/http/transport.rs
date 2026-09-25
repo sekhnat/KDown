@@ -17,7 +17,9 @@ use hyper_util::rt::TokioExecutor;
 use crate::config::{EngineConfig, NetworkPolicy, ProxyConfig};
 use crate::control::CancellationToken;
 use crate::error::DownloadError;
-use crate::http::connect::{ConnectError, ConnectionLimits, EngineConnector};
+use crate::http::connect::{
+    ConnectError, ConnectionLimits, EngineConnector, HttpProtocol, HttpProtocolStats,
+};
 use crate::http::execution::{
     challenge, classify_hyper_body_error, range_overrun_error, retry_after, status_to_error,
     FullResponsePolicy, HttpBody, HttpBodySource, HttpExecutor, HttpFailure, ProbeOutcome,
@@ -134,6 +136,10 @@ pub struct HttpTransport {
     clients: Vec<Arc<Client<EngineConnector, Full<bytes::Bytes>>>>,
     next_client: Arc<std::sync::atomic::AtomicUsize>,
     connector: Arc<EngineConnector>,
+    /// Protocol instrumentation shared with the connector (task 5.1):
+    /// logical requests/H2 streams counted separately from physical
+    /// TCP/TLS establishments, labeled by negotiated protocol.
+    stats: Arc<HttpProtocolStats>,
     network: NetworkPolicy,
     redirect: RedirectPolicy,
     user_agent: String,
@@ -146,6 +152,7 @@ impl std::fmt::Debug for HttpTransport {
             .field("network", &self.network)
             .field("proxy", &self.proxy)
             .field("h2_connection_slots", &self.clients.len())
+            .field("protocol_stats", &self.stats)
             .finish()
     }
 }
@@ -177,10 +184,12 @@ impl HttpTransport {
         for _ in 0..slots {
             clients.push(Arc::new(Self::build_client(&connector, cfg)));
         }
+        let stats = connector.protocol_stats().clone();
         Ok(Self {
             clients,
             next_client: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             connector: Arc::new(connector),
+            stats,
             redirect: RedirectPolicy {
                 max_redirects: cfg.network.max_redirects,
                 deny_downgrade: cfg.network.deny_https_downgrade,
@@ -230,6 +239,14 @@ impl HttpTransport {
     #[must_use]
     pub fn connection_limits(&self) -> &Arc<ConnectionLimits> {
         self.connector.limits()
+    }
+
+    /// Protocol instrumentation shared with the connector (task 5.1):
+    /// logical requests/H2 streams vs physical TCP/TLS establishments,
+    /// each labeled with its negotiated protocol.
+    #[must_use]
+    pub fn protocol_stats(&self) -> &Arc<HttpProtocolStats> {
+        &self.stats
     }
 
     fn uri(&self, url: &str) -> Result<Uri, DownloadError> {
@@ -444,7 +461,6 @@ impl HttpTransport {
         let req = builder
             .body(Full::new(bytes::Bytes::new()))
             .map_err(|e| DownloadError::Protocol(format!("request build: {e}")))?;
-
         // Range requests spread across H2 connection slots (D5 hook);
         // everything else uses slot 0. Range requests round-robin so
         // `Additional { max_connections: N }` opens up to N connections
@@ -462,6 +478,15 @@ impl HttpTransport {
             .await
             .map_err(|_| DownloadError::ConnectTimeout)?
             .map_err(|e| classify_transport_error(&e))?;
+        // Logical request accounting (task 5.1): one completed request is
+        // one H2 stream when the connection negotiated HTTP/2, otherwise
+        // one HTTP/1.x request on its own connection.
+        let protocol = if resp.version() == hyper::Version::HTTP_2 {
+            HttpProtocol::Http2
+        } else {
+            HttpProtocol::Http1
+        };
+        self.stats.record_request(protocol);
         Ok(resp)
     }
 }

@@ -10,7 +10,9 @@ pub mod scripted;
 pub mod transport;
 pub mod validators;
 
-pub use connect::{ConnectError, ConnectionLimits};
+pub use connect::{
+    ConnectError, ConnectionLimits, HttpProtocol, HttpProtocolStats, H2_FLOW_CONTROL_INSTRUMENTED,
+};
 pub use execution::{
     BodyEvent, FullResponsePolicy, HttpBody, HttpBodySource, HttpExecution, HttpExecutor,
     HttpFailure, ProbeOutcome, ProbeRequest, RangeIntent, TransferIntent, TransferRequest,

@@ -598,3 +598,168 @@ async fn isolated_transient_fail_carries_configured_retry_after() {
     let path = result.final_path.clone().expect("published");
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
+
+// ---- Protocol instrumentation reconciliation (task 5.1) ----
+
+/// Server-side counters read over a raw throwaway TCP connection
+/// (`Connection: close`), so each read deterministically adds exactly one
+/// accepted connection and one served request to the totals it reports.
+fn raw_server_stats(addr: &str) -> (u64, u64, u64) {
+    use std::io::{Read as _, Write as _};
+    let mut conn = std::net::TcpStream::connect(addr).expect("stats connect");
+    conn.write_all(b"GET /__stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("stats request");
+    // The /__stats handler keeps the connection open, so half-close the
+    // write side: the server reads EOF, closes, and read_to_end returns.
+    conn.shutdown(std::net::Shutdown::Write)
+        .expect("stats half-close");
+    let mut response = Vec::new();
+    conn.read_to_end(&mut response).expect("stats response");
+    let text = String::from_utf8_lossy(&response);
+    let parse = |key: &str| {
+        text.lines()
+            .find_map(|l| {
+                l.strip_prefix(key)
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| panic!("stats key {key} missing: {text}"))
+    };
+    (parse("emitted="), parse("connections="), parse("requests="))
+}
+
+/// H1 reconciliation (task 5.1): the transport's physical-establishment and
+/// request counters match the isolated server's accepted connections and
+/// served requests exactly (raw stats reads account for their own +1/+1),
+/// every establishment/request is labeled HTTP/1, and pooling keeps
+/// establishments within the request count. H2 flow-control data stays
+/// labeled unavailable instead of fabricated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h1_connection_and_request_counters_reconcile_with_server() {
+    let server = spawn_server(&["--size", "1MiB", "--seed", "4242"]);
+    let url = format!("http://{}/f.bin", server.addr);
+    let mut cfg = EngineConfig::default();
+    cfg.network.response_header_timeout = Duration::from_secs(30);
+    cfg.network.read_idle_timeout = Duration::from_secs(30);
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.initial_segment_size = 256 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 256 * 1024;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let stats = transport.protocol_stats().clone();
+    let controller = SingleStreamController::new(transport, cfg.clone());
+
+    let (_, conns_before, reqs_before) = raw_server_stats(&server.addr);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url, dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    let (_, conns_after, reqs_after) = raw_server_stats(&server.addr);
+
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256);
+
+    // The after-read itself contributes exactly one connection and one
+    // request (Connection: close); the before-read predates the delta.
+    let server_conns = conns_after - conns_before - 1;
+    let server_requests = reqs_after - reqs_before - 1;
+    assert_eq!(
+        stats.establishments_h1(),
+        server_conns,
+        "H1 establishments must reconcile with accepted server connections"
+    );
+    assert_eq!(
+        stats.requests_h1(),
+        server_requests,
+        "H1 requests must reconcile with served server requests"
+    );
+    assert_eq!(stats.establishments_total(), stats.establishments_h1());
+    assert_eq!(stats.requests_total(), stats.requests_h1());
+    assert_eq!(
+        (stats.establishments_h2(), stats.h2_streams()),
+        (0, 0),
+        "plain HTTP must label every connection/request HTTP/1"
+    );
+    assert!(stats.establishments_h1() >= 1, "at least one connection");
+    assert!(
+        stats.establishments_h1() <= stats.requests_h1(),
+        "keep-alive reuse must not open more connections than requests"
+    );
+    // Unavailable H2 flow-control instrumentation is labeled, not guessed.
+    assert!(
+        stats.h2_flow_control_wait().is_none(),
+        "flow-control data must stay labeled unavailable (instrumented={})",
+        kdown_engine::http::H2_FLOW_CONTROL_INSTRUMENTED
+    );
+}
+
+/// H2 reconciliation (task 5.1): segmented range requests arrive at the
+/// server as multiplexed streams on the single default connection — stream
+/// count matches served server requests exactly (engine stats reads add a
+/// fixed HEAD+GET pair), physical establishments stay at one under the
+/// default `H2ConnectionPolicy::Single`, and no request is labeled HTTP/1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_stream_counters_reconcile_with_server_side_requests() {
+    let (server, ca, _cert_dir) = spawn_tls_server(&["--size", "1MiB", "--seed", "4242"]);
+    let url = tls_url(&server, "/f.bin");
+    let mut cfg = EngineConfig::default();
+    configure_tls(&mut cfg, &ca);
+    cfg.transfer.segmentation_threshold = 1;
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.initial_segment_size = 256 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 256 * 1024;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let stats = transport.protocol_stats().clone();
+    let controller = SingleStreamController::new(transport, cfg.clone());
+
+    let (_, conns_before, reqs_before) = read_tls_stats(&cfg, &server).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let result = controller
+        .run(DownloadRequest::new(url, dir.path().join("out.bin")))
+        .await
+        .expect("download");
+    let (_, conns_after, reqs_after) = read_tls_stats(&cfg, &server).await;
+
+    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let path = result.final_path.clone().expect("published");
+    assert_eq!(fixtures::file_sha256(&path), server.sha256, "H2 parity");
+
+    // Each stats read is one HEAD probe plus one GET on a tiny resource:
+    // exactly two served requests, so the after-read adds 2 to the delta.
+    let server_requests = reqs_after - reqs_before - 2;
+    assert_eq!(
+        stats.h2_streams(),
+        server_requests,
+        "H2 streams must reconcile with served server requests"
+    );
+    assert!(
+        stats.h2_streams() > stats.establishments_h2(),
+        "segmented H2 must multiplex streams over one connection"
+    );
+    // Default Single policy: the job's transport opens exactly one H2
+    // connection; the server saw at least that one plus each stats read.
+    assert_eq!(
+        stats.establishments_h2(),
+        1,
+        "default H2ConnectionPolicy::Single must use one connection"
+    );
+    assert!(
+        conns_after - conns_before >= stats.establishments_h2(),
+        "server must have accepted at least the job's H2 connection"
+    );
+    assert_eq!(
+        (stats.establishments_h1(), stats.requests_h1()),
+        (0, 0),
+        "TLS H2 transfer must not establish or label HTTP/1 traffic"
+    );
+    assert!(
+        stats.h2_flow_control_wait().is_none(),
+        "unavailable H2 flow-control data is labeled unavailable (instrumented={})",
+        kdown_engine::http::H2_FLOW_CONTROL_INSTRUMENTED
+    );
+}

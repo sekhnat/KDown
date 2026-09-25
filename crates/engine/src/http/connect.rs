@@ -304,6 +304,131 @@ pub(crate) struct LimitPermits {
     _origin: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Negotiated wire protocol of one HTTP connection (§24): `Http2` only
+/// when actually negotiated (TLS ALPN `h2`), never assumed from
+/// configuration. Instrumentation labels, not connection policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpProtocol {
+    /// HTTP/1.x over its own connection (one request at a time).
+    Http1,
+    /// HTTP/2: many multiplexed streams over one connection.
+    Http2,
+}
+
+/// Protocol-level transport instrumentation (task 5.1): logical HTTP
+/// requests/H2 streams counted separately from physical TCP/TLS
+/// establishments, each labeled with its negotiated protocol.
+///
+/// Counters are monotonically increasing process-wide for one transport
+/// stack (connector + clients share one `Arc`). Physical establishments
+/// increment exactly when the connector dials a new socket — pooled reuse
+/// never re-enters the connector — so `establishments_*` reconcile with a
+/// server's accepted-connection count, while `requests_h1`/`h2_streams`
+/// reconcile with a server's served-request count (H2 requests arrive as
+/// multiplexed streams).
+///
+/// H2 flow-control stall/window data is **not** observable through
+/// hyper-util's legacy client: [`Self::h2_flow_control_wait`] reports
+/// `None` and [`H2_FLOW_CONTROL_INSTRUMENTED`] is `false`, so reports must
+/// label that axis unavailable rather than fabricate values (observability
+/// contract).
+#[derive(Debug, Default)]
+pub struct HttpProtocolStats {
+    establishments_h1: std::sync::atomic::AtomicU64,
+    establishments_h2: std::sync::atomic::AtomicU64,
+    requests_h1: std::sync::atomic::AtomicU64,
+    requests_h2: std::sync::atomic::AtomicU64,
+}
+
+/// Whether H2 flow-control windows/stall waits AND peer stream limits
+/// (SETTINGS_MAX_CONCURRENT_STREAMS) are instrumented. The hyper-util
+/// legacy client exposes neither, so this is `false` and dependent reports
+/// are labeled unavailable (task 5.1/5.3: automatic extra H2 sockets stay
+/// off without measured flow-control/stream-limit evidence; peer stream
+/// limits cannot be probed where not exposed).
+pub const H2_FLOW_CONTROL_INSTRUMENTED: bool = false;
+
+impl HttpProtocolStats {
+    /// Record one physical TCP/TLS establishment with its negotiated
+    /// protocol. Called only from a successful connector dial.
+    pub(crate) fn record_establishment(&self, protocol: HttpProtocol) {
+        match protocol {
+            HttpProtocol::Http1 => {
+                self.establishments_h1
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            HttpProtocol::Http2 => {
+                self.establishments_h2
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Record one completed HTTP request. On HTTP/2 every request is one
+    /// multiplexed stream; on HTTP/1.x it occupies its connection.
+    pub(crate) fn record_request(&self, protocol: HttpProtocol) {
+        match protocol {
+            HttpProtocol::Http1 => {
+                self.requests_h1
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            HttpProtocol::Http2 => {
+                self.requests_h2
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Physical TCP/TLS establishments negotiated to HTTP/1.x.
+    #[must_use]
+    pub fn establishments_h1(&self) -> u64 {
+        self.establishments_h1
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Physical TCP/TLS establishments negotiated to HTTP/2.
+    #[must_use]
+    pub fn establishments_h2(&self) -> u64 {
+        self.establishments_h2
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// All physical establishments regardless of negotiated protocol.
+    #[must_use]
+    pub fn establishments_total(&self) -> u64 {
+        self.establishments_h1()
+            .saturating_add(self.establishments_h2())
+    }
+
+    /// HTTP/1.x requests served (each occupies its connection).
+    #[must_use]
+    pub fn requests_h1(&self) -> u64 {
+        self.requests_h1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// HTTP/2 requests served — each is one multiplexed stream on a shared
+    /// connection, so this counts streams, not sockets.
+    #[must_use]
+    pub fn h2_streams(&self) -> u64 {
+        self.requests_h2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// All logical requests across protocols.
+    #[must_use]
+    pub fn requests_total(&self) -> u64 {
+        self.requests_h1().saturating_add(self.h2_streams())
+    }
+
+    /// Observed H2 flow-control stall wait of the last blocked stream, when
+    /// the transport can observe it. Always `None` today: hyper-util's
+    /// legacy client does not expose per-stream flow-control windows, so
+    /// this axis is labeled unavailable instead of fabricated.
+    #[must_use]
+    pub fn h2_flow_control_wait(&self) -> Option<Duration> {
+        None
+    }
+}
+
 /// Origin key for limits and pooling (§27.1).
 pub(crate) fn origin_key(scheme: &str, host: &str, port: u16, proxy: Option<&str>) -> String {
     match proxy {
@@ -316,6 +441,9 @@ pub(crate) fn origin_key(scheme: &str, host: &str, port: u16, proxy: Option<&str
 /// `tower::Service<Uri>` so hyper-util's legacy `Client` can drive it.
 pub(crate) struct EngineConnector {
     limits: Arc<ConnectionLimits>,
+    /// Shared protocol instrumentation (task 5.1): requests/streams vs
+    /// physical establishments, labeled by negotiated protocol.
+    stats: Arc<HttpProtocolStats>,
     proxy: ProxyConfig,
     tls: Option<Arc<TlsSettings>>,
     address_filter: Option<Arc<dyn crate::config::AddressFilter>>,
@@ -337,6 +465,7 @@ impl std::fmt::Debug for EngineConnector {
 impl Clone for EngineConnector {
     fn clone(&self) -> Self {
         Self {
+            stats: self.stats.clone(),
             limits: self.limits.clone(),
             proxy: self.proxy.clone(),
             tls: self.tls.clone(),
@@ -376,6 +505,7 @@ impl EngineConnector {
             _ => None,
         };
         Ok(Self {
+            stats: Arc::new(HttpProtocolStats::default()),
             limits: Arc::new(ConnectionLimits::new(
                 cfg.max_connections_total,
                 cfg.max_connections_per_origin,
@@ -393,6 +523,24 @@ impl EngineConnector {
     #[must_use]
     pub fn limits(&self) -> &Arc<ConnectionLimits> {
         &self.limits
+    }
+
+    /// The shared protocol instrumentation (task 5.1): logical
+    /// requests/H2 streams vs physical TCP/TLS establishments and their
+    /// negotiated protocol. Shared by every client slot of one transport.
+    #[must_use]
+    pub fn protocol_stats(&self) -> &Arc<HttpProtocolStats> {
+        &self.stats
+    }
+
+    /// Negotiated wire protocol of a completed TLS handshake (§24):
+    /// `Http2` only when ALPN actually negotiated `h2`, never assumed.
+    fn tls_protocol(tls: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> HttpProtocol {
+        if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+            HttpProtocol::Http2
+        } else {
+            HttpProtocol::Http1
+        }
     }
 
     /// Connect to `dst`, honoring limits, the SSRF hook, and the proxy
@@ -432,12 +580,15 @@ impl EngineConnector {
         match (&self.proxy, scheme.as_str()) {
             (ProxyConfig::None, "http") => {
                 let tcp = self.connect_tcp(&host, port, true).await?;
+                self.stats.record_establishment(HttpProtocol::Http1);
                 let conn = LimitedConn::plain(tcp, false, permits);
                 Ok(conn)
             }
             (ProxyConfig::None, "https") => {
                 let tcp = self.connect_tcp(&host, port, true).await?;
                 let tls = self.tls_handshake(tcp, &host).await?;
+                let protocol = Self::tls_protocol(&tls);
+                self.stats.record_establishment(protocol);
                 let conn = LimitedConn::tls(tls, false, self.alpn_h2, permits);
                 Ok(conn)
             }
@@ -468,6 +619,8 @@ impl EngineConnector {
                 })?;
                 let raw = tunneled.into_inner();
                 let tls = self.tls_handshake(raw, &host).await?;
+                let protocol = Self::tls_protocol(&tls);
+                self.stats.record_establishment(protocol);
                 let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits);
                 Ok(conn)
             }
@@ -498,9 +651,12 @@ impl EngineConnector {
                 let raw = conn.into_inner();
                 if scheme == "https" {
                     let tls = self.tls_handshake(raw, &host).await?;
+                    let protocol = Self::tls_protocol(&tls);
+                    self.stats.record_establishment(protocol);
                     let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits);
                     Ok(conn)
                 } else {
+                    self.stats.record_establishment(HttpProtocol::Http1);
                     let conn = LimitedConn::plain(raw, true, permits);
                     Ok(conn)
                 }
@@ -519,6 +675,7 @@ impl EngineConnector {
                     .map_err(ConnectError)?;
                 }
                 let tcp = self.connect_tcp(&phost, pport, false).await?;
+                self.stats.record_establishment(HttpProtocol::Http1);
                 let conn = LimitedConn::plain(tcp, true, permits);
                 Ok(conn)
             }

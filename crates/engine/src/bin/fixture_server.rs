@@ -79,9 +79,13 @@ struct ServerStats {
 }
 
 impl ServerStats {
+    /// Fixed-width summary: the byte length must not change between a
+    /// HEAD probe and its GET (engine integrity compares the two), so
+    /// every counter is zero-padded to u64's maximum digit count. Parsers
+    /// read `key=<digits>` lines, which fixed width does not affect.
     fn summary(&self) -> String {
         format!(
-            "emitted={}\nconnections={}\nrequests={}\n",
+            "emitted={:020}\nconnections={:020}\nrequests={:020}\n",
             self.emitted.load(Ordering::Relaxed),
             self.connections.load(Ordering::Relaxed),
             self.requests.load(Ordering::Relaxed),
