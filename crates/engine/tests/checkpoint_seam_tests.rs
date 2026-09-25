@@ -51,6 +51,24 @@ async fn wait_for_delete(store: &ScriptedCheckpointStore) {
     .expect("checkpoint delete reached its synchronization gate");
 }
 
+/// Wait until the store records at least one save operation. Unlike the
+/// delete gate (which the completion path always reaches), a cadence save
+/// only happens while the job is still transferring — tests that need the
+/// delete-after-save ordering must keep the job alive (for example with a
+/// scripted gate) until this observes a save.
+async fn wait_for_save(store: &ScriptedCheckpointStore) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store.ops().iter().any(|operation| operation.is_save()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("cadence save recorded while the job was still running");
+}
+
 // ---- Scripted adapter focused tests ----
 
 #[test]
@@ -1020,12 +1038,49 @@ async fn segmented_save_failure_converges_workers_to_failed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn segmented_post_commit_delete_failure_retains_completed() {
-    let (scripted, content) = segmented_script(false);
+    let content = deterministic_bytes(SEG_TOTAL, 77_001);
+    // Three ranges transfer freely; the LAST range parks behind a gate so
+    // the job cannot complete before the coordinator's cadence save has
+    // provably recorded the absorbed progress. A zero-delay scripted job
+    // can otherwise outrun the first timer tick entirely — observed on
+    // Windows, where the transfer finished between ticks and the
+    // delete-after-save premise had no saves to order against.
+    let head = (0..3u64)
+        .map(|i| {
+            let start = i * 1000;
+            let end = start + 999;
+            TransferStep::new().range((start, end)).ok(TransferOk::new()
+                .range(start, end)
+                .total(SEG_TOTAL)
+                .chunk(content[start as usize..(end + 1) as usize].to_vec()))
+        })
+        .collect();
+    let last_start = 3 * 1000;
+    let last_end = SEG_TOTAL - 1;
+    let scripted = ScriptedHttp::new()
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(SEG_TOTAL),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }))
+        .expect_unordered_ranges("head", head)
+        .gate("final")
+        .expect_unordered_ranges(
+            "final",
+            vec![TransferStep::new()
+                .range((last_start, last_end))
+                .ok(TransferOk::new()
+                    .range(last_start, last_end)
+                    .total(SEG_TOTAL)
+                    .chunk(content[last_start as usize..=last_end as usize].to_vec()))],
+        );
     let store = ScriptedCheckpointStore::new();
     store.fail_next_delete(CheckpointError::Corrupt("seg delete boom".into()));
     let delete_gate = store.hold_delete(1);
-    // 1ns cadence: cadence saves record in-flight progress, so the
-    // delete-after-save ordering is observable.
+    // 1ns cadence: cadence saves record in-flight progress; the gate above
+    // guarantees at least one such save exists before the job can finish.
     let config = EngineConfig {
         checkpoint_flush_interval: Duration::from_nanos(1),
         ..segmented_cfg()
@@ -1040,6 +1095,10 @@ async fn segmented_post_commit_delete_failure_retains_completed() {
         dest.clone(),
     ));
     let mut events = handle.events();
+    // Deterministic ordering premise: the parked final range keeps the job
+    // alive until the coordinator records at least one save of the head.
+    wait_for_save(&store).await;
+    scripted.open_gate("final");
     wait_for_delete(&store).await;
     let published_before_delete = std::fs::read(&dest);
     let state_before_delete = handle.state();
