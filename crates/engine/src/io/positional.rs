@@ -28,7 +28,6 @@ impl PositionalWriter for std::fs::File {
 #[cfg(windows)]
 impl PositionalWriter for std::fs::File {
     fn pos_write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        use std::os::windows::fs::FileExt;
         // seek_write: positional write; does not move the file pointer used
         // by other handles, but this handle's own cursor is per-handle state
         // that no segmented worker shares.
@@ -248,35 +247,24 @@ mod tests {
         // arithmetic on every platform, including Windows seek_write.
         write_all_at(&file, 4 * GIB + 512, tail).expect("write tail past 4 GiB");
         let mut head_back = vec![0u8; head.len()];
-        file.read_exact_at(&mut head_back, 0)
-            .expect("read head back");
+        read_exact_at(&mut file, &mut head_back, 0).expect("read head back");
         assert_eq!(&head_back, head);
         let mut mid_back = vec![0u8; mid.len()];
-        file.read_exact_at(&mut mid_back, 4 * MIB)
-            .expect("read mid back");
+        read_exact_at(&mut file, &mut mid_back, 4 * MIB).expect("read mid back");
         assert_eq!(&mid_back, mid);
         let mut tail_back = vec![0u8; tail.len()];
-        file.read_exact_at(&mut tail_back, 4 * GIB + 512)
-            .expect("read tail back");
+        read_exact_at(&mut file, &mut tail_back, 4 * GIB + 512).expect("read tail back");
         assert_eq!(&tail_back, tail);
     }
 
-    trait ReadExactAt {
-        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
-    }
-    #[cfg(unix)]
-    impl ReadExactAt for std::fs::File {
-        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-            std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
-        }
-    }
-    // Windows mirrors the Unix positional read: FileExt::read_exact_at reads
-    // exactly `buf.len()` bytes at the absolute offset without moving any
-    // shared cursor, matching how the writes under test were performed.
-    #[cfg(windows)]
-    impl ReadExactAt for std::fs::File {
-        fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-            std::os::windows::fs::FileExt::read_exact_at(self, buf, offset)
-        }
+    /// Portable positional read-back on the test's own private handle:
+    /// seek to the absolute offset, then read exactly `buf.len()` bytes.
+    /// The handle is test-local, so moving its cursor cannot disturb
+    /// anything; this keeps verification identical on every platform while
+    /// the code under test (positional WRITES) stays platform-specific.
+    fn read_exact_at(file: &mut std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
     }
 }

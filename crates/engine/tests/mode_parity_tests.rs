@@ -217,13 +217,18 @@ async fn run_completion_mode(
         config.transfer.max_segment_size = 1000;
         config.transfer.min_segment_size = 1;
     }
-    let scripted = ScriptedHttp::new().expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
-        status: 200,
-        total_size: Some(TOTAL),
-        accept_ranges: true,
-        range_verified: true,
-        ..ProbeMetadata::default()
-    }));
+    // The scripted body is zero-delay, so the run task could otherwise
+    // finish the integrity phase before the test subscribes to events.
+    // Park every call behind a gate until the subscription exists.
+    let scripted = ScriptedHttp::new()
+        .gate("subscribe")
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(TOTAL),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }));
     let scripted = if segmented {
         let ranges = (0..TOTAL)
             .step_by(1000)
@@ -261,6 +266,8 @@ async fn run_completion_mode(
     };
     let (handle, task) = controller.start(request);
     let mut events = handle.events();
+    // Subscription is live: release the parked probe/transfer calls.
+    scripted.open_gate("subscribe");
     let result = task
         .await
         .expect("job task")
