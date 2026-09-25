@@ -83,14 +83,17 @@ impl TokenBucket {
         let burst = self.burst.load(Ordering::Relaxed) as f64;
         let mut st = self.state.lock().expect("bucket lock");
         refill(&mut st, rate, burst);
-        if st.tokens >= bytes as f64 {
-            st.tokens -= bytes as f64;
+        // Negative-balance accounting (task 7.1): the balance may go below
+        // zero by the requested bytes; the caller sleeps the deficit off
+        // while refill climbs back. Keeping the debit inside the balance
+        // (instead of zeroing it and leaving the wait's accrual for the
+        // next caller) prevents double-spending — the previous behavior
+        // delivered ~2× the configured rate in the deficit regime.
+        st.tokens -= bytes as f64;
+        if st.tokens >= 0.0 {
             return Acquisition { wait: None };
         }
-        // Deficit: time until the bucket refills enough.
-        let deficit = bytes as f64 - st.tokens;
-        st.tokens = 0.0;
-        let wait_secs = deficit / rate;
+        let wait_secs = -st.tokens / rate;
         Acquisition {
             wait: Some(std::time::Duration::from_secs_f64(wait_secs)),
         }
@@ -258,6 +261,39 @@ mod tests {
     fn unlimited_limiter_never_waits() {
         let limiter = RateLimiter::unlimited();
         assert_eq!(limiter.acquire(u64::MAX / 2).wait, None);
+    }
+
+    /// Contended limited-mode probe (task 7.2, #[ignore]: run explicitly
+    /// with `cargo test -p kdown-engine --lib -- --ignored --nocapture`).
+    /// Measures ns/acquire for N workers hammering a shared limited bucket
+    /// with 64 KiB acquires — the segmented worker pattern (one acquire per
+    /// received chunk). Evidence only; asserts nothing timing-tight.
+    #[test]
+    #[ignore]
+    fn probe_limited_mode_lock_contention() {
+        const WORKERS: usize = 16;
+        const ACQUIRES_PER_WORKER: u64 = 40_000;
+        const CHUNK: u64 = 64 * 1024;
+        // Limited (the contended path) and unlimited (the fast path).
+        for rate in [0u64, 64 * 1024 * 1024 * 1024] {
+            let bucket = Arc::new(TokenBucket::new(rate));
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..WORKERS {
+                    scope.spawn(|| {
+                        for _ in 0..ACQUIRES_PER_WORKER {
+                            let _ = bucket.acquire(CHUNK);
+                        }
+                    });
+                }
+            });
+            let total = WORKERS as u64 * ACQUIRES_PER_WORKER;
+            let elapsed = start.elapsed();
+            println!(
+                "rate={rate:>12} ns/acquire={} ({total} acquires, {elapsed:?})",
+                elapsed.as_nanos() as u64 / total
+            );
+        }
     }
 
     #[tokio::test]

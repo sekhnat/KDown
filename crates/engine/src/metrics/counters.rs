@@ -145,6 +145,66 @@ pub struct ProgressSnapshot {
 
 #[cfg(test)]
 mod tests {
+
+    /// False-sharing probe (task 7.3, #[ignore]): N threads each hammering
+    /// their OWN WorkerCounters (the real pattern — one worker, one cell)
+    /// laid out adjacently (current) vs cache-line-padded. Evidence only.
+    #[test]
+    #[ignore]
+    fn probe_worker_counters_false_sharing() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        #[repr(align(64))]
+        struct Padded(WorkerCounters);
+
+        const WORKERS: usize = 16;
+        const ITERS: u64 = 200_000;
+        for padded in [false, true] {
+            // Leak the storage: opaque addresses keep LLVM from eliding
+            // the atomics after inlining the scoped threads. The padded arm
+            // gives each worker its own line; the adjacent arm uses the
+            // current production layout (Vec<WorkerCounters>, ~40 B stride).
+            let padded_cells: &'static [Padded] = Box::leak(Box::new(
+                (0..WORKERS)
+                    .map(|_| Padded(WorkerCounters::default()))
+                    .collect::<Vec<Padded>>(),
+            ));
+            let plain_cells: &'static [WorkerCounters] = Box::leak(Box::new(
+                (0..WORKERS)
+                    .map(|_| WorkerCounters::default())
+                    .collect::<Vec<WorkerCounters>>(),
+            ));
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for w in 0..WORKERS {
+                    let cell: &WorkerCounters = if padded {
+                        &padded_cells[w].0
+                    } else {
+                        &plain_cells[w]
+                    };
+                    scope.spawn(move || {
+                        let mut sink: u64 = 0;
+                        for i in 0..ITERS {
+                            cell.add_network(64 * 1024);
+                            if i % 8 == 0 {
+                                cell.add_completed(64 * 1024);
+                            }
+                            sink ^= cell.network_bytes.load(Ordering::Relaxed);
+                        }
+                        std::hint::black_box(sink);
+                    });
+                }
+            });
+            let elapsed = start.elapsed();
+            let total = (WORKERS as u64 * (ITERS + ITERS / 8)) as f64;
+            println!(
+                "padded={padded} ns/op={} ({elapsed:?} for {total:.0} ops)",
+                elapsed.as_nanos() as u64 / total as u64
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

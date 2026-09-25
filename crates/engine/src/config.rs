@@ -427,6 +427,10 @@ pub struct EngineConfig {
     /// Shared blocking write-executor policy (design D2, task 2.3): the
     /// small bounded blocking pool serving positional writes for all jobs.
     pub write_executor: WriteExecutorConfig,
+    /// Engine-wide (global) payload rate limit in bytes/second shared by
+    /// every job of the controller (§18: global above per-job). `None` =
+    /// unlimited; per-job [`NetworkPolicy::rate_limit`] still applies.
+    pub global_rate_limit: Option<u64>,
 }
 
 /// Restrict resolved addresses / redirect targets (§21.5 SSRF hook).
@@ -476,6 +480,7 @@ impl Default for EngineConfig {
             network: NetworkPolicy::default(),
             write_budget: WriteBudgetConfig::default(),
             write_executor: WriteExecutorConfig::default(),
+            global_rate_limit: None,
         }
     }
 }
@@ -507,6 +512,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("network", &self.network)
             .field("write_budget", &self.write_budget)
             .field("write_executor", &self.write_executor)
+            .field("global_rate_limit", &self.global_rate_limit)
             .finish()
     }
 }
@@ -532,6 +538,7 @@ impl PartialEq for EngineConfig {
             && self.network == other.network
             && self.write_budget == other.write_budget
             && self.write_executor == other.write_executor
+            && self.global_rate_limit == other.global_rate_limit
     }
 }
 
@@ -666,6 +673,12 @@ impl EngineConfig {
             return Err(invalid(
                 "write_budget.job_max_bytes",
                 "must be <= write_budget.global_max_bytes",
+            ));
+        }
+        if self.global_rate_limit == Some(0) {
+            return Err(invalid(
+                "global_rate_limit",
+                "use None for unlimited, not Some(0)",
             ));
         }
         if self.write_budget.worker_read_ahead_bytes > self.write_budget.job_max_bytes {
