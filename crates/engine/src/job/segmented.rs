@@ -3068,8 +3068,6 @@ mod sync_tests {
             }
             writer_cell.clear();
         });
-
-        let mut observed = 0u64;
         while !writer.is_finished() {
             if let Some(record) = cell.snapshot() {
                 observed += 1;
