@@ -117,6 +117,19 @@ pub struct SegmentedJob {
     /// Configured bounds for manual concurrency control (task 8.2).
     min_workers: u64,
     max_workers: u64,
+    /// Negotiated wire protocol of the probe response (tasks 5.2/5.3):
+    /// `true` when HTTP/2 was actually negotiated — additional active
+    /// workers are streams multiplexed over one connection; `false` for
+    /// HTTP/1, where each additional active worker means an additional
+    /// physical connection subject to the connector's permits.
+    protocol_is_h2: bool,
+    /// Per-origin physical connection allowance (task 5.2): the connector
+    /// enforces it; on HTTP/1 the adaptive controller never probes desired
+    /// beyond it — a growth probe into blocked permits is wasted.
+    per_origin_connection_cap: u32,
+    /// Engine-global physical connection allowance (task 5.2): also gates
+    /// HTTP/1 growth probes alongside the per-origin cap.
+    global_connection_cap: u32,
     /// Ready-work sizing (task 3.3): the opt-in Automatic selector keeps
     /// `ready_work_factor × desired` unclaimed leases pending; disabled for
     /// Explicit sizing (which keeps its configured meaning).
@@ -746,6 +759,9 @@ pub(crate) async fn run_segmented(
             .collect(),
         min_workers: u64::from(config.transfer.min_workers.max(1)),
         max_workers: u64::from(config.transfer.max_workers.max(1)),
+        protocol_is_h2: meta.http_version == "HTTP/2.0",
+        per_origin_connection_cap: config.max_connections_per_origin,
+        global_connection_cap: config.max_connections_total,
         ready_work_sizing: matches!(
             config.transfer.segment_sizing,
             crate::config::SegmentSizing::Automatic | crate::config::SegmentSizing::Duration { .. }
@@ -2426,8 +2442,25 @@ async fn adaptive_controller_loop(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let config = crate::control::adaptive::AdaptiveConfig::default();
+    // Protocol-aware growth gate (tasks 5.2/5.3, design D5): on HTTP/1 an
+    // additional active worker means an additional physical connection, so
+    // growth probes never target more concurrent workers than the
+    // per-origin connection allowance the connector enforces — probing
+    // into blocked permits wastes the probe and the cooldown. On HTTP/2
+    // workers are streams multiplexed over one connection: the connection
+    // allowance does not cap stream growth, and automatic additional
+    // sockets stay off (flow-control evidence is unavailable, task 5.1).
+    let effective_max = if job.protocol_is_h2 {
+        job.max_workers
+    } else {
+        job.max_workers.min(u64::from(
+            job.per_origin_connection_cap
+                .min(job.global_connection_cap)
+                .max(1),
+        ))
+    };
     let mut controller =
-        crate::control::adaptive::AdaptiveController::new(config, job.min_workers, job.max_workers);
+        crate::control::adaptive::AdaptiveController::new(config, job.min_workers, effective_max);
     // Sub-interval activity sampling (task 4.1): the window's active/idle
     // inputs are interval-weighted worker-time, not one instantaneous count.
     let sample_interval = (config.window / 8).max(Duration::from_millis(1));
@@ -2735,6 +2768,9 @@ mod durability_tests {
             ready_work_sizing: false,
             ready_work_factor: 1,
             applied_ready_divisor: AtomicU64::new(u64::MAX),
+            protocol_is_h2: false,
+            per_origin_connection_cap: 1,
+            global_connection_cap: 1,
             worker_progress: vec![Arc::new(LeaseProgress::default())],
         };
         let job = Arc::new(job);

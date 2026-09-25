@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy};
 use kdown_engine::http::transport::HttpTransport;
@@ -311,5 +312,260 @@ async fn h2_pipelined_respects_additional_connections_policy() {
     assert!(
         conns.load(Ordering::SeqCst) >= 1,
         "server accepted no connections"
+    );
+}
+
+/// Paced HTTPS test server speaking HTTP/2 (task 5.3): each ranged response
+/// is delayed proportionally to its payload length, so every multiplexed
+/// stream adds real useful goodput and adaptive stream growth is measurable.
+async fn start_paced_h2_tls_server(
+    content: Arc<Vec<u8>>,
+    bytes_per_sec: u64,
+) -> (std::net::SocketAddr, Vec<u8>, Arc<AtomicUsize>) {
+    use tokio_rustls::rustls;
+
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+    let ca_pem = cert.cert.pem().into_bytes();
+    let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+    );
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server cert");
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_config = Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let conn_count = Arc::new(AtomicUsize::new(0));
+    let accept_loop = conn_count.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let tls = tls_config.clone();
+            let content = content.clone();
+            accept_loop.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
+                else {
+                    return;
+                };
+                let served = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(
+                    hyper_util::rt::TokioIo::new(tls_stream),
+                    hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let content = content.clone();
+                            async move {
+                                let range = req
+                                    .headers()
+                                    .get("range")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(parse_range);
+                                let (status, body, cr) = match range {
+                                    Some((s, e)) => {
+                                        let end = e.min(content.len() as u64 - 1);
+                                        (
+                                            206,
+                                            content[s as usize..=(end as usize)].to_vec(),
+                                            Some(format!("bytes {s}-{end}/{}", content.len())),
+                                        )
+                                    }
+                                    None => (200, (*content).clone(), None),
+                                };
+                                // Pace the response by payload length: each
+                                // stream is served at `bytes_per_sec`, and
+                                // concurrent streams each get their own
+                                // share (streams scale goodput).
+                                if req.method() != "HEAD" && bytes_per_sec > 0 {
+                                    let delay = Duration::from_secs_f64(
+                                        body.len() as f64 / bytes_per_sec as f64,
+                                    );
+                                    if !delay.is_zero() {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                }
+                                let mut resp = hyper::Response::builder()
+                                    .status(status)
+                                    .header("content-length", body.len())
+                                    .header("etag", "\"h2-fixed\"")
+                                    .header("accept-ranges", "bytes");
+                                if let Some(cr) = cr {
+                                    resp = resp.header("content-range", cr);
+                                }
+                                resp.body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                                    .map(Ok::<_, std::convert::Infallible>)
+                                    .expect("response body")
+                            }
+                        },
+                    ),
+                )
+                .await;
+                if let Err(e) = served {
+                    eprintln!("h2 paced test server conn error: {e}");
+                }
+            });
+        }
+    });
+    (addr, ca_pem, conn_count)
+}
+
+/// H2 stream growth is not capped by the connection allowance (task 5.3,
+/// design D5): with `max_connections_per_origin = 1` and the default
+/// `H2ConnectionPolicy::Single`, adaptive stream concurrency still grows
+/// past one — streams multiplex over the single healthy socket — and the
+/// engine never opens additional sockets on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_adaptive_growth_not_capped_by_connection_limits() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..24_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let (addr, ca_pem, _conns) = start_paced_h2_tls_server(content.clone(), 2_097_152).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+    let dest = dir.path().join("out.bin");
+
+    let mut cfg = h2_cfg(&ca_path);
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    cfg.transfer.initial_segment_size = 64 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 64 * 1024;
+    // Connection allowance of ONE: on H1 this would clamp adaptive growth;
+    // on H2 it must not, because workers are streams, not sockets.
+    cfg.pool.max_per_origin = 1;
+    cfg.max_connections_total = 1;
+    cfg.max_connections_per_origin = 1;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let stats = transport.protocol_stats().clone();
+    let controller = SingleStreamController::new(transport, cfg);
+    let (handle, join) = controller.start(DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    ));
+
+    let mut max_desired = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            max_desired = max_desired.max(job.desired_workers());
+            if max_desired >= 3 {
+                break;
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(180), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    eprintln!(
+        "[dbg] segment_requests={} warnings={:?}",
+        result.segment_requests, result.warnings
+    );
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+
+    assert!(
+        max_desired >= 3,
+        "H2 adaptive stream growth must not be capped by the connection allowance: {max_desired}"
+    );
+    assert_eq!(
+        stats.establishments_h2(),
+        1,
+        "default H2ConnectionPolicy::Single must keep exactly one multiplexed socket"
+    );
+    assert!(
+        stats.h2_streams() > stats.establishments_h2(),
+        "H2 streams must exceed physical connections (multiplexing)"
+    );
+    assert_eq!(
+        (stats.establishments_h1(), stats.requests_h1()),
+        (0, 0),
+        "no HTTP/1 fallback traffic expected"
+    );
+}
+
+/// Explicit `H2ConnectionPolicy::Additional` override stays compatible with
+/// adaptive concurrency (task 5.3): the round-robin extra slots still work,
+/// the connection caps are respected, and the transfer completes byte-exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_additional_policy_stays_compatible_with_adaptive() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..24_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let (addr, ca_pem, _conns) = start_paced_h2_tls_server(content.clone(), 2_097_152).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+    let dest = dir.path().join("out.bin");
+
+    let mut cfg = h2_cfg(&ca_path);
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    cfg.transfer.initial_segment_size = 64 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 64 * 1024;
+    cfg.h2_policy = H2ConnectionPolicy::Additional { max_connections: 4 };
+    cfg.pool.max_per_origin = 4;
+    cfg.max_connections_total = 4;
+    cfg.max_connections_per_origin = 4;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let stats = transport.protocol_stats().clone();
+    let controller = SingleStreamController::new(transport, cfg);
+    let (handle, join) = controller.start(DownloadRequest::new(
+        format!("https://localhost:{}/file.bin", addr.port()),
+        dest.clone(),
+    ));
+
+    let mut max_desired = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            max_desired = max_desired.max(job.desired_workers());
+            if max_desired >= 2 {
+                break;
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(180), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+
+    assert!(
+        max_desired >= 2,
+        "adaptive growth must still work with the explicit Additional policy: {max_desired}"
+    );
+    assert!(
+        stats.establishments_h2() >= 1 && stats.establishments_h2() <= 4,
+        "additional-socket policy must stay within its configured cap: {}",
+        stats.establishments_h2()
     );
 }

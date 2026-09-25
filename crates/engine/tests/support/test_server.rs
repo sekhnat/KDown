@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -138,6 +139,11 @@ impl ScriptedResponse {
 pub struct RequestInfo {
     pub method: String,
     pub path: String,
+    /// Server-assigned connection ordinal (task 5.2): distinct physical
+    /// connections to the server get distinct ids, so handlers can model
+    /// per-connection bottlenecks or penalties. A keep-alive connection
+    /// keeps its id across requests.
+    pub conn_id: u64,
     /// Parsed `Range: bytes=S-E` inclusive.
     pub range: Option<(u64, u64)>,
     pub if_range: Option<String>,
@@ -174,6 +180,9 @@ struct ServerState {
     /// amplification accounting): counts body bytes served, including
     /// duplicated re-delivery from overlapping/split requests.
     emitted: std::sync::atomic::AtomicU64,
+    /// Connection ordinal source (task 5.2): each accepted TCP connection
+    /// gets the next id, so handlers can tell connections apart.
+    conn_seq: std::sync::atomic::AtomicU64,
 }
 
 /// Builder for a deterministic scripted HTTP server.
@@ -276,6 +285,7 @@ impl TestServer {
             default_headers: Mutex::new(self.default_headers),
             requests: Mutex::new(Vec::new()),
             emitted: std::sync::atomic::AtomicU64::new(0),
+            conn_seq: std::sync::atomic::AtomicU64::new(0),
         });
         let loop_state = state.clone();
         tokio::spawn(async move {
@@ -283,8 +293,9 @@ impl TestServer {
                 match listener.accept().await {
                     Ok((socket, _)) => {
                         let st = loop_state.clone();
+                        let conn_id = st.conn_seq.fetch_add(1, Ordering::SeqCst);
                         tokio::spawn(async move {
-                            let _ = serve_conn(socket, st).await;
+                            let _ = serve_conn(socket, st, conn_id).await;
                         });
                     }
                     Err(_) => return,
@@ -402,7 +413,11 @@ fn resolve_response(state: &ServerState, info: &RequestInfo) -> ScriptedResponse
         .unwrap_or_else(|| ScriptedResponse::new(404))
 }
 
-async fn serve_conn(socket: tokio::net::TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+async fn serve_conn(
+    socket: tokio::net::TcpStream,
+    state: Arc<ServerState>,
+    conn_id: u64,
+) -> std::io::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     loop {
@@ -434,6 +449,7 @@ async fn serve_conn(socket: tokio::net::TcpStream, state: Arc<ServerState>) -> s
         let info = RequestInfo {
             method: method.clone(),
             path: path.clone(),
+            conn_id,
             range: headers
                 .iter()
                 .find(|(k, _)| k == "range")

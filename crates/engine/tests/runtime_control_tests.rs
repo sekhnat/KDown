@@ -1237,3 +1237,165 @@ async fn adaptive_cancel_keep_partial_with_parked_workers() {
         "no duplicated coverage on the cancelled path: {result:?}"
     );
 }
+// ---- Protocol-aware H1 connection gating (optimize-transfer-engine-v2 task 5.2) ----
+
+/// H1 marginal-benefit + ConnectionLimits gate (task 5.2): with the
+/// per-origin/global connection allowance set to 3 and adaptive max_workers
+/// 8, the controller must never probe desired concurrency past the
+/// connection allowance (probing into blocked permits is wasted), the
+/// connector's permits are never exceeded by many concurrent H1 requests,
+/// and the job still completes byte-exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h1_adaptive_growth_never_exceeds_connection_permits() {
+    let content = Arc::new(deterministic_bytes(16 * 1024 * 1024, 5100));
+    let server = paced_range_server(content.clone(), "/h1cap", Duration::from_millis(50))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("h1cap.bin");
+
+    let mut cfg = segmented_cfg();
+    cfg.transfer.max_workers = 8;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    cfg.transfer.initial_segment_size = 256 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 256 * 1024;
+    cfg.pool.max_per_origin = 3;
+    cfg.max_connections_total = 3;
+    cfg.max_connections_per_origin = 3;
+
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let limits = transport.connection_limits().clone();
+    let controller = SingleStreamController::new(transport, cfg.clone());
+    let (handle, join) = controller.start(DownloadRequest::new(server.url("/h1cap"), dest.clone()));
+
+    let origin_key = format!("http://{}", server.socket_addr());
+    let mut max_desired = 0u64;
+    let mut max_seen_conns = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            max_desired = max_desired.max(job.desired_workers());
+            max_seen_conns = max_seen_conns.max(limits.origin_in_use(&origin_key));
+            if max_desired >= 3 {
+                break;
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+
+    assert!(
+        max_desired <= 3,
+        "H1 adaptive desired must be clamped to the per-origin connection cap: {max_desired}"
+    );
+    assert_eq!(
+        max_desired, 3,
+        "H1 growth probes should still reach the connection cap: {max_desired}"
+    );
+    assert!(
+        max_seen_conns <= 3,
+        "many H1 requests must never exceed per-origin/global permits: {max_seen_conns}"
+    );
+}
+
+/// H1 marginal-gain revert (task 5.2): additional connections that stop
+/// improving useful goodput must be reverted. The fixture makes every
+/// distinct connection beyond the first strictly harmful — the per-request
+/// header delay triples with each distinct connection the server has seen —
+/// so aggregate useful goodput always DROPS when the controller grows the
+/// connection count. The adaptive probe must first raise desired above 1,
+/// then revert it to 1 once the marginal gain disappears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
+    use std::collections::HashSet;
+
+    let content = Arc::new(deterministic_bytes(8 * 1024 * 1024, 5101));
+    let conns_seen: Arc<std::sync::Mutex<HashSet<u64>>> =
+        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let server = {
+        let content = content.clone();
+        let conns_seen = conns_seen.clone();
+        TestServer::new().serve_handler("/marginal", move |req| {
+            let total = content.len() as u64;
+            // Distinct-connection count drives the penalty: delay triples
+            // per distinct connection (capped), so an added connection
+            // always lowers aggregate goodput below the prior level.
+            let distinct = {
+                let mut set = conns_seen.lock().expect("conns seen lock");
+                set.insert(req.conn_id);
+                set.len() as u32
+            };
+            let delay_ms = 8u64.saturating_mul(3u64.pow(distinct.saturating_sub(1).min(5)));
+            let base = if req.method == "HEAD" {
+                ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
+            } else if let Some((s, e)) = req.range {
+                let end = e.min(total - 1);
+                ScriptedResponse::new(206)
+                    .with_body(content[s as usize..=(end as usize)].to_vec())
+                    .with_header("content-range", &format!("bytes {s}-{end}/{total}"))
+                    .with_header("accept-ranges", "bytes")
+            } else {
+                ScriptedResponse::ok((*content).clone()).with_header("accept-ranges", "bytes")
+            };
+            base.delayed_headers(Duration::from_millis(delay_ms))
+        })
+    }
+    .start()
+    .await
+    .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("marginal.bin");
+
+    let mut cfg = segmented_cfg();
+    cfg.transfer.max_workers = 4;
+    cfg.transfer.min_workers = 1;
+    cfg.transfer.concurrency_mode = kdown_engine::config::ConcurrencyMode::Adaptive;
+    cfg.transfer.initial_segment_size = 64 * 1024;
+    cfg.transfer.min_segment_size = 64 * 1024;
+    cfg.transfer.max_segment_size = 64 * 1024;
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = SingleStreamController::new(transport, cfg);
+    let (handle, join) =
+        controller.start(DownloadRequest::new(server.url("/marginal"), dest.clone()));
+
+    let mut saw_two = false;
+    let mut reverted_to_one = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Some(job) = handle.segmented_job() {
+            let desired = job.desired_workers();
+            if desired >= 2 {
+                saw_two = true;
+            }
+            if saw_two && desired == 1 {
+                reverted_to_one = true;
+                break;
+            }
+        }
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(120), join)
+        .await
+        .expect("no hang")
+        .expect("join")
+        .expect("terminal");
+    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
+
+    assert!(saw_two, "probe must first raise desired above 1");
+    assert!(
+        reverted_to_one,
+        "desired must revert to 1 once the additional connection stops helping"
+    );
+}
