@@ -1047,7 +1047,7 @@ async fn segmented_save_failure_converges_workers_to_failed() {
             .with_checkpoint_resolver(Arc::new(RecordingResolver::new(store.clone())));
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("seg.bin");
-    let (handle, join) = controller.start(DownloadRequest::new(
+    let (_handle, join) = controller.start(DownloadRequest::new(
         "https://scripted/seg-fail.bin",
         dest.clone(),
     ));
