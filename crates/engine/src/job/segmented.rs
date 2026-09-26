@@ -3160,23 +3160,31 @@ mod write_pipeline_tests {
 
     /// One segmented lease [0, 1999] whose body arrives as two chunks.
     fn pipeline_http(content: &[u8]) -> ScriptedHttp {
-        ScriptedHttp::new()
-            .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
-                status: 200,
-                total_size: Some(TOTAL),
-                accept_ranges: true,
-                range_verified: true,
-                ..ProbeMetadata::default()
-            }))
-            .expect_transfer(
-                TransferStep::new()
-                    .range((0, TOTAL - 1))
-                    .ok(TransferOk::new()
-                        .range(0, TOTAL - 1)
-                        .total(TOTAL)
-                        .chunk(content[..1000].to_vec())
-                        .chunk(content[1000..].to_vec())),
-            )
+        pipeline_http_with_gate(content, None)
+    }
+
+    fn pipeline_http_with_gate(content: &[u8], gate: Option<&str>) -> ScriptedHttp {
+        let scripted = ScriptedHttp::new().expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(TOTAL),
+            accept_ranges: true,
+            range_verified: true,
+            ..ProbeMetadata::default()
+        }));
+        let scripted = if let Some(label) = gate {
+            scripted.gate(label)
+        } else {
+            scripted
+        };
+        scripted.expect_transfer(
+            TransferStep::new()
+                .range((0, TOTAL - 1))
+                .ok(TransferOk::new()
+                    .range(0, TOTAL - 1)
+                    .total(TOTAL)
+                    .chunk(content[..1000].to_vec())
+                    .chunk(content[1000..].to_vec())),
+        )
     }
 
     fn pipeline_config(pipeline_writes: bool, read_ahead_frames: u64) -> EngineConfig {
@@ -3267,7 +3275,7 @@ mod write_pipeline_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn adaptive_window_carries_weighted_activity_and_writer_instrumentation() {
         let content = content();
-        let scripted = pipeline_http(&content);
+        let scripted = pipeline_http_with_gate(&content, Some("adaptive-start"));
         let dir = tempfile::tempdir().expect("tmp");
         let dest = dir.path().join("adaptive-window.bin");
         let mut config = pipeline_config(true, 4);
@@ -3280,21 +3288,54 @@ mod write_pipeline_tests {
         let script = OutputFaultScript::register(&dest);
         let gate = script.script().hold_next(OutputOperation::Write);
         let controller = DownloadController::with_execution(
-            crate::http::execution::HttpExecution::from_adapter(scripted),
+            crate::http::execution::HttpExecution::from_adapter(scripted.clone()),
             config,
         );
         let (handle, task) = controller.start(DownloadRequest::new(
             "https://example.test/adaptive-window.bin",
             dest.clone(),
         ));
+        // Workers cannot consume either chunk until the controller has folded
+        // its initial baseline. Otherwise a fast transfer can put the first
+        // receipt in that baseline and the later window deltas omit it.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while handle
             .segmented_job()
-            .is_none_or(|job| job.adaptive_sample_log().len() < 2)
+            .is_none_or(|job| job.adaptive_sample_log().is_empty())
         {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the controller recorded fewer than two windows"
+                "the controller recorded no baseline window"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        scripted.open_gate("adaptive-start");
+        // Observe a complete window after both wire receipts and the second
+        // write acknowledgement; sampling an in-flight job is not a total.
+        while handle.snapshot().network_bytes < TOTAL
+            || handle
+                .segmented_job()
+                .is_none_or(|job| job.ack_latency_samples() == 0)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both receipts and a writer acknowledgement arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let observed_windows = handle
+            .segmented_job()
+            .expect("live job")
+            .adaptive_sample_log()
+            .len()
+            .max(2);
+        while handle
+            .segmented_job()
+            .is_none_or(|job| job.adaptive_sample_log().len() <= observed_windows)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controller recorded a complete post-receipt window"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
