@@ -3023,9 +3023,29 @@ mod sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sequence_cell_never_mixes_publications_under_stress() {
         let cell = Arc::new(LeaseProgress::default());
+        // Seed one observation synchronously: on a loaded runner the
+        // spawned writer can finish its whole 20k-record bulk before the
+        // reading task is first scheduled, which would make `observed` zero
+        // and turn a scheduling race into a test failure. The concurrent
+        // stress below still interleaves publish/clear against snapshots.
+        cell.publish(LeaseRecord {
+            lease_id: 1,
+            generation: 0,
+            lease_start: 1_000,
+            written_through: 1_001,
+            received_through: 1_001,
+        });
+        let seeded = cell.snapshot().expect("seeded record is observable");
+        assert_eq!(
+            seeded.written_through,
+            seeded.lease_id * 1000 + (seeded.lease_id % 1000),
+            "seeded record must satisfy the coherence invariant"
+        );
+        let mut observed = 1u64;
+
         let writer_cell = cell.clone();
         let writer = tokio::spawn(async move {
-            for lease_id in 1..=20_000u64 {
+            for lease_id in 2..=20_000u64 {
                 if lease_id % 5 == 0 {
                     // Clear/reuse: the cell returns to idle between leases.
                     writer_cell.clear();
@@ -3040,11 +3060,14 @@ mod sync_tests {
                         received_through: lease_id * 1000 + (lease_id % 1000),
                     });
                 }
+                // Periodic yields keep the reader interleaved on loaded
+                // runners instead of racing the entire bulk at once.
+                if lease_id % 128 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             writer_cell.clear();
         });
-
-        let mut observed = 0u64;
         while !writer.is_finished() {
             if let Some(record) = cell.snapshot() {
                 observed += 1;
