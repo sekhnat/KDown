@@ -110,6 +110,10 @@ name = "network_conditions_tests"
 path = "tests/network_conditions_tests.rs"
 
 [[test]]
+name = "http_edge_cases_tests"
+path = "tests/http_edge_cases_tests.rs"
+
+[[test]]
 name = "wire_amplification_tests"
 path = "tests/wire_amplification_tests.rs"
 
