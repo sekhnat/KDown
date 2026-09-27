@@ -482,13 +482,17 @@ impl HttpTransport {
     ) -> Result<FinalResponse, DownloadError> {
         let mut tracker = RedirectTracker::new(self.redirect.clone());
         let mut url = spec.url.clone();
-        let mut strip_credentials = false;
         loop {
             if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
+            // Credential scope is a property of the outgoing request: once
+            // the chain has crossed an origin boundary, every later hop
+            // (including a return to the original origin) keeps dropping
+            // origin credentials.
+            let strip_credentials = tracker.cross_origin_seen();
             let resp = self
-                .single_request(&method, &url, spec, range, strip_credentials)
+                .single_request(&method, &url, spec, range, strip_credentials, cancel)
                 .await?;
             let status = resp.status().as_u16();
             let location = resp
@@ -496,12 +500,7 @@ impl HttpTransport {
                 .get(hyper::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let current_headers: Vec<(String, String)> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect();
-            let decision = tracker.decide(status, location.as_deref(), &url, &current_headers);
+            let decision = tracker.decide(status, location.as_deref(), &url, &spec.headers);
             match decision.action {
                 RedirectAction::Final => {
                     // Retain the post-redirect URL and wire version for
@@ -517,11 +516,10 @@ impl HttpTransport {
                         http_version,
                     });
                 }
-                RedirectAction::Follow { location: next } => {
-                    if strip_credentials || decision.strip_credentials {
-                        strip_credentials = true;
-                    }
-                    url = resolve_redirect(&url, &next)?;
+                RedirectAction::Follow { location: target } => {
+                    // `decide` already resolved the Location against the
+                    // current URL; never re-resolve raw header text.
+                    url = target;
                 }
                 RedirectAction::Reject(e) => return Err(e),
             }
@@ -535,6 +533,7 @@ impl HttpTransport {
         spec: &RequestSpec,
         range: Option<(u64, u64)>,
         strip_credentials: bool,
+        cancel: &crate::control::CancellationToken,
     ) -> Result<hyper::Response<Incoming>, DownloadError> {
         let uri = self.uri(url)?;
         let scheme_ok = matches!(
@@ -567,8 +566,21 @@ impl HttpTransport {
             }
             for (k, v) in &spec.headers {
                 let lower = k.to_ascii_lowercase();
-                if strip_credentials && (lower == "authorization" || lower == "cookie") {
-                    continue; // stripped by redirect policy (§21.2)
+                // Proxy credentials are attached only by the connector
+                // from the configured proxy; a caller-supplied value must
+                // never reach an origin as an origin credential (§21.2).
+                if lower == "proxy-authorization" {
+                    continue;
+                }
+                // Cross-origin hop: drop the classified origin credentials,
+                // and for caller-marked sensitive requests drop every
+                // caller-supplied header, since its values may all be
+                // credentials under arbitrary names.
+                if strip_credentials
+                    && (crate::http::redirect::is_origin_credential_header(&lower)
+                        || spec.sensitive)
+                {
+                    continue;
                 }
                 hm.insert(
                     hyper::header::HeaderName::from_bytes(k.as_bytes())
@@ -595,10 +607,18 @@ impl HttpTransport {
             &self.clients[0]
         };
         let fut = client.request(req);
-        let resp = tokio::time::timeout(self.network.response_header_timeout, fut)
-            .await
-            .map_err(|_| DownloadError::ConnectTimeout)?
-            .map_err(|e| classify_transport_error(&e))?;
+        // A stalled response head must not outlive the job deadline or a
+        // caller cancellation: the same token every other wait honors
+        // interrupts the header wait promptly (§9.5, §10.2).
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+            result = tokio::time::timeout(self.network.response_header_timeout, fut) => {
+                result
+                    .map_err(|_| DownloadError::ConnectTimeout)?
+                    .map_err(|e| classify_transport_error(&e))?
+            }
+        };
         // Logical request accounting: one completed request is
         // one H2 stream when the connection negotiated HTTP/2, otherwise
         // one HTTP/1.x request on its own connection.
@@ -711,10 +731,22 @@ impl HttpExecutor for HttpTransport {
                 && request.verify_range_support
                 && !meta.range_verified
             {
+                // The validating range request targets the probe's final
+                // URL; credentials configured for the original URL are only
+                // attached when the final target is still credential-
+                // eligible (§21.2).
+                let vspec_headers = crate::http::redirect::scoped_request_headers(
+                    &request.spec.url,
+                    &head.final_url,
+                    &request.spec.headers,
+                    request.spec.sensitive,
+                    self.redirect.forward_cross_origin_credentials,
+                );
                 let mut vspec = RequestSpec {
                     url: head.final_url.clone(),
-                    headers: request.spec.headers.clone(),
+                    headers: vspec_headers,
                     identity_encoding: true,
+                    sensitive: request.spec.sensitive,
                     ..RequestSpec::default()
                 };
                 vspec.range = Some((0, 0));
@@ -866,32 +898,6 @@ impl HttpExecutor for HttpTransport {
     }
 }
 
-/// Resolve a redirect Location against the current URL (RFC 7231 §7.1.2).
-pub(crate) fn resolve_redirect(current: &str, location: &str) -> Result<String, DownloadError> {
-    if location.contains("://") {
-        return Ok(location.to_string());
-    }
-    let base =
-        hyper::Uri::try_from(current).map_err(|e| DownloadError::InvalidUrl(e.to_string()))?;
-    if let Some(path_and_query) = base.path_and_query() {
-        let pq = path_and_query.as_str();
-        if let Some(rest) = pq.strip_prefix('/') {
-            let _ = rest;
-        }
-    }
-    let authority = base
-        .authority()
-        .ok_or_else(|| DownloadError::InvalidUrl(current.to_string()))?;
-    let scheme = base.scheme_str().unwrap_or("http");
-    if location.starts_with('/') {
-        Ok(format!("{scheme}://{}{location}", authority.as_str()))
-    } else {
-        // Relative path: resolve against the current directory portion.
-        let base_path = base.path();
-        let dir = base_path.rsplit_once('/').map_or("/", |(d, _)| d);
-        Ok(format!("{scheme}://{authority}{dir}/{location}"))
-    }
-}
 
 /// Map hyper client errors onto the taxonomy (§17.1).
 pub(crate) fn classify_transport_error(e: &hyper_util::client::legacy::Error) -> DownloadError {

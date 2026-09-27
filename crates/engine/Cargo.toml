@@ -118,6 +118,10 @@ name = "platform_fs_tests"
 path = "tests/platform_fs_tests.rs"
 
 [[test]]
+name = "publication_tests"
+path = "tests/publication_tests.rs"
+
+[[test]]
 name = "wire_amplification_tests"
 path = "tests/wire_amplification_tests.rs"
 

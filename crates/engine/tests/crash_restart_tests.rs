@@ -122,7 +122,8 @@ async fn interrupt_during_pause_simulates_process_kill() {
             } else {
                 ScriptedResponse::ok((*content).clone())
             };
-            base.chunked(Duration::from_millis(20))
+            base.with_header("etag", "\"kill-gen\"")
+                .chunked(Duration::from_millis(20))
         })
         .start()
         .await
@@ -267,7 +268,8 @@ async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
             } else {
                 ScriptedResponse::ok((*content).clone())
             };
-            base.chunked(Duration::from_millis(20))
+            base.with_header("etag", "\"durable-gen\"")
+                .chunked(Duration::from_millis(20))
         })
         .start()
         .await
@@ -555,7 +557,8 @@ async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
                 } else {
                     ScriptedResponse::ok((*content).clone())
                 };
-                base.chunked(Duration::from_millis(20))
+                base.with_header("etag", "\"multi-gen\"")
+                    .chunked(Duration::from_millis(20))
             })
             .start()
             .await

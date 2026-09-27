@@ -174,7 +174,7 @@ struct ServerState {
     /// Path -> response for unlimited repeats.
     fallbacks: Mutex<HashMap<String, Handler>>,
     /// Path -> extra response headers.
-    default_headers: Mutex<HashMap<String, ExtraHeaders>>,
+    default_headers: Mutex<HashMap<String, Vec<ExtraHeaders>>>,
     requests: Mutex<Vec<RequestInfo>>,
     /// Payload bytes actually written to sockets (phase-0 wire
     /// amplification accounting): counts body bytes served, including
@@ -260,7 +260,7 @@ impl NetworkConditions {
 pub struct TestServer {
     handlers: HashMap<String, Handler>,
     scripts: Vec<(String, u32, ScriptedResponse)>,
-    default_headers: HashMap<String, ExtraHeaders>,
+    default_headers: HashMap<String, Vec<ExtraHeaders>>,
     network: Option<NetworkConditions>,
 }
 
@@ -348,7 +348,12 @@ impl TestServer {
         add: impl Fn(&mut Vec<(String, String)>) + Send + Sync + 'static,
     ) -> Self {
         let add = Arc::new(add);
-        self.default_headers.insert(path.to_string(), add);
+        // Composed, not replaced: several fixtures add headers to the same
+        // path (e.g. range advertisement plus validators).
+        self.default_headers
+            .entry(path.to_string())
+            .or_default()
+            .push(add);
         self
     }
 
@@ -549,8 +554,10 @@ async fn serve_conn(
         let mut resp = resolve_response(&state, &info);
         {
             let extras = state.default_headers.lock().expect("extras lock");
-            if let Some(add) = extras.get(&path) {
-                add(&mut resp.headers);
+            if let Some(adds) = extras.get(&path) {
+                for add in adds {
+                    add(&mut resp.headers);
+                }
             }
         }
 
@@ -666,6 +673,12 @@ async fn write_response(
                 emitted.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 writer.write_all(b"\r\n").await?;
             }
+        }
+        // A scripted reset interrupts the chunked stream as well: closing
+        // without the terminal chunk makes the client observe an
+        // incomplete chunked body, exactly like a mid-stream disconnect.
+        if resp.reset_after.is_some() {
+            return writer.flush().await;
         }
         writer.write_all(b"0\r\n\r\n").await?;
         return writer.flush().await;

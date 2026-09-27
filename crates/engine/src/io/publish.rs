@@ -23,6 +23,54 @@ pub(crate) struct PublishOutcome {
     pub(crate) temp_cleanup_warning: Option<String>,
 }
 
+/// Identity of the verified temporary output, captured from the open write
+/// handle before publication (design D2).
+///
+/// Where the platform exposes device + inode, publication re-checks the
+/// directory entry against this identity immediately before the atomic
+/// operation, so an entry swapped after verification fails closed. On
+/// platforms without those primitives the check degrades to a regular-file
+/// and length check, and callers rely on the documented trusted-directory
+/// precondition instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+}
+
+impl OutputIdentity {
+    /// Capture the identity of an opened output file.
+    #[must_use]
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Self {
+            dev,
+            ino,
+            len: meta.len(),
+        }
+    }
+
+    /// Whether a directory-entry metadata record still describes the same
+    /// file.
+    fn matches(&self, meta: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            meta.dev() == self.dev && meta.ino() == self.ino
+        }
+        #[cfg(not(unix))]
+        {
+            meta.len() == self.len
+        }
+    }
+}
 trait PublicationOps {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()>;
@@ -93,11 +141,51 @@ fn wait_at_test_gate(destination: &Path, mode: PublishMode) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn publish(
     temporary: &Path,
     destination: &Path,
     mode: PublishMode,
 ) -> io::Result<PublishOutcome> {
+    publish_verified(temporary, destination, mode, None)
+}
+
+/// Publish a verified temporary output, binding the operation to the exact
+/// file that was written and verified.
+///
+/// The directory entry is re-checked against `identity` immediately before
+/// the atomic rename/link: a swapped, symlinked or irregular entry fails
+/// closed without publishing. Pathname-based publication cannot eliminate
+/// the final check-to-operation race on every platform, so the destination
+/// directory must be trusted (no non-cooperating concurrent writers);
+/// cooperative jobs additionally hold the destination lease.
+pub(crate) fn publish_verified(
+    temporary: &Path,
+    destination: &Path,
+    mode: PublishMode,
+    identity: Option<OutputIdentity>,
+) -> io::Result<PublishOutcome> {
+    if let Some(expected) = identity {
+        let meta = std::fs::symlink_metadata(temporary)?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "temporary output {} is no longer a regular file",
+                    temporary.display()
+                ),
+            ));
+        }
+        if !expected.matches(&meta) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "temporary output {} changed after verification",
+                    temporary.display()
+                ),
+            ));
+        }
+    }
     #[cfg(test)]
     wait_at_test_gate(destination, mode);
     publish_with_ops(&LocalPublicationOps, temporary, destination, mode)
@@ -447,5 +535,49 @@ mod tests {
             .any(|event| matches!(event, crate::metrics::events::Event::Committed { .. }));
         assert!(!committed, "failed replacement emits no committed event");
         scripted.assert_all_consumed();
+    }
+
+    #[test]
+    fn swapped_entry_after_verification_fails_closed() {
+        // The entry is replaced with different content after the writer's
+        // identity was captured: publication must refuse to publish
+        // whatever now occupies the temp name (design D2).
+        let directory = tempfile::tempdir().expect("tempdir");
+        let temporary = write_temp(directory.path(), "output.part", b"verified bytes");
+        let destination = directory.path().join("output.bin");
+        let file = std::fs::File::open(&temporary).expect("open verified output");
+        let identity = OutputIdentity::of(&file.metadata().expect("metadata"));
+        std::fs::remove_file(&temporary).expect("remove verified entry");
+        std::fs::write(&temporary, b"impostor bytes").expect("plant impostor");
+
+        publish_verified(&temporary, &destination, PublishMode::Replace, Some(identity))
+            .expect_err("a changed entry must not publish");
+        assert!(!destination.exists(), "nothing may be published");
+        assert_eq!(
+            std::fs::read(&temporary).expect("impostor preserved"),
+            b"impostor bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_entry_after_verification_fails_closed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let temporary = write_temp(directory.path(), "output.part", b"verified bytes");
+        let scratch = write_temp(directory.path(), "unrelated.scratch", b"UNRELATED");
+        let destination = directory.path().join("output.bin");
+        let file = std::fs::File::open(&temporary).expect("open verified output");
+        let identity = OutputIdentity::of(&file.metadata().expect("metadata"));
+        std::fs::remove_file(&temporary).expect("remove verified entry");
+        std::os::unix::fs::symlink(&scratch, &temporary).expect("plant symlink");
+
+        publish_verified(&temporary, &destination, PublishMode::Replace, Some(identity))
+            .expect_err("a symlinked entry must not publish");
+        assert!(!destination.exists(), "nothing may be published");
+        assert_eq!(
+            std::fs::read(&scratch).expect("read scratch"),
+            b"UNRELATED",
+            "the symlink target must never be renamed or modified"
+        );
     }
 }

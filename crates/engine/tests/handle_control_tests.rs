@@ -174,3 +174,214 @@ async fn failed_job_leaves_no_temp_residue() {
     assert_eq!(handle.state(), JobState::Failed);
     assert!(!dir.path().join("dead.bin.part").exists());
 }
+
+/// `max_active_jobs` is enforced synchronously with an RAII permit: an
+/// over-cap start is rejected immediately with a typed error and writes
+/// no artifact, and the permit is released when a job finishes so a later
+/// start is admitted (§9.5, design D5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_job_cap_rejects_immediately_and_releases_on_completion() {
+    let content = vec![3u8; 4_000_000];
+    let server = TestServer::new()
+        .serve_handler("/capped", move |_req| {
+            ScriptedResponse::ok(content.clone()).chunked(Duration::from_millis(40))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let first_dest = dir.path().join("first.bin");
+    let second_dest = dir.path().join("second.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.max_active_jobs = 1;
+    let c = DownloadController::new(
+        HttpTransport::new(cfg.network.clone()).expect("transport"),
+        cfg,
+    );
+
+    let (first_handle, first_join) =
+        c.start(DownloadRequest::new(server.url("/capped"), first_dest.clone()));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        first_handle.snapshot().network_bytes > 0,
+        "the first job is admitted and transferring"
+    );
+
+    let (_second_handle, second_join) =
+        c.start(DownloadRequest::new(server.url("/capped"), second_dest.clone()));
+    let error = tokio::time::timeout(Duration::from_secs(10), second_join)
+        .await
+        .expect("no hang")
+        .expect("task");
+    let error = error.expect_err("an over-cap start must be rejected");
+    assert_eq!(error.category(), kdown_engine::ErrorCategory::MemoryCap);
+    assert!(
+        matches!(
+            error.as_engine_error(),
+            Some(kdown_engine::DownloadError::AdmissionRejected { cap: 1, .. })
+        ),
+        "typed admission rejection: {error:?}"
+    );
+    assert!(!second_dest.exists(), "a rejected job publishes nothing");
+    assert!(
+        !dir.path().join("second.bin.part").exists(),
+        "a rejected job writes no partial artifact"
+    );
+
+    // The first job's permit is released on its terminal path, so the cap
+    // admits a later job.
+    first_handle.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(30), first_join)
+        .await
+        .expect("no hang");
+    let third_dest = dir.path().join("third.bin");
+    let (_third_handle, third_join) =
+        c.start(DownloadRequest::new(server.url("/capped"), third_dest.clone()));
+    let completed = tokio::time::timeout(Duration::from_secs(60), third_join)
+        .await
+        .expect("no hang")
+        .expect("task")
+        .expect("a job started after a release must be admitted");
+    assert!(completed.final_path.exists());
+}
+
+// ---- Job deadline (task 4.4) ----
+
+fn deadline_controller(cfg: EngineConfig) -> DownloadController {
+    DownloadController::new(
+        HttpTransport::new(cfg.network.clone()).expect("transport"),
+        cfg,
+    )
+}
+
+/// A stalled response head must not outlive the deadline: the header wait
+/// is interrupted by the same token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_interrupts_stalled_header_wait_promptly() {
+    let server = TestServer::new()
+        .serve_handler("/stall", |_req| {
+            ScriptedResponse::ok(vec![1, 2, 3]).delayed_headers(Duration::from_secs(30))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("stall.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.job_deadline = Some(Duration::from_millis(80));
+    let c = deadline_controller(cfg);
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        c.run(DownloadRequest::new(server.url("/stall"), dest.clone())),
+    )
+    .await
+    .expect("bounded expiry")
+    .expect_err("the deadline must fail the job");
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::DeadlineExceeded,
+        "typed deadline outcome: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "expiry latency must be bounded, took {:?}",
+        started.elapsed()
+    );
+    assert!(!dest.exists(), "nothing may be published");
+}
+
+/// A server-directed `Retry-After` backoff longer than the deadline must be
+/// interrupted instead of slept through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_interrupts_retry_after_backoff() {
+    let server = TestServer::new()
+        .serve_handler("/throttle", |_req| {
+            ScriptedResponse::new(503).with_header("retry-after", "30")
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("throttle.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.retry.honor_retry_after = true;
+    cfg.transfer.job_deadline = Some(Duration::from_millis(100));
+    let c = deadline_controller(cfg);
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        c.run(DownloadRequest::new(server.url("/throttle"), dest.clone())),
+    )
+    .await
+    .expect("bounded expiry")
+    .expect_err("the deadline must fail the job");
+    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 30s backoff must be interrupted, took {:?}",
+        started.elapsed()
+    );
+    assert!(!dest.exists());
+}
+
+/// A job paused indefinitely still expires at its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_expires_while_paused() {
+    let content = vec![4u8; 4_000_000];
+    let server = TestServer::new()
+        .serve_handler("/paused", move |_req| {
+            ScriptedResponse::ok(content.clone()).chunked(Duration::from_millis(30))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("paused.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.job_deadline = Some(Duration::from_millis(300));
+    let c = deadline_controller(cfg);
+    let (handle, join) = c.start(DownloadRequest::new(server.url("/paused"), dest.clone()));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    handle.pause();
+    let error = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("a paused job must still expire")
+        .expect("task")
+        .expect_err("the deadline must fail the paused job");
+    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert!(!dest.exists());
+}
+
+/// A slow body observes the deadline within a bounded number of chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_interrupts_slow_body() {
+    let content = vec![5u8; 8_000_000];
+    let server = TestServer::new()
+        .serve_handler("/slow", move |_req| {
+            ScriptedResponse::ok(content.clone()).chunked(Duration::from_millis(25))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmp");
+    let dest = dir.path().join("slow.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.job_deadline = Some(Duration::from_millis(120));
+    let c = deadline_controller(cfg);
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        c.run(DownloadRequest::new(server.url("/slow"), dest.clone())),
+    )
+    .await
+    .expect("bounded expiry")
+    .expect_err("the deadline must fail the job");
+    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slow bodies must stop promptly, took {:?}",
+        started.elapsed()
+    );
+    assert!(!dest.exists());
+}

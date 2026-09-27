@@ -304,6 +304,19 @@ impl<'a> PendingAdmission<'a> {
                 }],
             });
         }
+        if let Err(reason) = cp.validators.comparable_generation(remote) {
+            // Insufficient evidence (missing, weak or incomparable
+            // validators): discard the checkpoint and restart from zero —
+            // old bytes are never trusted on size alone (§26, design D3).
+            if let Err(failure) = delete_restart_state(self.store, &self.identity) {
+                return AdmissionDecision::Reject(failure);
+            }
+            let mut warnings = self.warnings;
+            warnings.push(format!(
+                "checkpoint not comparable ({reason}); restarting from zero"
+            ));
+            return AdmissionDecision::Proceed(Box::new(ResumePlan::fresh(warnings, vec![])));
+        }
         if let Err(e) = validate_temp_file(&cp, &self.temp_path) {
             // Unusable local output: conservative restart (§15.5/§38).
             if let Err(failure) = delete_restart_state(self.store, &self.identity) {
@@ -337,7 +350,12 @@ fn delete_restart_state(store: &dyn CheckpointStore, identity: &str) -> Result<(
 /// [`DownloadError::Checkpoint`] when the temp file is missing or too
 /// small for the recorded ranges.
 fn validate_temp_file(cp: &Checkpoint, temp_path: &Path) -> Result<(), DownloadError> {
-    let meta = std::fs::metadata(temp_path).map_err(|e| {
+    // The entry must be an engine-owned regular file: a symlink or a
+    // multiply linked file is never a trustworthy partial output (§15.5,
+    // design D2). `symlink_metadata` deliberately does not follow links.
+    crate::io::sink::validate_owned_regular_file(temp_path)
+        .map_err(|e| DownloadError::Checkpoint(e.0.to_string()))?;
+    let meta = std::fs::symlink_metadata(temp_path).map_err(|e| {
         DownloadError::Checkpoint(format!("temp file {} missing: {e}", temp_path.display()))
     })?;
     let needed = cp
@@ -353,6 +371,10 @@ fn validate_temp_file(cp: &Checkpoint, temp_path: &Path) -> Result<(), DownloadE
             needed
         )));
     }
+    // v2 owned binding: the recorded file object identity and bounded
+    // covered-byte digest must still describe this entry (design D3).
+    cp.verify_local_binding(temp_path)
+        .map_err(DownloadError::Checkpoint)?;
     Ok(())
 }
 
@@ -423,6 +445,24 @@ mod tests {
             cp.record_completed(s, e);
         }
         cp
+    }
+
+    /// A checkpoint with no validator evidence at all (legacy or stripped).
+    fn sample_cp_without_validators(ranges: &[ByteRange]) -> Checkpoint {
+        let mut cp = Checkpoint::new("job", "https://example/f", "tmp");
+        cp.validators.total_size = Some(1000);
+        cp.total_size = Some(1000);
+        for &(s, e) in ranges {
+            cp.record_completed(s, e);
+        }
+        cp
+    }
+
+    fn remote_without_validators() -> ResourceValidators {
+        ResourceValidators {
+            total_size: Some(1000),
+            ..ResourceValidators::default()
+        }
     }
 
     /// Scripted in-memory store for admission tests: deterministic
@@ -730,5 +770,113 @@ mod tests {
         assert_eq!(plan.sequential().offset, 1000);
         assert_eq!(plan.sequential().reused_bytes, 1000);
         assert_eq!(plan.segmented().reused_bytes, 1000);
+    }
+
+    #[test]
+    fn validator_free_checkpoint_restarts_instead_of_size_only_resume() {
+        // The reproduced P0: a fully covered checkpoint with no validators
+        // used to authorize publishing its bytes without any GET. Size
+        // equality is not evidence; admission must restart from zero.
+        let store = FakeStore::holding(sample_cp_without_validators(&[(0, 999)]));
+        let dir = tempfile::tempdir().expect("tmp");
+        let temp = dir.path().join("out.part");
+        std::fs::write(&temp, vec![0u8; 1000]).expect("temp");
+        let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators()) else {
+            panic!("validator-free state restarts conservatively");
+        };
+        assert!(!plan.is_resuming(), "no validator means no reuse");
+        assert_eq!(plan.sequential().offset, 0);
+        assert_eq!(store.deleted_identities(), vec!["identity".to_string()]);
+        assert!(
+            plan.warnings()
+                .iter()
+                .any(|w| w.contains("not comparable")),
+            "the restart must explain the missing evidence: {:?}",
+            plan.warnings()
+        );
+    }
+
+    #[test]
+    fn disappearing_etag_restarts_from_zero() {
+        let store = FakeStore::holding(sample_cp("\"gen-1\"", &[(0, 499)]));
+        let dir = tempfile::tempdir().expect("tmp");
+        let temp = dir.path().join("out.part");
+        std::fs::write(&temp, vec![0u8; 500]).expect("temp");
+        let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators()) else {
+            panic!("missing current validator restarts; it is not a change");
+        };
+        assert!(!plan.is_resuming());
+        assert_eq!(store.deleted_identities(), vec!["identity".to_string()]);
+    }
+
+    #[test]
+    fn weak_etag_pair_restarts_from_zero() {
+        let mut cp = Checkpoint::new("job", "https://example/f", "tmp");
+        cp.validators = ResourceValidators {
+            etag: Some("\"weak\"".into()),
+            etag_is_weak: true,
+            total_size: Some(1000),
+            ..ResourceValidators::default()
+        };
+        cp.record_completed(0, 499);
+        let store = FakeStore::holding(cp);
+        let dir = tempfile::tempdir().expect("tmp");
+        let temp = dir.path().join("out.part");
+        std::fs::write(&temp, vec![0u8; 500]).expect("temp");
+        let remote = ResourceValidators {
+            etag: Some("\"weak\"".into()),
+            etag_is_weak: true,
+            total_size: Some(1000),
+            ..ResourceValidators::default()
+        };
+        let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote) else {
+            panic!("weak-only evidence restarts");
+        };
+        assert!(!plan.is_resuming());
+        assert_eq!(store.deleted_identities(), vec!["identity".to_string()]);
+    }
+
+    #[test]
+    fn last_modified_change_rejects_without_deleting() {
+        let mut cp = Checkpoint::new("job", "https://example/f", "tmp");
+        cp.validators.last_modified = Some("Mon, 01 Jan 2024 00:00:00 GMT".into());
+        cp.validators.total_size = Some(1000);
+        cp.record_completed(0, 499);
+        let store = FakeStore::holding(cp);
+        let dir = tempfile::tempdir().expect("tmp");
+        let temp = dir.path().join("out.part");
+        std::fs::write(&temp, vec![0u8; 500]).expect("temp");
+        let remote = ResourceValidators {
+            last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
+            total_size: Some(1000),
+            ..ResourceValidators::default()
+        };
+        let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
+        let AdmissionDecision::Reject(failure) = pending.finalize(&remote) else {
+            panic!("a changed Last-Modified is a resource change");
+        };
+        assert!(matches!(failure.error, DownloadError::ResourceChanged(_)));
+        assert!(
+            store.deleted_identities().is_empty(),
+            "the fail policy preserves state for inspection"
+        );
+    }
+
+    #[test]
+    fn fully_covered_checkpoint_with_strong_etag_still_resumes() {
+        let store = FakeStore::holding(sample_cp("\"gen-1\"", &[(0, 999)]));
+        let dir = tempfile::tempdir().expect("tmp");
+        let temp = dir.path().join("out.part");
+        std::fs::write(&temp, vec![0u8; 1000]).expect("temp");
+        let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&validators_for("\"gen-1\"")) else {
+            panic!("comparable strong validators admit the checkpoint");
+        };
+        assert!(plan.is_resuming());
+        assert_eq!(plan.sequential().offset, 1000);
+        assert!(store.deleted_identities().is_empty());
     }
 }

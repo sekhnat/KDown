@@ -407,6 +407,7 @@ fn pause_mid_body_script() -> ScriptedHttp {
         .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
             status: 200,
             total_size: Some(10),
+            validators: etag_validators("\"refresh-gen\"", 10),
             ..ProbeMetadata::default()
         }))
         .expect_transfer(
@@ -579,6 +580,7 @@ async fn resume_refresh_save_failure_preserves_previous_checkpoint() {
     // Prior usable state: checkpoint + temp file covering its ranges.
     let mut prior = EngineCheckpoint::new(&identity, "https://scripted/refresh.bin", "tmp");
     prior.total_size = Some(10);
+    prior.validators = etag_validators("\"refresh-gen\"", 10);
     prior.record_completed(0, 4);
     store.save_atomic(&prior).expect("seed checkpoint");
     std::fs::write(dir.path().join("out.bin.part"), vec![0u8; 5]).expect("temp");

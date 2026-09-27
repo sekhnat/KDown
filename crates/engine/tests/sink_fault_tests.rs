@@ -310,6 +310,9 @@ async fn keep_partial_cancel_then_restart_resumes_from_durable_ranges() {
     let content = Arc::new(fixtures::deterministic_bytes(1024 * 1024, 0x73));
     let server = crate::internal_tests::support::test_server::TestServer::new()
         .serve_static("/file", (*content).clone())
+        .with_default_headers("/file", |headers| {
+            headers.push(("etag".to_string(), "\"fault-gen\"".to_string()));
+        })
         .start()
         .await
         .expect("start");
@@ -357,4 +360,151 @@ async fn keep_partial_cancel_then_restart_resumes_from_durable_ranges() {
         "the restart reused durable ranges: reused={}",
         completed.accounting.bytes_reused_from_checkpoint
     );
+}
+
+/// Durable mode: a cadence checkpoint may persist only after the output
+/// data corresponding to its frontier was synchronized. An injected sync
+/// failure stops the job with a checkpoint-category failure and never
+/// persists the unsynced frontier (§15.4, design D3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_cadence_sync_failure_never_persists_the_frontier() {
+    use super::support::test_server::{ScriptedResponse, TestServer};
+    use kdown_engine::resume::FileCheckpointStore;
+    use kdown_engine::{CheckpointStore as _, StoreDurabilityMode};
+
+    let content = Arc::new(fixtures::deterministic_bytes(1024 * 1024, 0x77));
+    let served = Arc::clone(&content);
+    let server = TestServer::new()
+        .serve_handler("/file", move |_| {
+            ScriptedResponse::ok((*served).clone()).chunked(std::time::Duration::from_millis(15))
+        })
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("out.bin");
+    let identity = kdown_engine::resume::job_identity(&server.url("/file"), &dest);
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.durability = kdown_engine::config::DurabilityMode::Durable;
+    cfg.checkpoint_flush_interval = std::time::Duration::from_millis(10);
+    let controller = controller_for(cfg);
+    let registration = OutputFaultScript::register(&dest);
+    registration.script().fail_next(
+        OutputOperation::Flush,
+        kdown_engine::DownloadError::SinkWrite("sync boom".into()),
+    );
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        controller.run(DownloadRequest::new(server.url("/file"), dest.clone())),
+    )
+    .await
+    .expect("no hang")
+    .expect_err("the failed sync must fail the job");
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::Checkpoint,
+        "sync failure surfaces as a checkpoint-category failure: {error:?}"
+    );
+    assert!(!dest.exists(), "nothing may be published");
+    let store = FileCheckpointStore::new(dir.path(), StoreDurabilityMode::Durable)
+        .expect("store");
+    assert!(
+        store.load(&identity).expect("load").is_none(),
+        "a failed sync must never persist a frontier"
+    );
+}
+
+/// Publication commit boundary (task 4.5): an expiry that arrives while
+/// the atomic commit is in flight still reports success truthfully once
+/// the commit completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_during_gated_commit_reports_success_truthfully() {
+    use super::support::test_server::{ScriptedResponse, TestServer};
+    use crate::io::publish::{install_test_gate, PublishMode};
+    use kdown_engine::config::OverwritePolicy;
+
+    let content = Arc::new(b"hello".to_vec());
+    let served = Arc::clone(&content);
+    let server = TestServer::new()
+        .serve_handler("/file", move |_| ScriptedResponse::ok((*served).clone()))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("out.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.job_deadline = Some(std::time::Duration::from_millis(400));
+    let controller = controller_for(cfg);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    install_test_gate(dest.clone(), PublishMode::Replace, entered_tx, release_rx);
+    let mut request = DownloadRequest::new(server.url("/file"), dest.clone());
+    request.overwrite = OverwritePolicy::Replace;
+    let (_handle, task) = controller.start(request);
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| ())
+    })
+    .await
+    .expect("gate waiter")
+    .expect("job reached the commit gate");
+    // The deadline expires while the atomic publication is held at the gate.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    release_tx.send(()).expect("release commit");
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("no hang")
+        .expect("task")
+        .expect("success after an atomic commit must be reported truthfully");
+    assert!(completed.final_path.exists());
+    assert_eq!(std::fs::read(&dest).expect("read"), b"hello");
+}
+
+/// Publication commit boundary (task 4.5): an expiry that arrives before
+/// the atomic commit fails safely and publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deadline_before_commit_fails_safely_without_publishing() {
+    use super::support::test_server::{ScriptedResponse, TestServer};
+    use kdown_engine::config::{ExpectedHash, HashAlgorithm};
+
+    let content = Arc::new(fixtures::deterministic_bytes(64 * 1024, 0x78));
+    let served = Arc::clone(&content);
+    let expected_hash = fixtures::sha256_hex(&content);
+    let server = TestServer::new()
+        .serve_handler("/file", move |_| ScriptedResponse::ok((*served).clone()))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("out.bin");
+    let mut cfg = EngineConfig::default();
+    cfg.transfer.job_deadline = Some(std::time::Duration::from_millis(400));
+    let controller = controller_for(cfg);
+    let registration = OutputFaultScript::register(&dest);
+    let gate = registration
+        .script()
+        .hold_next(OutputOperation::VerificationRead);
+    let mut request = DownloadRequest::new(server.url("/file"), dest.clone());
+    request.integrity.expected_hashes = vec![ExpectedHash {
+        algorithm: HashAlgorithm::Sha256,
+        hex: expected_hash,
+    }];
+    let (_handle, task) = controller.start(request);
+    // Wait at the verification boundary until the deadline has passed.
+    gate.wait_until_entered();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    gate.release();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("no hang")
+        .expect("task")
+        .expect_err("an expiry before commit must fail the job");
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::DeadlineExceeded,
+        "typed deadline failure: {error:?}"
+    );
+    assert!(!dest.exists(), "nothing may be published");
 }

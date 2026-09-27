@@ -13,6 +13,10 @@ pub struct CancellationToken {
 #[derive(Debug)]
 struct Inner {
     cancelled: AtomicBool,
+    /// Set when terminal cancellation came from the job deadline: the
+    /// terminal handler reports `DeadlineExceeded` instead of a caller
+    /// cancellation while cleanup/disposition stay identical.
+    deadline: AtomicBool,
     /// Separate pause flag: pause must stop network reads (§9.3) but is
     /// distinct from terminal cancellation.
     paused: AtomicBool,
@@ -28,6 +32,7 @@ impl Default for Inner {
         let (state_tx, _) = tokio::sync::watch::channel(0u8);
         Self {
             cancelled: AtomicBool::default(),
+            deadline: AtomicBool::default(),
             paused: AtomicBool::default(),
             state_tx,
         }
@@ -56,6 +61,20 @@ impl CancellationToken {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Cancel because the job deadline expired: terminal handlers report
+    /// [`crate::error::DownloadError::DeadlineExceeded`] rather than a
+    /// caller cancellation.
+    pub fn cancel_with_deadline(&self) {
+        self.inner.deadline.store(true, Ordering::SeqCst);
+        self.cancel();
+    }
+
+    /// Whether terminal cancellation was caused by the job deadline.
+    #[must_use]
+    pub fn deadline_exceeded(&self) -> bool {
+        self.inner.deadline.load(Ordering::SeqCst)
     }
 
     /// Request cooperative pause.
@@ -207,5 +226,16 @@ mod tests {
                 .await
                 .expect("resolves");
         assert_eq!(reason, CancellationReason::Paused);
+    }
+
+    #[test]
+    fn deadline_flag_is_distinct_from_caller_cancel() {
+        let t = CancellationToken::new();
+        t.cancel();
+        assert!(!t.deadline_exceeded(), "a caller cancel is not a deadline");
+        let t2 = CancellationToken::new();
+        t2.cancel_with_deadline();
+        assert!(t2.is_cancelled());
+        assert!(t2.deadline_exceeded(), "the deadline reason latches");
     }
 }

@@ -30,7 +30,7 @@ use crate::io::write_executor::{
     SessionDisposition, WriteCompletion, WriteExecutor, WriteOutcome, WriteSession, WriteSubmission,
 };
 use crate::io::write_frontier::{CompletionStatus, LeaseFrontier};
-use crate::job::controller::{CancelMode, DownloadRequest, ResultStatus};
+use crate::job::controller::{CancelMode, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::SharedHub;
@@ -50,6 +50,14 @@ pub struct SegmentedJob {
     fatal: FatalState,
     cancel: CancellationToken,
     hub: SharedHub,
+    /// Shared authenticated request context for this job's resolved
+    /// origin (§21.2, §29): workers read the current headers per attempt
+    /// and one bounded challenge stage may latch provider credentials.
+    credentials: Arc<crate::control::auth::SharedCredentials>,
+    /// Owned temp path backing this job's output (§15.2, design D3): every
+    /// persisted checkpoint is stamped with this file's v2 identity and
+    /// bounded covered digest.
+    temp_path: std::path::PathBuf,
     counters: Arc<JobCounters>,
     /// Stable per-job token bucket (§18): one `Arc<TokenBucket>`
     /// for the job's lifetime; rate `0` = unlimited. Live rate updates
@@ -675,7 +683,7 @@ pub(crate) struct SegmentedOutcome {
 pub(crate) async fn run_segmented(
     execution: HttpExecution,
     config: &EngineConfig,
-    request: &DownloadRequest,
+    credentials: Arc<crate::control::auth::SharedCredentials>,
     state: &Arc<StateMachine>,
     session: &mut OutputSession,
     store: &Arc<dyn CheckpointStore>,
@@ -792,7 +800,9 @@ pub(crate) async fn run_segmented(
         fatal: FatalState::default(),
         cancel: cancel.clone(),
         hub: hub.clone(),
+        credentials: credentials.clone(),
         counters: counters.clone(),
+        temp_path: session.temp_path().to_path_buf(),
         rate_bucket: initial_rate_bucket,
         global_rate_bucket,
         total_size,
@@ -923,7 +933,6 @@ pub(crate) async fn run_segmented(
         };
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
-            headers: request.headers.clone(),
             identity_encoding: true,
         };
         let counters_w = counters.clone();
@@ -1176,7 +1185,9 @@ pub(crate) async fn run_segmented(
 #[derive(Debug, Clone)]
 struct WorkerRequestSpec {
     url: String,
-    headers: Vec<(String, String)>,
+    /// Headers are read from the job's shared credential context on every
+    /// attempt, so credentials latched after a challenge reach later
+    /// requests (§21.2, §29).
     identity_encoding: bool,
 }
 
@@ -1585,7 +1596,12 @@ async fn worker_cycle(
                         delay,
                     } => {
                         attempt = next;
-                        tokio::time::sleep(delay).await;
+                        // Cancellation/deadline interrupts the backoff and
+                        // the worker loop settles on its next pass.
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = job.cancel.cancelled() => {}
+                        }
                     }
                     RetryDecision::GiveUp => {
                         job.fatal.install(DownloadError::RetryExhausted {
@@ -1675,7 +1691,14 @@ async fn transfer_lease(
         };
         if let Some(d) = wait {
             if d > Duration::ZERO {
-                tokio::time::sleep(d).await;
+                // The shared backoff gate must not outlive cancellation or
+                // the deadline; a cancelled wait ends this lease attempt.
+                tokio::select! {
+                    _ = tokio::time::sleep(d) => {}
+                    _ = job.cancel.cancelled() => {
+                        return Err(WorkerError::Fatal(DownloadError::Cancelled));
+                    }
+                }
                 continue;
             }
         }
@@ -1724,31 +1747,73 @@ async fn transfer_lease(
     // Semantic ranged transfer (§32): the intent carries the requested
     // range, established total, and expected validators (generation
     // identity, §5.2); HTTP validates the response before any body byte.
-    let spec = RequestSpec {
-        url: req_spec.url.clone(),
-        headers: req_spec.headers.clone(),
-        identity_encoding: req_spec.identity_encoding,
-        ..RequestSpec::default()
-    };
-    let intent = TransferIntent::Range(RangeIntent {
-        range: (start_from, lease.end),
-        established_total: Some(job.total_size),
-        // Expected validators issue the request conditionally (If-Range,
-        // §11.3) and reject generation mixing (§26).
-        expected_validators: Some(job.validators.clone()),
-        full_response: FullResponsePolicy::InvalidRange,
-    });
+    // Semantic ranged transfer (§32): the intent carries the requested
+    // range, established total, and expected validators (generation
+    // identity, §5.2); HTTP validates the response before any body byte.
+    //
+    // The authenticated header set is read from the job's shared
+    // credential context on every attempt: provider credentials latched
+    // after a challenge reach the immediate, bounded retry below.
     let cancel = job.cancel.clone();
-    let response = match execution
-        .transfer(TransferRequest { spec, intent }, &cancel)
-        .await
-    {
-        Ok(r) => r,
-        Err(HttpFailure {
-            error, retry_after, ..
-        }) => {
-            // No body bytes were received for this attempt: zero waste.
-            return Err(worker_error_from_failure(error, retry_after, classifier, 0));
+    // At most one credential retry per lease attempt: a repeated challenge
+    // after the latched credentials fails closed instead of looping, while
+    // provider consultations stay globally bounded by MAX_AUTH_STAGES.
+    let mut provided_here = false;
+    let response = loop {
+        let spec = RequestSpec {
+            url: req_spec.url.clone(),
+            headers: job.credentials.headers(),
+            identity_encoding: req_spec.identity_encoding,
+            sensitive: job.credentials.sensitive(),
+            ..RequestSpec::default()
+        };
+        let intent = TransferIntent::Range(RangeIntent {
+            range: (start_from, lease.end),
+            established_total: Some(job.total_size),
+            // Expected validators issue the request conditionally (If-Range,
+            // §11.3) and reject generation mixing (§26).
+            expected_validators: Some(job.validators.clone()),
+            full_response: FullResponsePolicy::InvalidRange,
+        });
+        match execution
+            .transfer(TransferRequest { spec, intent }, &cancel)
+            .await
+        {
+            Ok(r) => break r,
+            Err(HttpFailure {
+                error,
+                retry_after,
+                challenge,
+            }) => {
+                if let Some(challenge) = &challenge {
+                    if provided_here {
+                        return Err(WorkerError::Fatal(
+                            DownloadError::AuthenticationRequired,
+                        ));
+                    }
+                    match job.credentials.provide(challenge) {
+                        // New credentials were latched: retry the same
+                        // lease immediately with them.
+                        Ok(true) => {
+                            provided_here = true;
+                            continue;
+                        }
+                        // No provider, no stage left, or the provider
+                        // declined: fail closed exactly like the sequential
+                        // path (no unbounded authentication retries).
+                        Ok(false) => {
+                            return Err(WorkerError::Fatal(
+                                DownloadError::AuthenticationRequired,
+                            ));
+                        }
+                        Err(provider_error) => {
+                            return Err(WorkerError::Fatal(provider_error));
+                        }
+                    }
+                }
+                // No body bytes were received for this attempt: zero waste.
+                return Err(worker_error_from_failure(error, retry_after, classifier, 0));
+            }
         }
     };
     let validated_start = response.start;
@@ -2868,19 +2933,15 @@ async fn attempt_coordinator_save(
         }
     }
 
-    // 3. Durability ordering: data sync strictly before metadata save.
+    // 3. Durability ordering (shared with the sequential cadence/pause
+    // path): in Durable mode data syncs strictly before metadata save.
     if job.durability == DurabilityMode::Durable {
-        let sync = job.sync.as_ref().ok_or_else(|| {
+        let sync = job.sync.clone().ok_or_else(|| {
             DownloadError::SinkWrite("durable checkpoint save has no sync capability".into())
         })?;
-        // Blocking fs work off the network tasks: one
-        // spawn_blocking per infrequent checkpoint, never per chunk.
-        let sync = sync.clone();
-        tokio::task::spawn_blocking(move || sync.sync_data())
+        crate::io::output_session::sync_data_before_checkpoint(true, sync)
             .await
-            .map_err(|join_err| {
-                DownloadError::SinkWrite(format!("checkpoint sync task failed: {join_err}"))
-            })??;
+            .map_err(|e| e.0)?;
     }
 
     // 4. Persist off the latency-sensitive path.
@@ -2892,10 +2953,12 @@ async fn attempt_coordinator_save(
     cp.total_size = Some(job.total_size);
     cp.validators = candidates.validators.clone();
     cp.completed_ranges = candidates.ranges.clone();
+    cp.set_owned_temp_identity(&job.temp_path);
+    cp.set_covered_digest(&job.temp_path);
     // Transfer-memory admission (task 3.6): the checkpoint's estimated
     // serialized size is charged to the Checkpoint component before the
     // store allocates; a refusal fails the save (and the job) safely.
-    let estimate = cp.serialized_size_estimate();
+    let estimate = cp.checked_serialized_size()?;
     let reservation = job
         .ledger
         .reserve(crate::io::transfer_ledger::Component::Checkpoint, estimate)
@@ -3015,6 +3078,12 @@ mod durability_tests {
             cancel: crate::control::CancellationToken::new(),
             hub: std::sync::Arc::new(hub),
             counters: Arc::new(JobCounters::new(1)),
+            credentials: Arc::new(crate::control::auth::SharedCredentials::new(
+                Vec::new(),
+                None,
+                false,
+            )),
+            temp_path: std::path::PathBuf::new(),
             rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
             global_rate_bucket: Arc::new(crate::control::rate_limit::TokenBucket::new(0)),
             total_size: 100,

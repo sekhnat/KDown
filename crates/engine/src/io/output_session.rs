@@ -140,6 +140,31 @@ impl OutputSyncCapability {
     }
 }
 
+/// Shared durability ordering (§15.4): in Durable mode, output data must be
+/// synchronized successfully before checkpoint metadata may persist.
+///
+/// The sequential cadence/pause saves and the segmented coordinator both
+/// call this with their sync capability, so the sync-then-store ordering
+/// cannot diverge between transfer modes. Performance mode skips the sync
+/// explicitly (its weaker page-cache guarantee is documented).
+///
+/// # Errors
+/// The structured sync failure; the caller must not persist the frontier.
+pub(crate) async fn sync_data_before_checkpoint(
+    durable: bool,
+    sync: OutputSyncCapability,
+) -> Result<(), SinkError> {
+    if !durable {
+        return Ok(());
+    }
+    match tokio::task::spawn_blocking(move || sync.sync_data()).await {
+        Ok(result) => result,
+        Err(join_error) => Err(SinkError(DownloadError::SinkWrite(format!(
+            "checkpoint sync task failed: {join_error}"
+        )))),
+    }
+}
+
 pub(crate) trait PartialArtifactOwner {
     fn preserve_partial(&mut self);
 }
@@ -172,7 +197,7 @@ impl OutputSession {
         if let Some(script) = &script {
             script.check(OutputOperation::Open).map_err(SinkError)?;
         }
-        let mut sink = FileSink::open(destination, spec, preallocate, physical)?;
+        let mut sink = FileSink::create_exclusive(destination, spec, preallocate, physical)?;
         sink.prepare(total_size)?;
         Ok(Self {
             sink: Some(sink),
@@ -193,7 +218,7 @@ impl OutputSession {
         if let Some(script) = &script {
             script.check(OutputOperation::Open).map_err(SinkError)?;
         }
-        let mut sink = FileSink::open(destination, spec, false, false)?;
+        let mut sink = FileSink::open_owned(destination, spec)?;
         sink.set_keep_on_drop(true);
         Ok(Self {
             sink: Some(sink),
@@ -351,6 +376,10 @@ impl Sink for OutputSession {
 
     fn size(&mut self) -> Result<u64, SinkError> {
         self.sink_mut()?.size()
+    }
+
+    fn truncate_to(&mut self, len: u64) -> Result<(), SinkError> {
+        self.sink_mut()?.truncate_to(len)
     }
 
     fn finalize(&mut self) -> Result<(), SinkError> {

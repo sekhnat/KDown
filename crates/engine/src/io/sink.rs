@@ -76,6 +76,14 @@ pub trait Sink {
     /// SinkOpen when the file cannot be inspected.
     fn size(&mut self) -> Result<u64, SinkError>;
 
+    /// Set the output length to `len` (the acknowledged end of an
+    /// unknown-length stream), removing stale tails or preallocated holes
+    /// before verification and publication (§25).
+    ///
+    /// # Errors
+    /// SinkWrite when the file cannot be resized.
+    fn truncate_to(&mut self, len: u64) -> Result<(), SinkError>;
+
     /// Flush and settle the temporary output according to the active durability policy.
     ///
     /// This does not publish the file. The engine publishes it only after
@@ -215,6 +223,129 @@ impl FileSink {
         })
     }
 
+    /// Create a fresh, exclusively owned temporary output.
+    ///
+    /// Any pre-existing entry at the temp path (regular file, symlink or
+    /// hard link) is unlinked first — never opened, inherited or written
+    /// through — and the new file is created with `create_new`, so a racing
+    /// replacement fails closed instead of being adopted (design D2, §14.1).
+    ///
+    /// # Errors
+    /// `SinkOpen`/`PermissionDenied` when the temp file cannot be created
+    /// or a racing entry already exists.
+    pub fn create_exclusive(
+        destination: &Path,
+        spec: &TempFileSpec,
+        preallocate: bool,
+        physical: bool,
+    ) -> Result<Self, SinkError> {
+        let temp_path = spec.temp_path_for(destination);
+        let parent = temp_path
+            .parent()
+            .ok_or_else(|| SinkError(DownloadError::SinkOpen("no parent directory".into())))?;
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(SinkError(DownloadError::SinkOpen(format!(
+                "destination directory does not exist: {}",
+                parent.display()
+            ))));
+        }
+        // Unlinked, never followed: removing a symlink/entry leaf cannot
+        // touch whatever it pointed at, and `create_new` below proves the
+        // new file is ours (a race surfaces as a typed failure).
+        match std::fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(SinkError(DownloadError::from_io(&e))),
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| DownloadError::from_io(&e))
+            .map_err(SinkError)?;
+        Ok(Self::from_file(
+            destination,
+            temp_path,
+            file,
+            preallocate,
+            physical,
+        ))
+    }
+
+    /// Open an existing, validated temporary output for resume.
+    ///
+    /// The entry must be a regular file with a single hard link and no
+    /// symlink; the opened descriptor is re-checked against the entry so a
+    /// replacement between check and open fails closed (§15.5, design D2).
+    ///
+    /// # Errors
+    /// `SinkOpen` when the entry is missing, irregular, linked or changed
+    /// while opening.
+    pub fn open_owned(destination: &Path, spec: &TempFileSpec) -> Result<Self, SinkError> {
+        let temp_path = spec.temp_path_for(destination);
+        validate_owned_regular_file(&temp_path)?;
+        let before = std::fs::symlink_metadata(&temp_path)
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+        let opened = file
+            .metadata()
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+        let after = std::fs::symlink_metadata(&temp_path)
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+        if !same_file_identity(&before, &opened) || !same_file_identity(&opened, &after) {
+            return Err(SinkError(DownloadError::SinkOpen(format!(
+                "temporary output {} changed while opening",
+                temp_path.display()
+            ))));
+        }
+        let mut sink = Self::from_file(destination, temp_path, file, false, false);
+        sink.set_keep_on_drop(true);
+        Ok(sink)
+    }
+
+    fn from_file(
+        destination: &Path,
+        temp_path: PathBuf,
+        file: File,
+        preallocate: bool,
+        physical: bool,
+    ) -> Self {
+        Self {
+            destination: destination.to_path_buf(),
+            temp_path,
+            preallocate,
+            physical,
+            keep_on_drop: false,
+            #[cfg(test)]
+            fail_next_write: false,
+            #[cfg(test)]
+            fail_next_flush: false,
+            file: Some(Arc::new(file)),
+            bytes_written: 0,
+            finalized: false,
+            aborted: false,
+        }
+    }
+
+    /// Set the output length to `len` — the acknowledged end of an
+    /// unknown-length stream — removing any stale tail or preallocated
+    /// hole before verification and publication (§25).
+    ///
+    /// # Errors
+    /// `SinkWrite` when the file cannot be resized.
+    pub fn truncate_to(&mut self, len: u64) -> Result<(), SinkError> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(SinkError(DownloadError::SinkOpen("sink closed".into())));
+        };
+        file.set_len(len)
+            .map_err(|e| SinkError(DownloadError::from_io(&e)))
+    }
+
     /// The shared immutable handle for lending write-only worker
     /// capabilities: positional writes need only `&File`.
     pub(crate) fn shared_handle(&self) -> Option<Arc<File>> {
@@ -309,10 +440,27 @@ impl FileSink {
         mode: PublishMode,
     ) -> Result<(PathBuf, Option<String>), SinkError> {
         // Close the handle before publication, which is required by Windows.
+        // Bind publication to the verified output identity: capture the
+        // open handle's identity, then re-check the directory entry inside
+        // publication so an entry swapped after verification cannot be
+        // published (design D2, §14.6).
+        let identity = match self.file.as_ref() {
+            Some(file) => Some(publish::OutputIdentity::of(
+                &file
+                    .metadata()
+                    .map_err(|e| SinkError(DownloadError::from_io(&e)))?,
+            )),
+            None => None,
+        };
         self.file = None;
         self.finalized = true; // Drop must preserve the temp file on failure.
-        let outcome =
-            publish::publish(&self.temp_path, &self.destination, mode).map_err(|error| {
+        let outcome = publish::publish_verified(
+            &self.temp_path,
+            &self.destination,
+            mode,
+            identity,
+        )
+        .map_err(|error| {
                 let download_error = if mode == PublishMode::NoReplace
                     && error.kind() == std::io::ErrorKind::AlreadyExists
                 {
@@ -412,6 +560,10 @@ impl Sink for FileSink {
         }
     }
 
+    fn truncate_to(&mut self, len: u64) -> Result<(), SinkError> {
+        FileSink::truncate_to(self, len)
+    }
+
     fn finalize(&mut self) -> Result<(), SinkError> {
         self.flush(FlushLevel::FsyncFile)?;
         if let Some(file) = self.file.take() {
@@ -453,6 +605,57 @@ impl Drop for FileSink {
             let _ = std::fs::remove_file(&self.temp_path);
         }
     }
+}
+
+/// Validate that `path` is an engine-owned regular partial file: a regular
+/// file entry (never a symlink) with a single hard link.
+///
+/// # Errors
+/// [`SinkError`] when the entry is missing, irregular or multiply linked.
+pub(crate) fn validate_owned_regular_file(path: &Path) -> Result<(), SinkError> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+    if !meta.file_type().is_file() {
+        return Err(SinkError(DownloadError::SinkOpen(format!(
+            "partial output {} is not a regular file",
+            path.display()
+        ))));
+    }
+    if link_count(&meta) > 1 {
+        return Err(SinkError(DownloadError::SinkOpen(format!(
+            "partial output {} has multiple hard links",
+            path.display()
+        ))));
+    }
+    Ok(())
+}
+
+/// Hard-link count of a metadata record (1 on platforms without the
+/// concept).
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// Whether two metadata records describe the same filesystem object.
+///
+/// Unix compares device+inode; other platforms fall back to length plus
+/// modification time and rely on the documented trusted-directory
+/// precondition for hostile-writer resistance (design D2).
+#[cfg(unix)]
+fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
 #[cfg(test)]

@@ -561,3 +561,277 @@ async fn h2_additional_policy_stays_compatible_with_adaptive() {
         stats.establishments_h2()
     );
 }
+
+// ---- Redirect credential isolation over HTTP/2 (task 1.1) ----
+
+/// Reserved dummy credential for the H2 isolation regressions: never a
+/// real secret and only offered to loopback listeners owned by the test.
+const H2_DUMMY_AUTHORIZATION: &str = "Bearer h2-dummy-secret";
+
+/// Behavior of a credential-isolation H2 listener.
+#[derive(Clone)]
+enum H2CredBehavior {
+    /// Serve `content` at every path (range-aware); when
+    /// `require_authorization` is set, requests without credentials are
+    /// answered with 401.
+    Serve {
+        content: Arc<Vec<u8>>,
+        require_authorization: bool,
+    },
+    /// Answer every request with a 302 to the given absolute URL.
+    Redirect(String),
+}
+
+#[derive(Clone, Debug)]
+struct RecordedH2Request {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+}
+
+/// A live credential-isolation H2 listener.
+struct H2CredServer {
+    addr: std::net::SocketAddr,
+    ca_pem: Vec<u8>,
+    requests: Arc<std::sync::Mutex<Vec<RecordedH2Request>>>
+}
+
+impl H2CredServer {
+    fn url(&self, path: &str) -> String {
+        format!("https://localhost:{}{path}", self.addr.port())
+    }
+
+    fn requests(&self) -> Vec<RecordedH2Request> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+/// An HTTPS/H2 listener that either serves content or redirects, recording
+/// the credentials seen on every request.
+async fn start_h2_cred_server(behavior: H2CredBehavior) -> H2CredServer {
+    use tokio_rustls::rustls;
+
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+    let ca_pem = cert.cert.pem().into_bytes();
+    let cert_der: rustls::pki_types::CertificateDer<'static> = cert.cert.into();
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+    );
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server cert");
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_config = Arc::new(config);
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let requests: Arc<std::sync::Mutex<Vec<RecordedH2Request>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests_for_loop = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let tls = Arc::clone(&tls_config);
+            let behavior = behavior.clone();
+            let requests = Arc::clone(&requests_for_loop);
+            tokio::spawn(async move {
+                let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tls).accept(socket).await
+                else {
+                    return;
+                };
+                let served = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(
+                    hyper_util::rt::TokioIo::new(tls_stream),
+                    hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let behavior = behavior.clone();
+                            let requests = Arc::clone(&requests);
+                            async move {
+                                let method = req.method().to_string();
+                                let path = req.uri().path().to_string();
+                                let authorization = req
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string);
+                                requests.lock().expect("requests lock").push(
+                                    RecordedH2Request {
+                                        method: method.clone(),
+                                        path: path.clone(),
+                                        authorization: authorization.clone(),
+                                    },
+                                );
+                                match behavior {
+                                    H2CredBehavior::Redirect(location) => hyper::Response::builder()
+                                        .status(302)
+                                        .header("location", location)
+                                        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+                                        .map(Ok::<_, std::convert::Infallible>)
+                                        .expect("redirect response"),
+                                    H2CredBehavior::Serve {
+                                        content,
+                                        require_authorization,
+                                    } => {
+                                        if require_authorization && authorization.is_none() {
+                                            return hyper::Response::builder()
+                                                .status(401)
+                                                .header(
+                                                    "www-authenticate",
+                                                    "Bearer realm=\"h2-test\"",
+                                                )
+                                                .header("content-length", 0)
+                                                .body(http_body_util::Full::new(
+                                                    hyper::body::Bytes::new(),
+                                                ))
+                                                .map(Ok::<_, std::convert::Infallible>)
+                                                .expect("401 response");
+                                        }
+                                        let range = req
+                                            .headers()
+                                            .get("range")
+                                            .and_then(|v| v.to_str().ok())
+                                            .and_then(parse_range);
+                                        let (status, body, cr) = match range {
+                                            Some((s, e)) => {
+                                                let end = e.min(content.len() as u64 - 1);
+                                                (
+                                                    206,
+                                                    content[s as usize..=(end as usize)].to_vec(),
+                                                    Some(format!(
+                                                        "bytes {s}-{end}/{}",
+                                                        content.len()
+                                                    )),
+                                                )
+                                            }
+                                            None => (200, (*content).clone(), None),
+                                        };
+                                        let mut resp = hyper::Response::builder()
+                                            .status(status)
+                                            .header("content-length", body.len())
+                                            .header("etag", "\"h2-cred-fixed\"")
+                                            .header("accept-ranges", "bytes");
+                                        if let Some(cr) = cr {
+                                            resp = resp.header("content-range", cr);
+                                        }
+                                        resp.body(http_body_util::Full::new(
+                                            hyper::body::Bytes::from(body),
+                                        ))
+                                        .map(Ok::<_, std::convert::Infallible>)
+                                        .expect("response body")
+                                    }
+                                }
+                            }
+                        },
+                    ),
+                )
+                .await;
+                if let Err(e) = served {
+                    eprintln!("h2 cred test server conn error: {e}");
+                }
+            });
+        }
+    });
+    H2CredServer {
+        addr,
+        ca_pem,
+        requests,
+    }
+}
+
+/// A cross-origin redirect over HTTP/2 must not leak the caller
+/// authorization to the redirect target on either the HEAD probe or the GET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_cross_origin_redirect_strips_authorization() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..2_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let peer = start_h2_cred_server(H2CredBehavior::Serve {
+        content: content.clone(),
+        require_authorization: false,
+    })
+    .await;
+    let origin = start_h2_cred_server(H2CredBehavior::Redirect(peer.url("/file.bin"))).await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    let mut bundle = origin.ca_pem.clone();
+    bundle.extend_from_slice(&peer.ca_pem);
+    std::fs::write(&ca_path, bundle).expect("write ca");
+    let dest = dir.path().join("out.bin");
+
+    let cfg = h2_cfg(&ca_path);
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = DownloadController::new(transport, cfg);
+    let mut req = DownloadRequest::new(origin.url("/origin.bin"), dest.clone());
+    req.authorization = Some(H2_DUMMY_AUTHORIZATION.to_string());
+    controller.run(req).await.expect("run");
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+
+    let origin_requests = origin.requests();
+    assert!(
+        origin_requests
+            .iter()
+            .any(|r| r.authorization.is_some()),
+        "the origin must receive the caller credentials: {origin_requests:?}"
+    );
+    let peer_requests = peer.requests();
+    assert!(!peer_requests.is_empty(), "redirect target must be reached");
+    assert!(
+        peer_requests.iter().all(|r| r.authorization.is_none()),
+        "an H2 cross-origin redirect target must never receive credentials: {peer_requests:?}"
+    );
+}
+
+/// Segmented HTTP/2 workers must authenticate every ranged GET exactly like
+/// a sequential transfer, over the same redirect-sanitized request context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn h2_same_origin_segmented_requests_keep_authorization() {
+    let content: Arc<Vec<u8>> =
+        Arc::new((0..4_u64 * 1024 * 1024).map(|i| (i % 249) as u8).collect());
+    let server = start_h2_cred_server(H2CredBehavior::Serve {
+        content: content.clone(),
+        require_authorization: true,
+    })
+    .await;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &server.ca_pem).expect("write ca");
+    let dest = dir.path().join("out.bin");
+
+    let cfg = h2_cfg(&ca_path);
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = DownloadController::new(transport, cfg);
+    let mut req = DownloadRequest::new(server.url("/file.bin"), dest.clone());
+    req.authorization = Some(H2_DUMMY_AUTHORIZATION.to_string());
+    controller.run(req).await.expect("run");
+    assert_eq!(
+        fixtures::file_sha256(dest.as_path()),
+        fixtures::sha256_hex(&content)
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests.iter().any(|r| r.method == "HEAD"),
+        "the probe must be attempted: {requests:?}"
+    );
+    let data_gets: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "GET" && r.path == "/file.bin")
+        .collect();
+    assert!(!data_gets.is_empty(), "segmented GETs must run: {requests:?}");
+    assert!(
+        data_gets
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some(H2_DUMMY_AUTHORIZATION)),
+        "every ranged GET must carry the configured authorization: {requests:?}"
+    );
+}

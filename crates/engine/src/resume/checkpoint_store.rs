@@ -136,6 +136,15 @@ impl CheckpointStoreResolver for SidecarCheckpointResolver {
 }
 
 /// Sidecar-file store (§34 default): `<dir>/<job_identity>.kdown`.
+///
+/// Filesystem trust rules: one cooperative writer per destination. Sidecar
+/// and temp entries are created exclusively (never opened through a
+/// symlink), non-regular entries are refused, and files are created with
+/// owner-only permissions on Unix so secret-bearing state is not readable
+/// by other directory users. The directory itself is the trust boundary:
+/// a non-cooperating writer that can replace entries inside it is outside
+/// the engine's threat model, and the v2 checkpoints' owned identity and
+/// covered digest fail closed on any replaced partial they can describe.
 #[derive(Debug, Clone)]
 pub struct FileCheckpointStore {
     dir: PathBuf,
@@ -187,8 +196,16 @@ impl CheckpointStore for FileCheckpointStore {
         let path = self.path_for(job_identity);
         // Bounded load (task 3.6): an oversized sidecar is refused before
         // reading (never overclaims durable ranges — it simply fails).
-        if let Some(cap) = self.max_serialized_bytes {
-            if let Ok(meta) = std::fs::metadata(&path) {
+        // The sidecar must be a regular file: a symlink or other entry is
+        // never read as checkpoint state (and never followed).
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if !meta.file_type().is_file() {
+                return Err(CheckpointError::Corrupt(format!(
+                    "checkpoint {} is not a regular file",
+                    path.display()
+                )));
+            }
+            if let Some(cap) = self.max_serialized_bytes {
                 let size = meta.len();
                 if size > cap {
                     return Err(CheckpointError::TooLarge { size, cap });
@@ -233,11 +250,22 @@ impl CheckpointStore for FileCheckpointStore {
             std::process::id(),
             Self::next_temp_suffix()
         ));
+        let mut created = false;
         let result = (|| -> Result<(), CheckpointError> {
             {
-                let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                // Exclusive creation: a planted entry at the temp path is
+                // never written through, and the file is owner-only on Unix.
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                let mut f = options.open(&tmp_path).map_err(|e| {
                     CheckpointError::Corrupt(format!("create {}: {e}", tmp_path.display()))
                 })?;
+                created = true;
                 f.write_all(json.as_bytes())
                     .map_err(|e| CheckpointError::Corrupt(format!("write: {e}")))?;
                 f.flush()
@@ -265,9 +293,10 @@ impl CheckpointStore for FileCheckpointStore {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && created {
             // Best-effort residue cleanup: a failed save must not leave a
             // temp file behind (harmless no-op once the rename succeeded).
+            // Only entries this save created are removed.
             let _ = std::fs::remove_file(&tmp_path);
         }
         result
@@ -541,5 +570,79 @@ mod tests {
         // A regular directory synchronizes successfully.
         let dir = tempfile::tempdir().expect("tmp");
         sync_parent_durable(dir.path()).expect("regular dir sync ok");
+    }
+
+    #[test]
+    fn symlinked_sidecar_is_never_read_or_deleted_through() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
+            .expect("store");
+        let mut cp = Checkpoint::new("job-symlink", "https://example/f", "tmp");
+        cp.record_completed(0, 4);
+        let json = cp.to_json().expect("json");
+        let scratch = dir.path().join("unrelated.scratch");
+        std::fs::write(&scratch, &json).expect("scratch");
+        let sidecar = dir.path().join("job-symlink.kdown");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&scratch, &sidecar).expect("symlink");
+            let err = store
+                .load("job-symlink")
+                .expect_err("a symlinked sidecar is never read");
+            assert!(matches!(err, CheckpointError::Corrupt(_)), "{err:?}");
+            // Delete removes the link itself, never the target.
+            store.delete("job-symlink").expect("delete");
+            assert!(!sidecar.exists());
+            assert_eq!(
+                std::fs::read(&scratch).expect("scratch read"),
+                json.as_bytes(),
+                "the symlink target must keep its bytes"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&store, &sidecar, &scratch);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_a_symlinked_sidecar_without_touching_its_target() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
+            .expect("store");
+        let mut cp = Checkpoint::new("job-swap", "https://example/f", "tmp");
+        cp.record_completed(0, 4);
+        let scratch = dir.path().join("unrelated.scratch");
+        std::fs::write(&scratch, b"UNRELATED-SCRATCH").expect("scratch");
+        let sidecar = dir.path().join("job-swap.kdown");
+        std::os::unix::fs::symlink(&scratch, &sidecar).expect("symlink");
+
+        store.save_atomic(&cp).expect("save replaces the entry");
+        assert_eq!(
+            std::fs::read(&scratch).expect("scratch read"),
+            b"UNRELATED-SCRATCH",
+            "the symlink target must never be written"
+        );
+        let loaded = store.load("job-swap").expect("load").expect("present");
+        assert_eq!(loaded.completed_ranges, vec![(0, 4)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_sidecar_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
+            .expect("store");
+        let mut cp = Checkpoint::new("job-perm", "https://example/f", "tmp");
+        cp.record_completed(0, 4);
+        store.save_atomic(&cp).expect("save");
+        let mode = std::fs::metadata(dir.path().join("job-perm.kdown"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "sidecar must not be group/world readable");
     }
 }

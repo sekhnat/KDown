@@ -387,6 +387,9 @@ async fn segmented_resume_reuses_all_completed_ranges() {
     let content = Arc::new(deterministic_bytes(2 * 1024 * 1024, 2010));
     let server = TestServer::new()
         .serve_static("/seg-resume.bin", (*content).clone())
+        .with_default_headers("/seg-resume.bin", |headers| {
+            headers.push(("etag".to_string(), "\"seg-resume-gen\"".to_string()));
+        })
         .start()
         .await
         .expect("start");
@@ -410,6 +413,8 @@ async fn segmented_resume_reuses_all_completed_ranges() {
     let mut cp =
         kdown_engine::resume::Checkpoint::new(&identity, server.url("/seg-resume.bin"), "tmp");
     cp.total_size = Some(content.len() as u64);
+    cp.validators.etag = Some("\"seg-resume-gen\"".into());
+    cp.validators.total_size = Some(content.len() as u64);
     cp.completed_ranges = vec![
         (0, prefix_len as u64 - 1),
         (

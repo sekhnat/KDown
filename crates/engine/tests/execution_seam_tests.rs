@@ -741,7 +741,12 @@ async fn scripted_invalid_ranged_resume_fails_before_body() {
     store.save_atomic(&cp).expect("seed checkpoint");
 
     let scripted = ScriptedHttp::new()
-        .expect_probe(ok_probe(200))
+        .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
+            status: 200,
+            total_size: Some(200),
+            validators: stale_validators.clone(),
+            ..ProbeMetadata::default()
+        }))
         .expect_transfer(
             // The resume request must be conditional on the checkpoint's
             // validators (If-Range, §11.3) for the missing tail only.

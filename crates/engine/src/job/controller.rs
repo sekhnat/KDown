@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Sha256, Sha512};
 
 use crate::config::{EngineConfig, HashAlgorithm, IntegrityPolicy, OverwritePolicy, ResumePolicy};
 use crate::control::origin::{normalized_origin, OriginRegistry};
@@ -338,6 +338,10 @@ pub struct DownloadController {
     /// `config.global_rate_limit`; replaceable for tests via
     /// [`Self::with_global_rate_bucket`].
     global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    /// Concurrent-admitted-job permits (`max_active_jobs`, §9.5): one
+    /// RAII permit per running job, acquired synchronously in [`Self::start`]
+    /// and released on success, failure, cancellation or task abort.
+    active_jobs: Arc<tokio::sync::Semaphore>,
 }
 
 /// Deprecated alias of [`DownloadController`], kept for source
@@ -388,6 +392,7 @@ impl DownloadController {
         metrics: Arc<EngineMetrics>,
         transfer_ledger: Arc<crate::io::transfer_ledger::TransferLedger>,
     ) -> Self {
+        let active_jobs = Arc::new(tokio::sync::Semaphore::new(config.max_active_jobs as usize));
         let classifier = RetryClassifier::new(config.retry.clone());
         let global_rate_bucket = Arc::new(crate::control::rate_limit::TokenBucket::new(
             config.global_rate_limit.unwrap_or(0),
@@ -406,6 +411,7 @@ impl DownloadController {
             metrics,
             transfer_ledger,
             global_rate_bucket,
+            active_jobs,
         }
     }
 
@@ -547,6 +553,13 @@ impl DownloadController {
     /// Start a download and return immediately with a control handle
     /// (§7.2 start -> §7.3 handle). The job runs on a spawned task; the
     /// caller awaits the returned join handle for the terminal result.
+    ///
+    /// Admission (§9.5): at most `max_active_jobs` jobs run concurrently
+    /// per controller. When the cap is exhausted, `start` still returns
+    /// its handle/join pair, but the task resolves immediately with
+    /// [`DownloadError::AdmissionRejected`] (category `MemoryCap`): no
+    /// transfer begins and no artifact is written. The permit is released
+    /// on success, failure, cancellation, or task abort.
     pub fn start(
         &self,
         request: DownloadRequest,
@@ -608,7 +621,57 @@ impl DownloadController {
         let transfer_ledger = self.transfer_ledger.clone();
         let job_memory_high_water = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let job_memory_cell = Arc::clone(&job_memory_high_water);
+        // Synchronous admission (§9.5): one RAII permit per admitted job.
+        // An exhausted cap rejects immediately with a typed error and
+        // writes nothing; the permit is held by the run task and released
+        // on success, failure, cancellation, or task abort.
+        let admission_cap = self.config.max_active_jobs;
+        let admission_permit = Arc::clone(&self.active_jobs).try_acquire_owned().ok();
+        let admission_active =
+            admission_cap.saturating_sub(self.active_jobs.available_permits() as u32);
+        let active_jobs_for_run = Arc::clone(&self.active_jobs);
+        // Admission timestamp for the one monotonic job deadline (§9.5):
+        // the watchdog is spawned only for admitted jobs.
+        let job_deadline_at = self
+            .config
+            .transfer
+            .job_deadline
+            .map(|budget| std::time::Instant::now() + budget);
         let join = tokio::spawn(async move {
+            let Some(_admission_permit) = admission_permit else {
+                // Immediate typed rejection: no transfer begins and no
+                // artifact is written for a job that was never admitted.
+                let _ = inner_state.transition(JobState::Failing);
+                let _ = inner_state.transition(JobState::Failed);
+                return Err(DownloadRunError::Infrastructure(Box::new(EngineFailure {
+                    error: DownloadError::AdmissionRejected {
+                        active: admission_active,
+                        cap: admission_cap,
+                    },
+                    partial: TransferAccounting::default(),
+                    artifacts: ArtifactDisposition::default(),
+                })));
+            };
+            // One monotonic deadline from admission: the watchdog cancels
+            // the same token every wait already honors, so probe,
+            // header/body waits, retries, workers and verification stop
+            // promptly. It is aborted at terminal; a deadline that fires
+            // during the job turns a Cancelled outcome into the typed
+            // DeadlineExceeded failure below.
+            let deadline_cancel = inner_cancel.clone();
+            let deadline_done = Arc::new(tokio::sync::Notify::new());
+            let deadline_watchdog = job_deadline_at.map(|deadline| {
+                let cancel = deadline_cancel.clone();
+                let done = Arc::clone(&deadline_done);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            cancel.cancel_with_deadline();
+                        }
+                        _ = done.notified() => {}
+                    }
+                })
+            });
             let this = Self {
                 execution,
                 config,
@@ -619,6 +682,7 @@ impl DownloadController {
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 metrics: metrics_for_run.clone(),
                 global_rate_bucket: global_bucket_for_run.clone(),
+                active_jobs: active_jobs_for_run,
             };
             let terminal = this
                 .run_inner(
@@ -634,6 +698,26 @@ impl DownloadController {
                     job_memory_cell,
                 )
                 .await;
+            deadline_done.notify_waiters();
+            if let Some(watchdog) = deadline_watchdog {
+                watchdog.abort();
+            }
+            let terminal = match terminal {
+                Err(DownloadRunError::Cancelled(summary))
+                    if deadline_cancel.deadline_exceeded() =>
+                {
+                    // The job stopped because its deadline expired, not
+                    // because the caller cancelled: report the typed
+                    // deadline outcome with the same truthful partial
+                    // accounting and artifact disposition.
+                    Err(DownloadRunError::Infrastructure(Box::new(EngineFailure {
+                        error: DownloadError::DeadlineExceeded,
+                        partial: summary.partial,
+                        artifacts: summary.artifacts,
+                    })))
+                }
+                other => other,
+            };
             match &terminal {
                 Ok(result) => metrics_for_run.record_completed(result),
                 Err(error) => metrics_for_run.record_run_error(error),
@@ -834,6 +918,10 @@ impl DownloadController {
         let probe_notices: Vec<String>;
         let mut attempt: u32 = 0;
         let mut probe_auth_guard = crate::control::auth::AuthStageGuard::new();
+        // Names supplied by the credential provider while probing: their
+        // values are credentials under arbitrary names, so the transfer
+        // context treats them as sensitive (§21.2, §29).
+        let mut provider_header_names: Vec<String> = Vec::new();
         loop {
             // Rebuilt per attempt: credential-provider headers (§29) merge
             // into `spec` before each re-probe.
@@ -917,6 +1005,7 @@ impl DownloadController {
                                 provider.request(ch)
                             {
                                 for (k, v) in hdrs {
+                                    provider_header_names.push(k.clone());
                                     if let Some(existing) = spec
                                         .headers
                                         .iter_mut()
@@ -948,7 +1037,12 @@ impl DownloadController {
                         } => {
                             counters.worker(0).expect("worker slot").add_retries(1);
                             attempt = next;
-                            tokio::time::sleep(delay).await;
+                            // Cancellation/deadline interrupts the backoff
+                            // instead of sleeping it out (§9.5).
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancel.cancelled() => {}
+                            }
                         }
                         RetryDecision::GiveUp => {
                             return Err(self.terminal_error(
@@ -1045,6 +1139,25 @@ impl DownloadController {
             self.config.transfer.verify_range_support,
         );
 
+        // One authenticated, redirect-sanitized credential context shared
+        // by every transfer path (§21.2, §29): the caller's headers plus the
+        // authorization convenience plus any headers the credential
+        // provider supplied while probing. It is scoped to the resolved
+        // final origin, so segmented workers — which request that URL
+        // directly — authenticate there while a cross-origin redirect never
+        // receives the credentials.
+        let shared_credentials = Arc::new(crate::control::auth::SharedCredentials::new(
+            crate::http::redirect::scoped_request_headers(
+                &request.url,
+                &meta.final_url,
+                &spec.headers,
+                !provider_header_names.is_empty(),
+                self.config.network.forward_credentials_cross_origin,
+            ),
+            request.credential_provider.clone(),
+            !provider_header_names.is_empty(),
+        ));
+
         // ---- Prepare (§9.1 Preparing, §14) ----
         let _ = state.transition(JobState::Preparing);
         let resuming = plan.is_resuming();
@@ -1131,7 +1244,7 @@ impl DownloadController {
             let outcome = crate::job::segmented::run_segmented(
                 self.execution.clone(),
                 &self.config,
-                &request,
+                Arc::clone(&shared_credentials),
                 &state,
                 &mut sink,
                 &store,
@@ -1164,6 +1277,7 @@ impl DownloadController {
                     sink,
                     warnings,
                     checkpoint_retained,
+                    &cancel,
                 )
                 .await;
         }
@@ -1203,8 +1317,10 @@ impl DownloadController {
             if let Some(cp) = plan.checkpoint() {
                 let mut fresh = cp.clone();
                 fresh.final_url = meta.final_url.clone();
+                fresh.set_owned_temp_identity(sink.temp_path());
+                fresh.set_covered_digest(sink.temp_path());
                 if let Err(e) = self
-                    .save_checkpoint_bounded(&job_ledger, &store, &fresh)
+                    .persist_checkpoint(&job_ledger, &store, &sink, &fresh)
                     .await
                 {
                     // A failed refresh cannot promise resumability: stop
@@ -1494,7 +1610,10 @@ impl DownloadController {
                                 })
                                 .await;
                             }
-                            tokio::time::sleep(delay).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancel.cancelled() => {}
+                            }
                             continue 'download;
                         }
                         RetryDecision::GiveUp => {
@@ -1781,8 +1900,11 @@ impl DownloadController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
+                            cp.set_owned_temp_identity(sink.temp_path());
+                            cp.set_covered_digest(sink.temp_path());
                             if let Err(e) =
-                                self.save_checkpoint_bounded(&job_ledger, &store, &cp).await
+                                self.persist_checkpoint(&job_ledger, &store, &sink, &cp)
+                                    .await
                             {
                                 // A failed cadence save must stop the job:
                                 // transfer continues would claim resumable
@@ -1825,8 +1947,11 @@ impl DownloadController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
+                            cp.set_owned_temp_identity(sink.temp_path());
+                            cp.set_covered_digest(sink.temp_path());
                             if let Err(e) =
-                                self.save_checkpoint_bounded(&job_ledger, &store, &cp).await
+                                self.persist_checkpoint(&job_ledger, &store, &sink, &cp)
+                                    .await
                             {
                                 // Pause must not claim a resumable state
                                 // that failed to persist: stop with the
@@ -1848,10 +1973,9 @@ impl DownloadController {
                             checkpoint_retained = true;
                             sink.preserve_partial();
                         }
-                        // Wait while paused, then continue or cancel.
-                        while cancel.is_paused() && !cancel.is_cancelled() {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
+                        // Wait while paused; the token resolves on resume,
+                        // cancellation, or deadline expiry — no fixed polling.
+                        let _ = cancel.wait_for_resume().await;
                         if cancel.is_cancelled() {
                             let mode = CancelMode::from_u8(
                                 cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
@@ -1989,7 +2113,10 @@ impl DownloadController {
                                     ),
                                 })
                                 .await;
-                                tokio::time::sleep(delay).await;
+                                tokio::select! {
+                                    _ = tokio::time::sleep(delay) => {}
+                                    _ = cancel.cancelled() => {}
+                                }
                                 continue 'download;
                             }
                             RetryDecision::GiveUp => {
@@ -2052,6 +2179,8 @@ impl DownloadController {
             sink,
             accounting,
             checkpoint_retained,
+            offset,
+            &cancel,
         )
         .await
     }
@@ -2142,6 +2271,7 @@ impl DownloadController {
         sink: OutputSession,
         mut warnings: Vec<String>,
         checkpoint_retained: bool,
+        cancel: &crate::control::CancellationToken,
     ) -> Result<CompletedDownload, DownloadRunError> {
         if outcome.status == ResultStatus::Cancelled {
             let _ = state.transition(JobState::Cancelling);
@@ -2171,6 +2301,11 @@ impl DownloadController {
             ));
         }
         let accounting = Self::segmented_accounting(&outcome, warnings);
+        let accepted_bytes: u64 = outcome
+            .completed_ranges
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start).saturating_add(1))
+            .sum();
         self.complete_verified_output(
             request,
             &state,
@@ -2180,6 +2315,8 @@ impl DownloadController {
             sink,
             accounting,
             checkpoint_retained,
+            accepted_bytes,
+            cancel,
         )
         .await
     }
@@ -2197,6 +2334,10 @@ impl DownloadController {
         mut sink: OutputSession,
         mut accounting: TransferAccounting,
         checkpoint_retained: bool,
+        // Acknowledged accepted coverage for this job (admitted
+        // checkpoint ranges plus bytes written under this session).
+        accepted_bytes: u64,
+        cancel: &crate::control::CancellationToken,
     ) -> Result<CompletedDownload, DownloadRunError> {
         // On a verification/commit failure the temp file survives exactly
         // when the session preserves it on drop (segmented runs preserve
@@ -2207,6 +2348,19 @@ impl DownloadController {
             temp_retained: sink.preserves_partial_on_drop(),
             checkpoint_retained,
         };
+        // Verification obeys the same deadline/cancellation token as the
+        // transfer (§9.5): an expiry before the commit boundary fails
+        // safely and publishes nothing.
+        if cancel.is_cancelled() {
+            return Err(self.terminal_error(
+                state,
+                request,
+                cancellation_error(cancel),
+                accounting,
+                artifacts_on_failure,
+                CancelMode::DeletePartial,
+            ));
+        }
         let _ = state.transition(JobState::Verifying);
         hub.emit(Event::IntegrityCheckStarted).await;
         let sink_size = match sink.size() {
@@ -2228,9 +2382,9 @@ impl DownloadController {
             }
         };
         if let Some(expected) = accounting.total_size {
-            if sink_size != expected {
+            if accepted_bytes != expected || sink_size != expected {
                 let error = DownloadError::IntegrityMismatch(format!(
-                    "size mismatch: got {sink_size}, expected {expected}"
+                    "size mismatch: acknowledged {accepted_bytes}, got {sink_size}, expected {expected}"
                 ));
                 hub.emit(Event::IntegrityCheckFailed {
                     detail: error.to_string(),
@@ -2240,6 +2394,23 @@ impl DownloadController {
                     state,
                     request,
                     error,
+                    accounting,
+                    artifacts_on_failure,
+                    CancelMode::DeletePartial,
+                ));
+            }
+        } else if sink_size != accepted_bytes {
+            // Unknown length: the successful stream's acknowledged end
+            // defines the output; drop any preallocated or stale tail (§25).
+            if let Err(error) = sink.truncate_to(accepted_bytes) {
+                hub.emit(Event::IntegrityCheckFailed {
+                    detail: error.to_string(),
+                })
+                .await;
+                return Err(self.terminal_error(
+                    state,
+                    request,
+                    error.0,
                     accounting,
                     artifacts_on_failure,
                     CancelMode::DeletePartial,
@@ -2261,7 +2432,7 @@ impl DownloadController {
                     CancelMode::DeletePartial,
                 ));
             }
-            match verify_hashes(&request.integrity, sink.temp_path()) {
+            match verify_hashes(&request.integrity, sink.temp_path(), cancel) {
                 Ok(()) => hub.emit(Event::IntegrityCheckPassed).await,
                 Err(error) => {
                     hub.emit(Event::IntegrityCheckFailed {
@@ -2278,6 +2449,19 @@ impl DownloadController {
                     ));
                 }
             }
+        }
+        // Publication commit boundary (§9.5, design D5): once the atomic
+        // publication succeeds the outcome is success, truthfully — but an
+        // expiry that arrives before it fails closed without publishing.
+        if cancel.is_cancelled() {
+            return Err(self.terminal_error(
+                state,
+                request,
+                cancellation_error(cancel),
+                accounting,
+                artifacts_on_failure,
+                CancelMode::DeletePartial,
+            ));
         }
         let _ = state.transition(JobState::Committing);
         if let Err(error) = sink.finalize() {
@@ -2388,7 +2572,7 @@ impl DownloadController {
         store: &Arc<dyn CheckpointStore>,
         checkpoint: &crate::resume::checkpoint::Checkpoint,
     ) -> Result<(), crate::resume::checkpoint::CheckpointError> {
-        let estimate = checkpoint.serialized_size_estimate();
+        let estimate = checkpoint.checked_serialized_size()?;
         let reservation = job_ledger
             .reserve(crate::io::transfer_ledger::Component::Checkpoint, estimate)
             .await
@@ -2407,6 +2591,38 @@ impl DownloadController {
         let result = store.save_atomic(checkpoint);
         drop(reservation);
         result
+    }
+
+    /// Persist one checkpoint through the shared mode-aware durability
+    /// ordering: in Durable mode the output data is synchronized before
+    /// the checkpoint metadata is allowed to persist (§15.4). Failure of
+    /// either step surfaces as a checkpoint-category error, so the job
+    /// stops without advertising unsynced ranges.
+    async fn persist_checkpoint(
+        &self,
+        job_ledger: &crate::io::transfer_ledger::JobLedger,
+        store: &Arc<dyn CheckpointStore>,
+        sink: &OutputSession,
+        checkpoint: &crate::resume::checkpoint::Checkpoint,
+    ) -> Result<(), crate::resume::checkpoint::CheckpointError> {
+        if self.config.transfer.durability == crate::config::DurabilityMode::Durable {
+            let sync = sink.sync_capability().map_err(|e| {
+                crate::resume::checkpoint::CheckpointError::Corrupt(format!(
+                    "output sync capability unavailable: {}",
+                    e.0
+                ))
+            })?;
+            crate::io::output_session::sync_data_before_checkpoint(true, sync)
+                .await
+                .map_err(|e| {
+                    crate::resume::checkpoint::CheckpointError::Corrupt(format!(
+                        "data sync before checkpoint failed: {}",
+                        e.0
+                    ))
+                })?;
+        }
+        self.save_checkpoint_bounded(job_ledger, store, checkpoint)
+            .await
     }
 
     /// Route one terminal engine error through the once-only terminal
@@ -2528,24 +2744,22 @@ impl DownloadController {
     }
 }
 
-/// Sequential SHA-256/SHA-512 verification of the completed temporary file.
-fn verify_hashes(integrity: &IntegrityPolicy, path: &Path) -> Result<(), DownloadError> {
+/// Chunked SHA-256/SHA-512 verification of the completed temporary file.
+///
+/// Cancellation and deadline expiry are checked between bounded chunks so
+/// an expiry during verification fails promptly without publishing.
+fn verify_hashes(
+    integrity: &IntegrityPolicy,
+    path: &Path,
+    cancel: &crate::control::CancellationToken,
+) -> Result<(), DownloadError> {
+    if cancel.is_cancelled() {
+        return Err(cancellation_error(cancel));
+    }
     for expected in &integrity.expected_hashes {
-        let file = std::fs::File::open(path).map_err(|error| DownloadError::from_io(&error))?;
-        let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
         let computed = match expected.algorithm {
-            HashAlgorithm::Sha256 => {
-                let mut hasher = Sha256::new();
-                std::io::copy(&mut reader, &mut hasher)
-                    .map_err(|error| DownloadError::SinkWrite(error.to_string()))?;
-                hex(&hasher.finalize())
-            }
-            HashAlgorithm::Sha512 => {
-                let mut hasher = Sha512::new();
-                std::io::copy(&mut reader, &mut hasher)
-                    .map_err(|error| DownloadError::SinkWrite(error.to_string()))?;
-                hex(&hasher.finalize())
-            }
+            HashAlgorithm::Sha256 => hash_file_bounded::<Sha256>(path, cancel)?,
+            HashAlgorithm::Sha512 => hash_file_bounded::<Sha512>(path, cancel)?,
         };
         if computed != expected.hex.to_ascii_lowercase() {
             return Err(DownloadError::IntegrityMismatch(format!(
@@ -2555,6 +2769,43 @@ fn verify_hashes(integrity: &IntegrityPolicy, path: &Path) -> Result<(), Downloa
         }
     }
     Ok(())
+}
+
+/// One bounded read pass feeding `D`; cancellation is honored between
+/// 256 KiB chunks.
+fn hash_file_bounded<D: sha2::Digest>(
+    path: &Path,
+    cancel: &crate::control::CancellationToken,
+) -> Result<String, DownloadError> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|error| DownloadError::from_io(&error))?;
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut hasher = D::new();
+    loop {
+        if cancel.is_cancelled() {
+            return Err(cancellation_error(cancel));
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| DownloadError::SinkWrite(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Typed terminal error for a cancelled or expired wait: deadline expiry
+/// maps to `DeadlineExceeded`, caller cancellation to `Cancelled`.
+fn cancellation_error(cancel: &crate::control::CancellationToken) -> DownloadError {
+    if cancel.deadline_exceeded() {
+        DownloadError::DeadlineExceeded
+    } else {
+        DownloadError::Cancelled
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -2646,6 +2897,8 @@ mod completion_tests {
                     warnings: Vec::new(),
                 },
                 false,
+                3,
+                &crate::control::CancellationToken::new(),
             )
             .await;
 

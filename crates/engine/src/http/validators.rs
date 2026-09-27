@@ -65,6 +65,42 @@ impl ResourceValidators {
         }
         Ok(())
     }
+
+    /// Whether this saved set offers *comparable* evidence for resuming
+    /// against a freshly probed set (design D3, §26).
+    ///
+    /// Admission requires either a matching pair of **strong** ETags or,
+    /// when no strong ETag is available, a matching Last-Modified pair.
+    /// A missing/weak counterpart, or a checkpoint with no validator at
+    /// all, is insufficient evidence: size equality alone never authorizes
+    /// reuse. Conflicting values are reported by [`Self::same_generation`]
+    /// before this check; here `Err` means "not comparable, restart".
+    pub fn comparable_generation(&self, current: &Self) -> Result<(), String> {
+        if let Some(saved) = &self.etag {
+            if !self.etag_is_weak {
+                if current
+                    .etag
+                    .as_ref()
+                    .is_some_and(|_| !current.etag_is_weak)
+                {
+                    // `same_generation` already verified the values match.
+                    return Ok(());
+                }
+                // A saved strong ETag with no comparable current one (or
+                // only a weak tag) is not proof of the same generation.
+                let _ = saved;
+                return Err("saved strong ETag has no comparable current ETag".into());
+            }
+        }
+        if self.last_modified.is_some() {
+            return if current.last_modified.is_some() {
+                Ok(())
+            } else {
+                Err("saved Last-Modified has no comparable current value".into())
+            };
+        }
+        Err("checkpoint carries no strong ETag or Last-Modified".into())
+    }
 }
 
 /// Split an ETag header value into (opaque-tag, weak-flag).
@@ -221,5 +257,40 @@ mod tests {
         assert_eq!(star.total, None);
         assert!(parse_content_range("bogus 1-2/3").is_err());
         assert!(parse_content_range("bytes 5-2/10").is_err(), "end < start");
+    }
+
+    #[test]
+    fn comparable_generation_requires_matching_evidence() {
+        let strong = ResourceValidators::from_headers(Some("\"e1\""), None, Some(100));
+        let strong_same = ResourceValidators::from_headers(Some("\"e1\""), None, Some(100));
+        assert!(strong.comparable_generation(&strong_same).is_ok());
+        let missing = ResourceValidators::from_headers(None, None, Some(100));
+        assert!(
+            strong.comparable_generation(&missing).is_err(),
+            "a missing current ETag is not comparable"
+        );
+        let weak = ResourceValidators::from_headers(Some("W/\"e1\""), None, Some(100));
+        assert!(
+            strong.comparable_generation(&weak).is_err(),
+            "a weak current ETag is not comparable"
+        );
+        assert!(
+            weak.comparable_generation(&weak).is_err(),
+            "weak-only evidence never authorizes resume"
+        );
+
+        let lm = ResourceValidators::from_headers(None, Some("date"), Some(100));
+        let lm_same = ResourceValidators::from_headers(None, Some("date"), Some(100));
+        assert!(lm.comparable_generation(&lm_same).is_ok());
+        assert!(
+            lm.comparable_generation(&missing).is_err(),
+            "a missing Last-Modified is not comparable"
+        );
+
+        let empty = ResourceValidators::default();
+        assert!(
+            empty.comparable_generation(&missing).is_err(),
+            "a checkpoint with no evidence never authorizes reuse"
+        );
     }
 }

@@ -346,6 +346,9 @@ async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
     let content = Arc::new(deterministic_bytes(64 * 1024, 78));
     let server = TestServer::new()
         .serve_static("/prefix.bin", (*content).clone())
+        .with_default_headers("/prefix.bin", |headers| {
+            headers.push(("etag".to_string(), "\"prefix-gen\"".to_string()));
+        })
         .start()
         .await
         .expect("start");
@@ -358,6 +361,8 @@ async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
     let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
     let mut cp = kdown_engine::resume::Checkpoint::new(&identity, server.url("/prefix.bin"), "tmp");
     cp.total_size = Some(content.len() as u64);
+    cp.validators.etag = Some("\"prefix-gen\"".into());
+    cp.validators.total_size = Some(content.len() as u64);
     cp.completed_ranges = vec![(0, prefix_len as u64 - 1)];
     store.save_atomic(&cp).expect("save");
 

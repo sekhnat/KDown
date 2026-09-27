@@ -174,6 +174,16 @@ pub enum DownloadError {
         /// Binding cap in bytes.
         cap: u64,
     },
+    /// Concurrent admitted-job cap (`max_active_jobs`) rejected this start
+    /// immediately: no transfer begins and no artifact is written. The
+    /// caller may retry after an active job finishes.
+    #[error("active-job admission rejected: {active} of {cap} jobs admitted")]
+    AdmissionRejected {
+        /// Jobs admitted when the start was refused.
+        active: u32,
+        /// Configured `max_active_jobs` cap.
+        cap: u32,
+    },
 }
 
 impl DownloadError {
@@ -183,6 +193,9 @@ impl DownloadError {
         match self {
             Configuration(_) => ErrorCategory::Configuration,
             MemoryCapExceeded { .. } => ErrorCategory::MemoryCap,
+            // A job-admission refusal is the same capacity family: fail
+            // immediately, never retryable.
+            AdmissionRejected { .. } => ErrorCategory::MemoryCap,
             InvalidUrl(_) => ErrorCategory::InvalidUrl,
             UnsupportedScheme(_) => ErrorCategory::UnsupportedScheme,
             Dns(_) => ErrorCategory::Dns,
@@ -287,7 +300,8 @@ impl DownloadError {
             | PermissionDenied(_)
             | Checkpoint(_)
             | Commit(_)
-            | DestinationConflict(_) => FailureDomain::Infrastructure,
+            | DestinationConflict(_)
+            | AdmissionRejected { .. } => FailureDomain::Infrastructure,
             Cancelled => FailureDomain::Cancelled,
             Dns(_)
             | ConnectTimeout
