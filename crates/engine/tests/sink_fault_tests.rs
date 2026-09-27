@@ -436,24 +436,35 @@ async fn deadline_during_gated_commit_reports_success_truthfully() {
     cfg.transfer.job_deadline = Some(std::time::Duration::from_millis(400));
     let controller = controller_for(cfg);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     install_test_gate(dest.clone(), PublishMode::Replace, entered_tx, release_rx);
+    // The release must not depend on the test task being polled: the job
+    // holds a runtime worker in the intentionally synchronous gate wait, and
+    // a starved CI runtime can otherwise delay the test body past the gate
+    // timeout. A plain OS thread waits for gate entry and then releases the
+    // commit once the deadline has expired.
+    std::thread::spawn(move || {
+        if entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok()
+        {
+            let _ = reached_tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = release_tx.send(());
+        }
+    });
     let mut request = DownloadRequest::new(server.url("/file"), dest.clone());
     request.overwrite = OverwritePolicy::Replace;
     let (_handle, task) = controller.start(request);
     tokio::task::spawn_blocking(move || {
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
             .map_err(|_| ())
     })
     .await
     .expect("gate waiter")
     .expect("job reached the commit gate");
-    eprintln!("[test] entered observed for {}", dest.display());
-    // The deadline expires while the atomic publication is held at the gate.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    eprintln!("[test] sending release for {}", dest.display());
-    release_tx.send(()).expect("release commit");
     let completed = tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
         .expect("no hang")

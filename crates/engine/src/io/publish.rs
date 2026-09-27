@@ -112,7 +112,6 @@ pub(crate) fn install_test_gate(
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 ) {
-    eprintln!("[gate] install {} mode={mode:?}", destination.display());
     let gate = PUBLISH_TEST_GATE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     gate.lock()
         .expect("publish test gate lock")
@@ -134,23 +133,15 @@ fn wait_at_test_gate(destination: &Path, mode: PublishMode) {
             .position(|gate| gate.destination == destination && gate.mode == mode)
             .map(|index| current.remove(index))
     };
-    match matching {
-        Some(gate) => {
-            eprintln!("[gate] entered {} mode={mode:?}", destination.display());
-            let _ = gate.entered.send(());
-            // Bounded so a broken path cannot hang the suite, but generous
-            // enough that a starved CI runtime (parallel sync-blocking fixtures)
-            // does not drop the receiver while the test is still waiting to
-            // release the commit (task 7.1 flake hardening).
-            let outcome = gate
-                .release
-                .recv_timeout(std::time::Duration::from_secs(120));
-            eprintln!(
-                "[gate] released {} mode={mode:?} outcome={outcome:?}",
-                destination.display()
-            );
-        }
-        None => eprintln!("[gate] miss {} mode={mode:?}", destination.display()),
+    if let Some(gate) = matching {
+        let _ = gate.entered.send(());
+        // Bounded so a broken path cannot hang the suite, but generous
+        // enough that a starved CI runtime (parallel sync-blocking fixtures)
+        // does not drop the receiver while the test is still waiting to
+        // release the commit (task 7.1 flake hardening).
+        let _ = gate
+            .release
+            .recv_timeout(std::time::Duration::from_secs(120));
     }
 }
 

@@ -519,14 +519,18 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
         }
     });
 
-    // Tight caps: 8 jobs × 128 KiB job caps + 8 connection footprints must
-    // all fold into a 1 MiB aggregate.
+    // Caps sized for the transport's actual delivery granularity: hyper may
+    // hand over a coalesced multi-chunk body frame (a 120 KiB atomic chunk
+    // was observed on CI at 64 KiB write pacing), and the ledger refuses an
+    // atomic frame that cannot fit its component cap. The pipeline stays
+    // oversubscribed (8 × 512 KiB job caps over a 2 MiB aggregate) while
+    // never refusing a legitimate single delivery.
     let mut cfg = EngineConfig {
         transfer_memory: TransferMemoryConfig {
-            aggregate_max_bytes: 1024 * 1024,
-            job_max_bytes: 128 * 1024,
-            network_ingress_max_bytes: 64 * 1024,
-            frames_max_bytes: 64 * 1024,
+            aggregate_max_bytes: 2 * 1024 * 1024,
+            job_max_bytes: 512 * 1024,
+            network_ingress_max_bytes: 512 * 1024,
+            frames_max_bytes: 512 * 1024,
             writer_max_bytes: 64 * 1024,
             checkpoint_max_bytes: 64 * 1024,
         },
