@@ -1,0 +1,137 @@
+{
+  "commit": "4caf56e441e4ec109bcaa08cf78802b9c7f4394a",
+  "fingerprint_fields": {
+    "arch": "x86_64",
+    "commit": "4caf56e441e4ec109bcaa08cf78802b9c7f4394a",
+    "cpu_model": "AMD Ryzen 7 9700X 8-Core Processor",
+    "dataset_bytes": 8388608,
+    "dest_root": null,
+    "disk_label": "tmpfs",
+    "fixture_args": [
+      "--addr",
+      "127.0.0.1:0",
+      "--size",
+      "4194304",
+      "--seed",
+      "20260927",
+      "--rtt-ms",
+      "10",
+      "--jitter-ms",
+      "1",
+      "--loss-percent",
+      "0.1",
+      "--throttle-mib-s",
+      "12.5",
+      "tls=true"
+    ],
+    "kernel": "7.2.7-1-cachyos",
+    "logical_cpus": 16,
+    "os": "linux",
+    "profile": "low-latency",
+    "profile_version": 1,
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01) (Arch Linux rust 1:1.98.1-1.1)"
+  },
+  "fingerprint_id": "8fdeeeddb03afdf5",
+  "host_noise_ok": true,
+  "noise_exceeded_scenarios": [],
+  "profile": "low-latency",
+  "profile_version": 1,
+  "recorded_at": "2026-09-27T10:54:08Z",
+  "reviewed_by": "kdown production-stability task 6.3 (matched development host; see host_noise_ok)",
+  "scaling": {
+    "h1": [
+      {
+        "jobs": 1,
+        "scaling_efficiency": 1.0,
+        "throughput_mib_s": 11.392585,
+        "workers": 1
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.254375,
+        "throughput_mib_s": 11.591978,
+        "workers": 4
+      }
+    ],
+    "h2": [
+      {
+        "jobs": 1,
+        "scaling_efficiency": 1.0,
+        "throughput_mib_s": 10.977914,
+        "workers": 1
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.256195,
+        "throughput_mib_s": 11.249949,
+        "workers": 4
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 1.192093,
+      "id": "low-latency/h1/workers_1/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 65536.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 11.392585,
+      "throughput_mib_s": 11.4046,
+      "throughput_spread_pct": 0.146011,
+      "workers": 1
+    },
+    {
+      "amplification": 1.010742,
+      "cpu_ns_per_byte": 2.384186,
+      "id": "low-latency/h1/workers_4/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 65483.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 11.591978,
+      "throughput_mib_s": 11.867101,
+      "throughput_spread_pct": 4.670884,
+      "workers": 4
+    },
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 1.907349,
+      "id": "low-latency/h2/workers_1/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 4096.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 10.977914,
+      "throughput_mib_s": 11.544209,
+      "throughput_spread_pct": 5.257946,
+      "workers": 1
+    },
+    {
+      "amplification": 1.014649,
+      "cpu_ns_per_byte": 3.33786,
+      "id": "low-latency/h2/workers_4/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 16384.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 11.249949,
+      "throughput_mib_s": 11.414152,
+      "throughput_spread_pct": 1.742019,
+      "workers": 4
+    }
+  ],
+  "schema": "kdown.bench.baseline/1",
+  "source_report_generated_at": "2026-09-27T10:44:17Z",
+  "thresholds": {
+    "amplification_delta": 0.05,
+    "baseline_max_age_days": 180,
+    "cpu_per_byte_delta_pct": 15.0,
+    "memory_delta_min_bytes": 1048576,
+    "memory_delta_pct": 10.0,
+    "noise_max_spread_pct": 15.0,
+    "scaling_loss_pct": 10.0,
+    "throughput_loss_pct": 10.0
+  }
+}

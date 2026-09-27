@@ -178,10 +178,26 @@ cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
 ```
 
+Category verification lanes record machine-checkable release evidence, and a
+production-stable verdict requires every mandatory gate to have fresh, passing,
+release-approving evidence:
+
+```sh
+scripts/ci_lane.sh correctness|durability|resource-bound|interoperability
+scripts/dynamic_checks.sh probe|miri|address|thread|self-test
+scripts/bench_check.sh --release loopback|low-latency|wan|all
+scripts/bench_check.sh --self-test
+python3 scripts/release_gate.py merge --manifest /tmp/manifest.json artifacts/evidence artifacts/dynamic
+python3 scripts/release_gate.py status --manifest /tmp/manifest.json --commit "$(git rev-parse HEAD)"
+```
+
 See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
-See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
-mapping and [`crates/engine/benches/results/baseline.md`](crates/engine/benches/results/baseline.md)
-for the loopback benchmark baseline.
+mapping, [`docs/performance-report-v1.md`](docs/performance-report-v1.md) for
+the multi-axis performance results, matched-host baselines, thresholds and the
+current production-stability blockers, and
+[`release/evidence-manifest.json`](release/evidence-manifest.json) for the gate
+definitions. The historical loopback criterion baseline remains at
+[`crates/engine/benches/results/baseline.md`](crates/engine/benches/results/baseline.md).
 
 **Reading benchmark numbers:** recorded loopback/synthetic throughput is
 regression evidence for the specific machine and fixture it was measured on.

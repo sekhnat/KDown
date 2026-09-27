@@ -9,7 +9,9 @@
 //!
 //! Controlled behaviors (CLI flags):
 //! - `--ignore-ranges`: answer every GET with a full 200 response.
-//! - `--throttle-mib-s <F>`: pace each response body to at most F MiB/s.
+//! - `--throttle-mib-s <F>`: emulate a F MiB/s link. The budget is shared
+//!   by every connection (one slot schedule), so N concurrent responses do not
+//!   each get the full rate.
 //! - `--transient-fail <N>:<CODE>`: fail the first N body requests with the
 //!   given status (e.g. `2:503`) plus `Retry-After: 0`, then serve normally.
 //! - `--reset-after-bytes <N>`: abruptly close the connection after N body
@@ -26,6 +28,9 @@
 //! The server serves until killed. With `--tls-cert`/`--tls-key` it speaks
 //! TLS with ALPN `h2` + `http/1.1` (hyper auto), so process-isolated
 //! comparisons cover the H2 path; otherwise it is plaintext HTTP/1.1.
+//!
+//! RTT (`--rtt-ms`) is applied per response with deterministic seeded jitter
+//! (`--jitter-ms`) so a pinned profile replays identically.
 //!
 //! `GET /__stats` returns `emitted=<n> connections=<n> requests=<n>` —
 //! server-side wire accounting for amplification records (stats responses
@@ -61,6 +66,9 @@ struct ServerConfig {
     /// response's headers (one full RTT per request; the handshake and
     /// kernel queues add their own, so this is a lower bound).
     rtt: Option<Duration>,
+    /// Uniform `0..=jitter_ms` extra delay per response, drawn from a seeded
+    /// per-response sequence so a profile replays identically.
+    jitter_ms: u64,
     /// Deterministic per-response connection-loss probability (0-100).
     loss_percent: f64,
     /// `Retry-After` seconds for transient-fail responses (default 0).
@@ -90,6 +98,71 @@ impl ServerStats {
             self.connections.load(Ordering::Relaxed),
             self.requests.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// Server-wide bandwidth shaping: one slot schedule shared by every connection.
+///
+/// `--throttle-mib-s` emulates a link rate, so concurrent responses share the
+/// budget. Per-response pacing (the earlier behavior) let N parallel range
+/// responses each use the full rate, which made shaped profiles meaningless
+/// under concurrency; the absolute slot schedule also keeps the achieved rate
+/// accurate despite a coarse (~1 ms) timer wheel.
+/// Pacing quantum: bytes are admitted in batches so each sleep is long enough
+/// for the runtime's coarse (~1 ms) timer wheel to schedule. Smaller quanta
+/// would cap the achievable rate near 4 MiB/s regardless of the configured one;
+/// 64 KiB keeps the burst bounded while staying accurate to well above the
+/// fastest pinned profile rate.
+const LINK_QUANTUM: u64 = 64 * 1024;
+
+struct LinkRate {
+    bytes_per_sec: f64,
+    state: tokio::sync::Mutex<LinkRateState>,
+}
+
+struct LinkRateState {
+    /// Virtual-clock instant at which the link becomes free again.
+    next_free: tokio::time::Instant,
+    /// Bytes admitted within the current quantum.
+    pending: u64,
+}
+
+impl LinkRate {
+    fn new(mib_per_sec: f64) -> Self {
+        Self {
+            bytes_per_sec: (mib_per_sec * 1024.0 * 1024.0).max(f64::EPSILON),
+            state: tokio::sync::Mutex::new(LinkRateState {
+                next_free: tokio::time::Instant::now(),
+                pending: 0,
+            }),
+        }
+    }
+
+    /// Reserve `bytes` on the shared link schedule and wait for their slot.
+    ///
+    /// The reservation clock is clamped to "now" on entry, so an idle server
+    /// does not accumulate burst credit: after a pause the next transfer starts
+    /// immediately instead of replaying the skipped budget.
+    async fn admit(&self, bytes: u64) {
+        let slot = {
+            let mut state = self.state.lock().await;
+            state.pending += bytes;
+            if state.pending < LINK_QUANTUM {
+                return;
+            }
+            let batch = state.pending;
+            state.pending = 0;
+            let service = Duration::from_secs_f64(batch as f64 / self.bytes_per_sec);
+            let now = tokio::time::Instant::now();
+            let start = if state.next_free < now {
+                now
+            } else {
+                state.next_free
+            };
+            state.next_free = start + service;
+            start
+        };
+        tokio::time::sleep_until(slot).await;
     }
 }
 
@@ -175,7 +248,7 @@ fn usage() -> ! {
          [--ignore-ranges] [--throttle-mib-s F] [--transient-fail N:CODE]\n\
          [--reset-after-bytes N] [--change-etag-after N]\n\
          [--tls-cert CERT.pem --tls-key KEY.pem]\n\
-         [--rtt-ms F] [--loss-percent P] [--retry-after SECS]"
+         [--rtt-ms F] [--jitter-ms MS] [--loss-percent P] [--retry-after SECS]"
     );
     std::process::exit(2);
 }
@@ -192,6 +265,7 @@ fn parse_args() -> (std::net::SocketAddr, ServerConfig) {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut rtt = None;
+    let mut jitter_ms = 0u64;
     let mut loss_percent = 0.0f64;
     let mut retry_after_secs = 0u64;
     // Materialize (flag, value) pairs first: flags take exactly one value,
@@ -233,6 +307,7 @@ fn parse_args() -> (std::net::SocketAddr, ServerConfig) {
                     .map(|ms| Duration::from_secs_f64(ms / 1000.0));
             }
             "--loss-percent" => loss_percent = value.parse().unwrap_or(0.0),
+            "--jitter-ms" => jitter_ms = parse_u64(&value).unwrap_or_else(|| usage()),
             "--retry-after" => retry_after_secs = parse_u64(&value).unwrap_or_else(|| usage()),
             _ => usage(),
         }
@@ -251,6 +326,7 @@ fn parse_args() -> (std::net::SocketAddr, ServerConfig) {
         tls_cert,
         tls_key,
         rtt,
+        jitter_ms,
         loss_percent,
         retry_after_secs,
     };
@@ -274,6 +350,8 @@ struct ServerState {
     served: u64,
     /// Deterministic loss-roll sequence.
     loss_seq: u64,
+    /// Deterministic jitter-draw sequence.
+    jitter_seq: u64,
     etag: String,
 }
 
@@ -301,10 +379,12 @@ async fn main() {
         transient_status: cfg.transient_fail.map_or(503, |(_, c)| c),
         served: 0,
         loss_seq: 0,
+        jitter_seq: 0,
         etag: "iso".to_string(),
     }));
     let cfg = Arc::new(cfg);
     let stats = Arc::new(ServerStats::default());
+    let rate = cfg.throttle_mib_s.map(|mib| Arc::new(LinkRate::new(mib)));
 
     if let (Some(cert), Some(key)) = (cfg.tls_cert.clone(), cfg.tls_key.clone()) {
         let tls = tls_server_config(&cert, &key);
@@ -318,9 +398,10 @@ async fn main() {
             let state = state.clone();
             let cfg = cfg.clone();
             let stats = stats.clone();
+            let rate = rate.clone();
             tokio::spawn(async move {
                 if let Ok(stream) = acceptor.accept(socket).await {
-                    serve_tls_connection(stream, state, cfg, stats).await;
+                    serve_tls_connection(stream, state, cfg, stats, rate).await;
                 }
             });
         }
@@ -334,8 +415,9 @@ async fn main() {
         let state = state.clone();
         let cfg = cfg.clone();
         let stats = stats.clone();
+        let rate = rate.clone();
         tokio::spawn(async move {
-            serve_connection(socket, state, cfg, stats).await;
+            serve_connection(socket, state, cfg, stats, rate).await;
         });
     }
 }
@@ -372,6 +454,7 @@ async fn serve_tls_connection(
     state: Arc<tokio::sync::Mutex<ServerState>>,
     cfg: Arc<ServerConfig>,
     stats: Arc<ServerStats>,
+    rate: Option<Arc<LinkRate>>,
 ) {
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
@@ -380,7 +463,10 @@ async fn serve_tls_connection(
         let state = state.clone();
         let cfg = cfg.clone();
         let stats = stats.clone();
-        async move { Ok::<_, std::convert::Infallible>(handle_request(req, state, cfg, stats).await) }
+        let rate = rate.clone();
+        async move {
+            Ok::<_, std::convert::Infallible>(handle_request(req, state, cfg, stats, rate).await)
+        }
     });
     if let Err(e) = builder
         .serve_connection_with_upgrades(TokioIo::new(stream), service)
@@ -412,15 +498,14 @@ fn stream_body_box(
     end: u64,
     stats: Arc<ServerStats>,
     truncate: bool,
+    rate: Option<Arc<LinkRate>>,
 ) -> BoxBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<
         Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>,
     >(4);
     let seed = cfg.seed;
-    let throttle_mib_s = cfg.throttle_mib_s;
     let reset_after_bytes = cfg.reset_after_bytes;
     tokio::spawn(async move {
-        let bytes_per_sec = throttle_mib_s.unwrap_or(f64::INFINITY) * 1024.0 * 1024.0;
         let mut off = start;
         let mut sent_this_response: u64 = 0;
         let mut chunks: Vec<Vec<u8>> = Vec::new();
@@ -433,6 +518,9 @@ fn stream_body_box(
             chunks.push(block[in_block..in_block + take_in_block].to_vec());
             if chunks.len() * STREAM_CHUNK >= 256 * 1024 {
                 for chunk in chunks.drain(..) {
+                    if let Some(rate) = &rate {
+                        rate.admit(chunk.len() as u64).await;
+                    }
                     if tx
                         .send(Ok(hyper::body::Frame::data(chunk.into())))
                         .await
@@ -458,14 +546,11 @@ fn stream_body_box(
                     return;
                 }
             }
-            if bytes_per_sec.is_finite() {
-                tokio::time::sleep(Duration::from_secs_f64(
-                    take_in_block as f64 / bytes_per_sec.max(f64::EPSILON),
-                ))
-                .await;
-            }
         }
         for chunk in chunks.drain(..) {
+            if let Some(rate) = &rate {
+                rate.admit(chunk.len() as u64).await;
+            }
             let _ = tx.send(Ok(hyper::body::Frame::data(chunk.into()))).await;
         }
     });
@@ -498,6 +583,7 @@ async fn handle_request(
     state: Arc<tokio::sync::Mutex<ServerState>>,
     cfg: Arc<ServerConfig>,
     stats: Arc<ServerStats>,
+    rate: Option<Arc<LinkRate>>,
 ) -> hyper::Response<BoxBody> {
     use hyper::header;
 
@@ -557,7 +643,7 @@ async fn handle_request(
         return builder.body(empty_body()).expect("head response");
     }
     builder
-        .body(stream_body_box(&cfg, start, end, stats, truncate))
+        .body(stream_body_box(&cfg, start, end, stats, truncate, rate))
         .expect("streaming response")
 }
 
@@ -688,6 +774,7 @@ async fn serve_connection(
     state: Arc<tokio::sync::Mutex<ServerState>>,
     cfg: Arc<ServerConfig>,
     stats: Arc<ServerStats>,
+    rate: Option<Arc<LinkRate>>,
 ) {
     loop {
         let Some((range, request_line, close_after)) = read_request(&mut socket).await else {
@@ -725,9 +812,22 @@ async fn serve_connection(
                 truncate,
             } => (status, range, truncate),
         };
-        // Loopback RTT approximation: one RTT before the response headers.
+        // Transport shaping: one RTT before the response headers plus a
+        // deterministic seeded jitter draw, so a pinned profile replays
+        // identically (the draw sequence keys off the server seed).
         if let Some(rtt) = cfg.rtt {
-            tokio::time::sleep(rtt).await;
+            let jitter = if cfg.jitter_ms == 0 {
+                0
+            } else {
+                let mut st = state.lock().await;
+                st.jitter_seq = st.jitter_seq.wrapping_add(1);
+                let mut rng = st.jitter_seq ^ cfg.seed;
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % (cfg.jitter_ms + 1)
+            };
+            tokio::time::sleep(rtt + Duration::from_millis(jitter)).await;
         }
 
         if status == 200 || status == 206 {
@@ -748,9 +848,17 @@ async fn serve_connection(
             if is_head {
                 continue;
             }
-            if stream_body(&mut socket, &cfg, start, end, &stats, truncate)
-                .await
-                .is_err()
+            if stream_body(
+                &mut socket,
+                &cfg,
+                start,
+                end,
+                &stats,
+                truncate,
+                rate.as_deref(),
+            )
+            .await
+            .is_err()
             {
                 return;
             }
@@ -782,8 +890,8 @@ async fn stream_body(
     end: u64,
     stats: &ServerStats,
     truncate: bool,
+    rate: Option<&LinkRate>,
 ) -> std::io::Result<()> {
-    let bytes_per_sec = cfg.throttle_mib_s.unwrap_or(f64::INFINITY) * 1024.0 * 1024.0;
     let mut off = start;
     let mut sent_this_response: u64 = 0;
     while off <= end {
@@ -792,6 +900,10 @@ async fn stream_body(
         let in_block = (off % SYNTHETIC_BLOCK as u64) as usize;
         let block = deterministic_block(block_off, cfg.seed);
         let take_in_block = (SYNTHETIC_BLOCK - in_block).min(take as usize);
+        // Shared link schedule: concurrent responses draw from one budget.
+        if let Some(rate) = rate {
+            rate.admit(take_in_block as u64).await;
+        }
         socket
             .write_all(&block[in_block..in_block + take_in_block])
             .await?;
@@ -813,11 +925,6 @@ async fn stream_body(
                 socket.shutdown().await.ok();
                 return Ok(());
             }
-        }
-        if bytes_per_sec.is_finite() {
-            let delay =
-                Duration::from_secs_f64(take_in_block as f64 / bytes_per_sec.max(f64::EPSILON));
-            tokio::time::sleep(delay).await;
         }
     }
     Ok(())

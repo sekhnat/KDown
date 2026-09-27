@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "description": "Machine-checkable release evidence for KDown (production-stability task 5.4). `required_gates` are the gates a production-stable verdict needs; `evidence` holds the recorded fragments merged from `scripts/evidence_io.py`; a missing, failed, stale, non-approving or unavailable gate blocks the verdict (an `unavailable` checker may be waived only by a reviewed exception, and a `passed_equivalent` entry must name the equivalent that ran).",
+  "required_categories": [
+    "correctness",
+    "durability",
+    "resource_bound",
+    "interoperability",
+    "stress",
+    "security",
+    "security_dynamic",
+    "performance"
+  ],
+  "required_gates": [
+    {
+      "id": "correctness_workspace_tests_linux",
+      "category": "correctness",
+      "summary": "Linux workspace build, full test matrix and clippy with the locked dependency set",
+      "producer": ".github/workflows/ci.yml job test (ubuntu-latest) via scripts/ci_lane.sh correctness",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "correctness_workspace_tests_macos",
+      "category": "correctness",
+      "summary": "macOS workspace build, full test matrix and clippy with the locked dependency set",
+      "producer": ".github/workflows/ci.yml job test (macos-latest) via scripts/ci_lane.sh correctness",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "correctness_workspace_tests_windows",
+      "category": "correctness",
+      "summary": "Windows workspace build, full test matrix and clippy with the locked dependency set",
+      "producer": ".github/workflows/ci.yml job test (windows-latest) via scripts/ci_lane.sh correctness",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "durability_platform_matrix_linux",
+      "category": "durability",
+      "summary": "Linux publication/lease platform matrix plus checkpoint crash/restart recovery",
+      "producer": ".github/workflows/ci.yml job test (ubuntu-latest) via scripts/ci_lane.sh durability",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "durability_platform_matrix_macos",
+      "category": "durability",
+      "summary": "macOS publication/lease platform matrix plus checkpoint crash/restart recovery",
+      "producer": ".github/workflows/ci.yml job test (macos-latest) via scripts/ci_lane.sh durability",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "durability_platform_matrix_windows",
+      "category": "durability",
+      "summary": "Windows publication/lease platform matrix plus checkpoint crash/restart recovery",
+      "producer": ".github/workflows/ci.yml job test (windows-latest) via scripts/ci_lane.sh durability",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "resource_bound_adversarial",
+      "category": "resource_bound",
+      "summary": "Transfer-memory admission, HTTP ingress bounds and budget telemetry under adversarial load",
+      "producer": ".github/workflows/ci.yml job resource-bound (Linux)",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "interoperability_http_matrix",
+      "category": "interoperability",
+      "summary": "Range/validator/CDN/proxy and network-condition interoperability suite on H1 and H2",
+      "producer": ".github/workflows/ci.yml job interoperability (Linux)",
+      "max_age_days": 30,
+      "approves_release": true
+    },
+    {
+      "id": "stress_fuzz_url",
+      "category": "stress",
+      "summary": "Time-budgeted libFuzzer run for URL handling with retained corpus and replay seed",
+      "producer": ".github/workflows/fuzz-stress.yml job fuzz (target fuzz_url)",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "stress_fuzz_content_range",
+      "category": "stress",
+      "summary": "Time-budgeted libFuzzer run for Content-Range parsing with retained corpus and replay seed",
+      "producer": ".github/workflows/fuzz-stress.yml job fuzz (target fuzz_content_range)",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "stress_fuzz_etag",
+      "category": "stress",
+      "summary": "Time-budgeted libFuzzer run for ETag capture/comparison with retained corpus and replay seed",
+      "producer": ".github/workflows/fuzz-stress.yml job fuzz (target fuzz_etag)",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "stress_fuzz_content_disposition",
+      "category": "stress",
+      "summary": "Time-budgeted libFuzzer run for Content-Disposition parsing with retained corpus and replay seed",
+      "producer": ".github/workflows/fuzz-stress.yml job fuzz (target fuzz_content_disposition)",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "stress_fuzz_checkpoint",
+      "category": "stress",
+      "summary": "Time-budgeted libFuzzer run for checkpoint parsing with retained corpus and replay seed",
+      "producer": ".github/workflows/fuzz-stress.yml job fuzz (target fuzz_checkpoint)",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "stress_state_machine",
+      "category": "stress",
+      "summary": "Long randomized scheduler/checkpoint/publication/crash-restart/sink-fault stress with retained seeds",
+      "producer": ".github/workflows/fuzz-stress.yml job state-machine-stress",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "security_dependency_audit",
+      "category": "security",
+      "summary": "Locked dependency audit for the workspace and fuzz lockfiles with reviewed advisory exceptions",
+      "producer": ".github/workflows/ci.yml job dependency-audit",
+      "max_age_days": 14,
+      "approves_release": true
+    },
+    {
+      "id": "security_dynamic_miri",
+      "category": "security_dynamic",
+      "summary": "Targeted Miri over parser metadata and scheduler state machines (or a recorded equivalent)",
+      "producer": ".github/workflows/fuzz-stress.yml job miri",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "security_dynamic_asan",
+      "category": "security_dynamic",
+      "summary": "Address-sanitizer run over parser, scheduler and transfer-ledger state machines",
+      "producer": ".github/workflows/fuzz-stress.yml job sanitizer-address",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "security_dynamic_tsan",
+      "category": "security_dynamic",
+      "summary": "Thread-sanitizer run over the concurrency-bearing admission state machine",
+      "producer": ".github/workflows/fuzz-stress.yml job sanitizer-thread",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "performance_loopback",
+      "category": "performance",
+      "summary": "Matched-host loopback profile suite meeting its versioned per-axis thresholds",
+      "producer": "scripts/bench_check.sh --release loopback",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "performance_low_latency",
+      "category": "performance",
+      "summary": "Low-latency shaped profile suite (10 ms RTT, 1 ms jitter, 100 Mbps, 0.1% loss) meeting its thresholds",
+      "producer": "scripts/bench_check.sh --release low-latency",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "performance_wan",
+      "category": "performance",
+      "summary": "WAN shaped profile suite (80 ms RTT, 20 ms jitter, 20 Mbps, 1% loss) meeting its thresholds",
+      "producer": "scripts/bench_check.sh --release wan",
+      "max_age_days": 45,
+      "approves_release": true
+    },
+    {
+      "id": "performance_pr_smoke",
+      "category": "performance",
+      "summary": "PR benchmark scenario smoke: detects broken benchmark scenarios only and never approves a release",
+      "producer": ".github/workflows/ci.yml job bench-check",
+      "max_age_days": 30,
+      "approves_release": false
+    }
+  ],
+  "reviewed_exceptions": [],
+  "evidence": [],
+  "high_severity_defects": []
+}

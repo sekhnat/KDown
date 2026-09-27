@@ -1,0 +1,100 @@
+{
+  "affected_axes": [
+    "noise",
+    "scaling"
+  ],
+  "baseline_fingerprint": "33919309d07fed4f",
+  "baseline_recorded_at": "2026-09-27T10:54:08Z",
+  "failures": [
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 35.1% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h1/workers_1/jobs_1"
+    },
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 28.0% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h1/workers_4/jobs_1"
+    },
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 26.5% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h2/workers_1/jobs_1"
+    },
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 18.4% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h2/workers_1/jobs_4"
+    },
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 30.4% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h2/workers_4/jobs_4"
+    },
+    {
+      "axis": "noise",
+      "detail": "run-to-run spread 17.9% exceeds the 15.0% noise limit; this run is not evidence about the engine - rerun on controlled hardware",
+      "scenario": "loopback/h2/workers_8/jobs_4"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 1.604x is 20.8% below baseline 2.026x (limit 10.0%)",
+      "scenario": "h1/workers_1/jobs_4"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 1.621x is 18.9% below baseline 1.998x (limit 10.0%)",
+      "scenario": "h1/workers_4/jobs_4"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 0.995x is 24.1% below baseline 1.311x (limit 10.0%)",
+      "scenario": "h1/workers_8/jobs_1"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 1.440x is 22.1% below baseline 1.848x (limit 10.0%)",
+      "scenario": "h1/workers_8/jobs_4"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 2.016x is 16.8% below baseline 2.424x (limit 10.0%)",
+      "scenario": "h2/workers_1/jobs_4"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 1.149x is 19.5% below baseline 1.427x (limit 10.0%)",
+      "scenario": "h2/workers_4/jobs_1"
+    },
+    {
+      "axis": "scaling",
+      "detail": "scaling efficiency 1.135x is 20.4% below baseline 1.425x (limit 10.0%)",
+      "scenario": "h2/workers_8/jobs_1"
+    }
+  ],
+  "noise_scenarios": [
+    "loopback/h1/workers_1/jobs_1",
+    "loopback/h1/workers_4/jobs_1",
+    "loopback/h2/workers_1/jobs_1",
+    "loopback/h2/workers_1/jobs_4",
+    "loopback/h2/workers_4/jobs_4",
+    "loopback/h2/workers_8/jobs_4"
+  ],
+  "notes": [
+    "baseline was recorded on a host that exceeded the noise limit for 6 scenario(s); re-record on a controlled host before treating comparisons as release evidence"
+  ],
+  "ok": false,
+  "profile": "loopback",
+  "report_fingerprint": "33919309d07fed4f",
+  "thresholds": {
+    "amplification_delta": 0.05,
+    "baseline_max_age_days": 180,
+    "cpu_per_byte_delta_pct": 15.0,
+    "memory_delta_min_bytes": 1048576,
+    "memory_delta_pct": 10.0,
+    "noise_max_spread_pct": 15.0,
+    "scaling_loss_pct": 10.0,
+    "throughput_loss_pct": 10.0
+  },
+  "verdict": "benchmark gate FAILED: 13 breach(es) on axes ['noise', 'scaling']"
+}

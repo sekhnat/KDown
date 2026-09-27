@@ -26,11 +26,24 @@ jobs:
       # --locked keeps every platform on the reviewed, tracked dependency
       # set: a resolution drift fails loudly here instead of silently
       # changing what the MSRV and platform jobs verify.
-      - run: cargo build --workspace --all-targets --locked
-      # Full matrix includes positional writes, rename-over-existing,
-      # preallocation, crash/resume, segmented, and security tests.
-      - run: cargo test --workspace --all-targets --locked
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The lane runs build + the full matrix + clippy and records a release-
+      # evidence fragment for this OS, so a green run on one platform cannot
+      # stand in for the three-OS matrix (task 5.4).
+      - name: Correctness lane (three-OS matrix evidence)
+        run: ./scripts/ci_lane.sh correctness
+      # Durability gate for this OS: platform filesystem/publication matrix
+      # plus checkpoint crash/restart recovery, recorded separately from the
+      # correctness lane.
+      - name: Durability lane (platform matrix evidence)
+        run: ./scripts/ci_lane.sh durability
+      - name: Upload release-evidence fragments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-test-${{ matrix.os }}-${{ github.run_id }}
+          path: artifacts/evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
   dependency-audit:
     name: dependency-audit
@@ -48,16 +61,50 @@ jobs:
       # .cargo/audit.toml due to its Rust 1.88 patch exceeding our Rust 1.85 MSRV;
       # no other RustSec IDs are ignored. The unmaintained-parser warning is
       # tracked in docs/acceptance-v1.md for planned migration.
-      - uses: actions-rust-lang/audit@v1
+      - id: audit_workspace
+        uses: actions-rust-lang/audit@v1
         with:
           file: Cargo.lock
           denyWarnings: false
           createIssues: false
-      - uses: actions-rust-lang/audit@v1
+      - id: audit_fuzz
+        uses: actions-rust-lang/audit@v1
         with:
           file: fuzz/Cargo.lock
           denyWarnings: false
           createIssues: false
+      # Record the audit outcome even when an audit step fails: a failed
+      # audit is blocking and never waivable (task 5.4).
+      - name: Record dependency-audit evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/evidence
+          status=passed
+          extra=--approves-release
+          if [ "${{ steps.audit_workspace.outcome }}" != success ] || [ "${{ steps.audit_fuzz.outcome }}" != success ]; then
+            status=failed
+            extra=
+          fi
+          python3 scripts/evidence_io.py record \
+            --out artifacts/evidence/security_dependency_audit.json \
+            --id security_dependency_audit \
+            --category security \
+            --status "$status" \
+            --source 'ci.yml#dependency-audit' \
+            --detail 'Locked lockfile advisory audit (workspace + fuzz) with reviewed exceptions in .cargo/audit.toml.' \
+            --command 'actions-rust-lang/audit@v1 file=Cargo.lock' \
+            --command 'actions-rust-lang/audit@v1 file=fuzz/Cargo.lock' \
+            --toolchain 'audit action v1; rust 1.98.1' \
+            --max-age-days 14 $extra
+      - name: Upload release-evidence fragments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-dependency-audit-${{ github.run_id }}
+          path: artifacts/evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
   property-fuzz-smoke:
     name: property-fuzz-smoke
@@ -79,6 +126,62 @@ jobs:
         run: cargo test --locked -p kdown-engine --lib fuzz_targets::smoke::corpus_smoke_no_panics -- --exact
       - name: Compile all libFuzzer targets
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+      # Guard the unavailable-tool semantics: a missing checker must record
+      # `unavailable` and exit non-zero, never report a pass (task 5.3).
+      - name: Dynamic-check evidence self-test
+        run: ./scripts/dynamic_checks.sh self-test
+      # Guard the release gate itself: missing, failed, stale, non-approving,
+      # unavailable and untriaged-defect evidence must all block the verdict,
+      # and PR smoke must never approve a release (tasks 5.3/5.4).
+      - name: Release-gate evidence self-test
+        run: python3 scripts/release_gate.py self-test
+
+  resource-bound:
+    # Resource-bound gate on Linux: the admission ledger, HTTP ingress bounds
+    # and budget/high-water telemetry run as their own evidence lane so the
+    # category cannot silently vanish from the release evidence (task 5.4).
+    name: resource-bound
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Resource-bound lane
+        run: ./scripts/ci_lane.sh resource-bound
+      - name: Upload release-evidence fragments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-resource-bound-${{ github.run_id }}
+          path: artifacts/evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  interoperability:
+    # Interoperability gate on Linux: HTTP range/validator/CDN/proxy and
+    # network-condition behavior on H1 and H2 (task 5.4).
+    name: interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Interoperability lane
+        run: ./scripts/ci_lane.sh interoperability
+      - name: Upload release-evidence fragments
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-interoperability-${{ github.run_id }}
+          path: artifacts/evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
 
   fmt:
@@ -115,12 +218,26 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
 
   bench-check:
-    # GitHub-hosted hardware/load differs from the local benchmark baseline;
-    # run the suite as a smoke test here and compare on matching hardware locally.
+    # GitHub-hosted hardware/load differs from any recorded baseline; run the
+    # suite as a scenario smoke here (task 6.4) and compare against reviewed
+    # baselines only on matched hardware (scripts/bench_check.sh --release).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --bench throughput --no-run
-      - run: ./scripts/bench_check.sh --smoke
+      - name: Benchmark smoke (scenario integrity + gate self-test)
+        run: ./scripts/bench_check.sh --smoke
+      - name: Upload benchmark smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-bench-smoke-${{ github.run_id }}
+          path: |
+            artifacts/evidence/
+            crates/engine/benches/results/suite/pr-smoke/
+          if-no-files-found: warn
+          retention-days: 90

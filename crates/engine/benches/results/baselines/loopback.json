@@ -1,0 +1,288 @@
+{
+  "commit": "4caf56e441e4ec109bcaa08cf78802b9c7f4394a",
+  "fingerprint_fields": {
+    "arch": "x86_64",
+    "commit": "4caf56e441e4ec109bcaa08cf78802b9c7f4394a",
+    "cpu_model": "AMD Ryzen 7 9700X 8-Core Processor",
+    "dataset_bytes": 67108864,
+    "dest_root": null,
+    "disk_label": "tmpfs",
+    "fixture_args": [
+      "--addr",
+      "127.0.0.1:0",
+      "--size",
+      "4194304",
+      "--seed",
+      "20260927",
+      "tls=true"
+    ],
+    "kernel": "7.2.7-1-cachyos",
+    "logical_cpus": 16,
+    "os": "linux",
+    "profile": "loopback",
+    "profile_version": 1,
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01) (Arch Linux rust 1:1.98.1-1.1)"
+  },
+  "fingerprint_id": "33919309d07fed4f",
+  "host_noise_ok": false,
+  "noise_exceeded_scenarios": [
+    "loopback/h1/workers_1/jobs_1",
+    "loopback/h1/workers_4/jobs_1",
+    "loopback/h2/workers_1/jobs_1",
+    "loopback/h2/workers_1/jobs_4",
+    "loopback/h2/workers_4/jobs_4",
+    "loopback/h2/workers_8/jobs_4"
+  ],
+  "profile": "loopback",
+  "profile_version": 1,
+  "recorded_at": "2026-09-27T10:54:08Z",
+  "reviewed_by": "kdown production-stability task 6.3 (matched development host; see host_noise_ok)",
+  "scaling": {
+    "h1": [
+      {
+        "jobs": 1,
+        "scaling_efficiency": 1.0,
+        "throughput_mib_s": 412.457851,
+        "workers": 1
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.506617,
+        "throughput_mib_s": 835.83203,
+        "workers": 1
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.267103,
+        "throughput_mib_s": 440.675154,
+        "workers": 4
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.124891,
+        "throughput_mib_s": 824.19926,
+        "workers": 4
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.16386,
+        "throughput_mib_s": 540.683676,
+        "workers": 8
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.057748,
+        "throughput_mib_s": 762.197078,
+        "workers": 8
+      }
+    ],
+    "h2": [
+      {
+        "jobs": 1,
+        "scaling_efficiency": 1.0,
+        "throughput_mib_s": 326.156546,
+        "workers": 1
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.605994,
+        "throughput_mib_s": 790.595984,
+        "workers": 1
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.356712,
+        "throughput_mib_s": 465.375604,
+        "workers": 4
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.129889,
+        "throughput_mib_s": 677.824003,
+        "workers": 4
+      },
+      {
+        "jobs": 1,
+        "scaling_efficiency": 0.178178,
+        "throughput_mib_s": 464.91239,
+        "workers": 8
+      },
+      {
+        "jobs": 4,
+        "scaling_efficiency": 0.064116,
+        "throughput_mib_s": 669.174664,
+        "workers": 8
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 0.766345,
+      "id": "loopback/h1/workers_1/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 163893.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 412.457851,
+      "throughput_mib_s": 554.736784,
+      "throughput_spread_pct": 35.101167,
+      "workers": 1
+    },
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 0.729093,
+      "id": "loopback/h1/workers_1/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 196502.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 835.83203,
+      "throughput_mib_s": 890.005364,
+      "throughput_spread_pct": 12.586795,
+      "workers": 1
+    },
+    {
+      "amplification": 1.00296,
+      "cpu_ns_per_byte": 1.128231,
+      "id": "loopback/h1/workers_4/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 299008.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 440.675154,
+      "throughput_mib_s": 534.602761,
+      "throughput_spread_pct": 27.979454,
+      "workers": 4
+    },
+    {
+      "amplification": 1.003258,
+      "cpu_ns_per_byte": 1.117587,
+      "id": "loopback/h1/workers_4/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 131072.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 824.19926,
+      "throughput_mib_s": 899.260794,
+      "throughput_spread_pct": 12.608987,
+      "workers": 4
+    },
+    {
+      "amplification": 1.004379,
+      "cpu_ns_per_byte": 1.341105,
+      "id": "loopback/h1/workers_8/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 372630.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 540.683676,
+      "throughput_mib_s": 552.184155,
+      "throughput_spread_pct": 3.717346,
+      "workers": 8
+    },
+    {
+      "amplification": 1.002029,
+      "cpu_ns_per_byte": 1.346426,
+      "id": "loopback/h1/workers_8/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 245707.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h1",
+      "throughput_median_mib_s": 762.197078,
+      "throughput_mib_s": 798.626749,
+      "throughput_spread_pct": 5.941706,
+      "workers": 8
+    },
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 1.064369,
+      "id": "loopback/h2/workers_1/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 4096.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 326.156546,
+      "throughput_mib_s": 410.358708,
+      "throughput_spread_pct": 26.510676,
+      "workers": 1
+    },
+    {
+      "amplification": 1.0,
+      "cpu_ns_per_byte": 1.090978,
+      "id": "loopback/h2/workers_1/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 4096.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 790.595984,
+      "throughput_mib_s": 827.42479,
+      "throughput_spread_pct": 18.449898,
+      "workers": 1
+    },
+    {
+      "amplification": 1.002502,
+      "cpu_ns_per_byte": 2.469335,
+      "id": "loopback/h2/workers_4/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 16384.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 465.375604,
+      "throughput_mib_s": 471.562807,
+      "throughput_spread_pct": 3.370543,
+      "workers": 4
+    },
+    {
+      "amplification": 1.002174,
+      "cpu_ns_per_byte": 2.256462,
+      "id": "loopback/h2/workers_4/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 16384.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 677.824003,
+      "throughput_mib_s": 820.312496,
+      "throughput_spread_pct": 30.35657,
+      "workers": 4
+    },
+    {
+      "amplification": 1.002991,
+      "cpu_ns_per_byte": 2.788646,
+      "id": "loopback/h2/workers_8/jobs_1",
+      "jobs": 1,
+      "managed_memory_high_water_bytes": 32768.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 464.91239,
+      "throughput_mib_s": 465.813903,
+      "throughput_spread_pct": 1.293715,
+      "workers": 8
+    },
+    {
+      "amplification": 1.002098,
+      "cpu_ns_per_byte": 2.586416,
+      "id": "loopback/h2/workers_8/jobs_4",
+      "jobs": 4,
+      "managed_memory_high_water_bytes": 32768.0,
+      "managed_memory_limit_bytes": 67108864,
+      "protocol": "h2",
+      "throughput_median_mib_s": 669.174664,
+      "throughput_mib_s": 786.373298,
+      "throughput_spread_pct": 17.886271,
+      "workers": 8
+    }
+  ],
+  "schema": "kdown.bench.baseline/1",
+  "source_report_generated_at": "2026-09-27T10:44:02Z",
+  "thresholds": {
+    "amplification_delta": 0.05,
+    "baseline_max_age_days": 180,
+    "cpu_per_byte_delta_pct": 15.0,
+    "memory_delta_min_bytes": 1048576,
+    "memory_delta_pct": 10.0,
+    "noise_max_spread_pct": 15.0,
+    "scaling_loss_pct": 10.0,
+    "throughput_loss_pct": 10.0
+  }
+}

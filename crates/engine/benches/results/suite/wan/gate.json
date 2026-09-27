@@ -1,0 +1,22 @@
+{
+  "affected_axes": [],
+  "baseline_fingerprint": "b5fd744c9cd45793",
+  "baseline_recorded_at": "2026-09-27T10:54:08Z",
+  "failures": [],
+  "noise_scenarios": [],
+  "notes": [],
+  "ok": true,
+  "profile": "wan",
+  "report_fingerprint": "b5fd744c9cd45793",
+  "thresholds": {
+    "amplification_delta": 0.05,
+    "baseline_max_age_days": 180,
+    "cpu_per_byte_delta_pct": 15.0,
+    "memory_delta_min_bytes": 1048576,
+    "memory_delta_pct": 10.0,
+    "noise_max_spread_pct": 15.0,
+    "scaling_loss_pct": 10.0,
+    "throughput_loss_pct": 10.0
+  },
+  "verdict": "benchmark gate PASSED: every axis within threshold"
+}

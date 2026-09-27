@@ -6,6 +6,22 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      bench_runner:
+        description: >-
+          Runner label for the release benchmark gates. Performance baselines
+          are matched-host artifacts, so a matched self-hosted runner is
+          required for a release-approving comparison; shared runners record an
+          explicit fingerprint-mismatch limitation instead.
+        required: false
+        default: ubuntu-latest
+      ci_run_id:
+        description: >-
+          Optional CI run id whose evidence artifacts (three-OS correctness and
+          durability, resource bound, interoperability) should be merged into
+          the release verdict.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -14,6 +30,106 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  miri:
+    # Targeted Miri (task 5.3): dynamic UB/aliasing checks over the isolated
+    # state machines that Miri can actually execute (parser metadata,
+    # interval/lease scheduling) without the async I/O the checkers cannot
+    # model. Miri is orders of magnitude slower than native execution, so the
+    # property runs are bounded and seeded.
+    name: miri-targeted
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT_DIR: artifacts/dynamic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Record checker availability and toolchain
+        run: |
+          mkdir -p artifacts/dynamic
+          ./scripts/dynamic_checks.sh probe | tee artifacts/dynamic/probe.txt
+      # --fallback-equivalent runs the documented applicable equivalent
+      # (address sanitizer over the same targeted tests) when Miri cannot
+      # execute. The evidence records which lane ran; an unavailable checker
+      # with no equivalent exits non-zero, so the job goes red and blocks
+      # release instead of silently passing.
+      - name: Run targeted Miri checks
+        run: ./scripts/dynamic_checks.sh miri --fallback-equivalent
+      - name: Retain dynamic-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-dynamic-miri-${{ github.run_id }}
+          path: artifacts/dynamic/
+          if-no-files-found: warn
+          retention-days: 90
+
+  sanitizer-address:
+    # AddressSanitizer over the same targeted state machines plus the
+    # transfer-ledger admission concurrency tests (task 5.3).
+    name: sanitizer-address
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT_DIR: artifacts/dynamic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Run address-sanitizer checks
+        run: |
+          mkdir -p artifacts/dynamic
+          ./scripts/dynamic_checks.sh probe | tee artifacts/dynamic/probe.txt
+          ./scripts/dynamic_checks.sh address
+      - name: Retain dynamic-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-dynamic-asan-${{ github.run_id }}
+          path: artifacts/dynamic/
+          if-no-files-found: warn
+          retention-days: 90
+
+  sanitizer-thread:
+    # ThreadSanitizer over the concurrency-bearing admission state machine.
+    # A runner that cannot map the TSAN shadow region records an explicit
+    # limitation (and fails the job) rather than reporting the check as
+    # passing: docs/regression-triage.md documents the reviewed disposition.
+    name: sanitizer-thread
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT_DIR: artifacts/dynamic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # Newer kernels default to more ASLR entropy than TSAN's shadow layout
+      # supports; lower it inside the runner when permitted and record it.
+      - name: Report ASLR entropy for ThreadSanitizer
+        run: |
+          mkdir -p artifacts/dynamic
+          sysctl vm.mmap_rnd_bits 2>/dev/null | tee artifacts/dynamic/tsan-aslr.txt || true
+          sudo sysctl -w vm.mmap_rnd_bits=28 2>/dev/null | tee -a artifacts/dynamic/tsan-aslr.txt || echo '::warning::vm.mmap_rnd_bits not adjustable on this runner'
+      - name: Run thread-sanitizer checks
+        run: |
+          ./scripts/dynamic_checks.sh probe | tee artifacts/dynamic/probe.txt
+          ./scripts/dynamic_checks.sh thread
+      - name: Retain dynamic-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-dynamic-tsan-${{ github.run_id }}
+          path: artifacts/dynamic/
+          if-no-files-found: warn
+          retention-days: 90
   fuzz:
     name: fuzz-${{ matrix.target }}
     runs-on: ubuntu-latest
@@ -51,6 +167,7 @@ jobs:
             echo "budget_seconds=${FUZZ_SECONDS}"
             echo "commit=${GITHUB_SHA}"
             echo "replay=cargo fuzz run ${{ matrix.target }} -- -seed=${FUZZ_SEED} -max_total_time=${FUZZ_SECONDS} -timeout=10 -max_len=65536"
+            rustc +nightly -Vv | sed 's/^/toolchain: /'
           } > "artifacts/fuzz-run/${{ matrix.target }}.replay.txt"
       - name: Run bounded libFuzzer target
         id: fuzz
@@ -63,15 +180,47 @@ jobs:
             -timeout=10 \
             -max_len=65536 \
             2>&1 | tee "artifacts/fuzz-run/${{ matrix.target }}.log"
+      # Release evidence for this fuzz target (tasks 5.2/5.4): each target is
+      # its own gate, so a failing or missing target blocks the release.
+      - name: Record fuzz evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/evidence
+          status=passed
+          extra=--approves-release
+          if [ "${{ steps.fuzz.outcome }}" != success ]; then
+            status=failed
+            extra=
+          fi
+          python3 scripts/evidence_io.py record \
+            --out "artifacts/evidence/stress_fuzz_${{ matrix.target }}.json" \
+            --id "stress_fuzz_${{ matrix.target }}" \
+            --category stress \
+            --status "$status" \
+            --source "fuzz-stress.yml#fuzz-${{ matrix.target }}" \
+            --detail "Time-budgeted libFuzzer run with retained corpus and replay seed (FUZZ_SEED=${FUZZ_SEED})." \
+            --command "cargo fuzz run ${{ matrix.target }} -- -seed=${FUZZ_SEED} -max_total_time=${FUZZ_SECONDS} -timeout=10 -max_len=65536" \
+            --toolchain "$(grep -m1 '^toolchain: ' "artifacts/fuzz-run/${{ matrix.target }}.replay.txt" | cut -d' ' -f2-)" \
+            --artifact "artifacts/fuzz-run/${{ matrix.target }}.log" \
+            --max-age-days 45 $extra
       - name: Retain seed corpus, crash artifacts, and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          name: fuzz-replay-${{ matrix.target }}-${{ github.run_id }}
           path: |
             fuzz/corpus/${{ matrix.target }}/
             fuzz/artifacts/${{ matrix.target }}/
             artifacts/fuzz-run/${{ matrix.target }}.*
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Retain fuzz release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-stress-fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: artifacts/evidence/
           if-no-files-found: warn
           retention-days: 90
       - name: Fail the job when a fuzz seed crashes
@@ -79,6 +228,118 @@ jobs:
         run: |
           echo "Fuzz target ${{ matrix.target }} failed; replay artifact uploaded above."
           exit 1
+
+  bench-release:
+    # Release performance gates (tasks 6.2-6.4): run every pinned profile with
+    # >=5 repetitions and gate each axis against its versioned baseline. A
+    # threshold breach records `failed`; an unmatched fingerprint (shared
+    # runner vs matched-host baseline) records `unavailable` with the
+    # limitation, so neither can be read as a pass.
+    name: bench-release-profiles
+    runs-on: ${{ inputs.bench_runner || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Gate semantics self-test (per-axis independence)
+        run: ./scripts/bench_check.sh --self-test
+      - name: Loopback, low-latency and WAN profile suites
+        continue-on-error: true
+        id: release_bench
+        run: ./scripts/bench_check.sh --release all
+      - name: Upload benchmark evidence and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-bench-release-${{ github.run_id }}
+          path: |
+            artifacts/evidence/
+            crates/engine/benches/results/suite/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Fail when a profile gate did not pass
+        if: steps.release_bench.outcome == 'failure'
+        run: |
+          echo "A pinned profile suite breached its thresholds (see the evidence fragment)."
+          exit 1
+
+  release-evidence:
+    # Assembles every evidence fragment this run produced (plus an optional
+    # referenced CI run) and evaluates the machine-checkable release gate
+    # (task 5.4/6.4). Missing WAN data or a breached threshold prevents a
+    # production-stable verdict; PR smoke alone can never approve a release.
+    name: release-evidence-gate
+    needs: [miri, sanitizer-address, sanitizer-thread, fuzz, state-machine-stress, bench-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download evidence artifacts from this run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "evidence-*"
+          path: artifacts/from-run
+          merge-multiple: true
+      - name: Download evidence artifacts from the referenced CI run
+        if: ${{ inputs.ci_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "evidence-*"
+          path: artifacts/from-ci
+          merge-multiple: true
+          run-id: ${{ inputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge fragments into the release manifest
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/evidence
+          cp release/evidence-manifest.json artifacts/evidence-manifest.json
+          python3 scripts/release_gate.py merge --manifest artifacts/evidence-manifest.json artifacts/from-run artifacts/from-ci 2>/dev/null \
+            || python3 scripts/release_gate.py merge --manifest artifacts/evidence-manifest.json artifacts/from-run
+      - name: Evaluate the release gate
+        id: verdict
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/release_gate.py check --manifest artifacts/evidence-manifest.json --commit "${GITHUB_SHA}" --json > artifacts/release-verdict.json
+          python3 scripts/release_gate.py status --manifest artifacts/evidence-manifest.json --commit "${GITHUB_SHA}"
+      - name: Print the verdict even when it blocks
+        if: steps.verdict.outcome == 'failure'
+        run: |
+          python3 scripts/release_gate.py status --manifest artifacts/evidence-manifest.json --commit "${GITHUB_SHA}" || true
+      - name: Upload the release verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verdict-${{ github.run_id }}
+          path: |
+            artifacts/release-verdict.json
+            artifacts/evidence-manifest.json
+          if-no-files-found: warn
+          retention-days: 365
+      - name: Failed upstream lane
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "A required verification lane failed; production stability is blocked."
+          exit 1
+      - name: Enforce the gate for release tags
+        if: github.ref_type == 'tag'
+        run: |
+          python3 scripts/release_gate.py check --manifest artifacts/evidence-manifest.json --commit "${GITHUB_SHA}"
+      - name: Report the gate state for scheduled runs
+        if: github.ref_type != 'tag'
+        run: |
+          if python3 scripts/release_gate.py check --manifest artifacts/evidence-manifest.json --commit "${GITHUB_SHA}"; then
+            echo "Evidence supports a production-stable verdict for ${GITHUB_SHA}."
+          else
+            echo "::warning::Evidence does not yet support a production-stable verdict (see the uploaded manifest and verdict artifact)."
+          fi
 
   state-machine-stress:
     name: scheduler-checkpoint-commit-concurrency-stress
@@ -94,6 +355,7 @@ jobs:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Run scheduler, checkpoint, publication, restart, and multi-job stress
+        id: stress
         run: |
           set -euo pipefail
           mkdir -p artifacts/stress
@@ -118,15 +380,51 @@ jobs:
               cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1
             done
           } 2>&1 | tee artifacts/stress/stress.log
+      # Release evidence for the long-running stress lane (task 5.4): a
+      # failed or missing stress run blocks the release.
+      - name: Record stress evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/evidence
+          status=passed
+          extra=--approves-release
+          if [ "${{ steps.stress.outcome }}" != success ]; then
+            status=failed
+            extra=
+          fi
+          python3 scripts/evidence_io.py record \
+            --out artifacts/evidence/stress_state_machine.json \
+            --id stress_state_machine \
+            --category stress \
+            --status "$status" \
+            --source 'fuzz-stress.yml#state-machine-stress' \
+            --detail "Three seeded stress rounds (scheduler properties, checkpoint seam, publication, crash/restart, sink faults) with base seed ${STRESS_BASE_SEED} and ${STRESS_CASES} cases." \
+            --command 'cargo test --locked -p kdown-engine --lib internal_tests::scheduler_property_tests -- --test-threads=1' \
+            --command 'cargo test --locked -p kdown-engine --lib internal_tests::checkpoint_seam_tests -- --test-threads=1' \
+            --command 'cargo test --locked -p kdown-engine --lib io::publish::tests -- --test-threads=1' \
+            --command 'cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1' \
+            --command 'cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1' \
+            --toolchain 'stable 1.98.1' \
+            --artifact 'artifacts/stress/stress.log' \
+            --max-age-days 45 $extra
       - name: Retain stress logs and minimized property seeds
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: state-machine-stress-${{ github.run_id }}
+          name: stress-replay-${{ github.run_id }}
           path: |
             artifacts/stress/
             crates/engine/tests/scheduler_property_tests.proptest-regressions
             fuzz/corpus/
             fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Retain stress release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-stress-state-machine-${{ github.run_id }}
+          path: artifacts/evidence/
           if-no-files-found: warn
           retention-days: 90

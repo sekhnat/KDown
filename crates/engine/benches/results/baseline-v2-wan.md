@@ -14,10 +14,15 @@
 | 100 Mbps | 12.5 MiB/s | 11.50 / 11.45 / 11.33 MiB/s | ~91% of nominal (pacing overhead) | ok ×3 |
 | 1 Gbps | 125 MiB/s | 14.59 / 14.35 / 14.25 MiB/s | **NOT usable**: per-chunk sleeps are bounded by the ~1 ms tokio timer wheel (4 KiB chunks → effective ≈4–14 MiB/s ceiling) | ok ×3 |
 
-**Fixture limitation recorded**: the throttle paces per 4 KiB block write;
-high rates need larger pacing quanta. The 1 Gbps axis is marked
-fixture-limited/not run rather than reported as shaped evidence. Candidate
-fix (larger pacing quanta) is a harness improvement, not an engine change.
+**Fixture limitation recorded (FIXED 2026-09-27)**: the throttle paced per
+4 KiB block write, so the ~1 ms timer wheel capped the achieved rate near
+4 MiB/s and the 1 Gbps axis was marked fixture-limited/not run. The fixture
+server now paces on a virtual clock in 64 KiB quanta and shares one link
+budget across connections: a 12.5 MiB/s target measures 12.49 MiB/s and a
+4 x 4 MiB concurrent batch completes in 1282 ms against the 1280 ms the
+shared link allows (see `docs/benchmark-profiling.md` and
+`docs/performance-report-v1.md`). The rows above remain the historical
+record; re-run the shaped profile suite for current numbers.
 
 ## RTT and loss (32 MiB, 4 workers, fixture shaping)
 

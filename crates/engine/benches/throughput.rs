@@ -1009,11 +1009,1098 @@ fn run_matrix(mode: MatrixMode) {
     emit_report(mode.label(), &records);
 }
 
+// ---------------------------------------------------------------------------
+// Release performance suite (tasks 6.1-6.4)
+// ---------------------------------------------------------------------------
+//
+// One machine-readable, multi-axis report per pinned profile: throughput,
+// network amplification, CPU per byte, engine-accounted transfer-memory
+// high-water and job/worker scaling for a fixed dataset on H1 and H2. The
+// shaped profiles (low-latency, WAN) drive a process-isolated fixture server
+// whose RTT, jitter, loss and bandwidth are pinned constants, so a result can
+// be replayed on a matched host and compared against a versioned baseline.
+
+/// Filesystem type of the destination root, when the platform can report it.
+///
+/// The disk condition is part of the fingerprint: a report written to a tmpfs
+/// and one written to a rotational disk are not comparable, so the label is
+/// observed rather than assumed. Unknown filesystems are reported as
+/// "unknown" instead of a fabricated value.
+fn detect_fs_type(path: &std::path::Path) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_device) = fields.next() else {
+            continue;
+        };
+        let Some(mount_point) = fields.next() else {
+            continue;
+        };
+        let Some(fs_type) = fields.next() else {
+            continue;
+        };
+        if canonical.starts_with(mount_point)
+            && best
+                .as_ref()
+                .is_none_or(|(len, _)| mount_point.len() >= *len)
+        {
+            best = Some((mount_point.len(), fs_type.to_string()));
+        }
+    }
+    best.map(|(_, fs_type)| fs_type)
+}
+
+/// Pinned shape of one release profile (design D7).
+#[derive(Debug, Clone, Copy)]
+struct SuiteProfile {
+    name: &'static str,
+    version: u32,
+    dataset_bytes: u64,
+    rtt_ms: f64,
+    jitter_ms: u64,
+    loss_percent: f64,
+    bandwidth_mib_s: Option<f64>,
+    workers: &'static [u32],
+    jobs: &'static [u32],
+    repetitions: u32,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Controlled loopback: no shaping, larger dataset, worker and job scaling.
+const PROFILE_LOOPBACK: SuiteProfile = SuiteProfile {
+    name: "loopback",
+    version: 1,
+    // 64 MiB and 7 repetitions: a fixed host hiccup of a few milliseconds then
+    // costs a few percent of a ~150 ms run instead of a third of a 40 ms one.
+    dataset_bytes: 64 * MIB,
+    rtt_ms: 0.0,
+    jitter_ms: 0,
+    loss_percent: 0.0,
+    bandwidth_mib_s: None,
+    workers: &[1, 4, 8],
+    jobs: &[1, 4],
+    repetitions: 7,
+};
+
+/// Low-latency profile: 10 ms RTT, 1 ms jitter, 100 Mbps, 0.1% loss.
+const PROFILE_LOW_LATENCY: SuiteProfile = SuiteProfile {
+    name: "low-latency",
+    version: 1,
+    dataset_bytes: 8 * MIB,
+    rtt_ms: 10.0,
+    jitter_ms: 1,
+    loss_percent: 0.1,
+    bandwidth_mib_s: Some(12.5), // 100 Mbps
+    workers: &[1, 4],
+    jobs: &[1],
+    repetitions: 5,
+};
+
+/// WAN profile: 80 ms RTT, 20 ms jitter, 20 Mbps, 1% loss.
+const PROFILE_WAN: SuiteProfile = SuiteProfile {
+    name: "wan",
+    version: 1,
+    dataset_bytes: 8 * MIB,
+    rtt_ms: 80.0,
+    jitter_ms: 20,
+    loss_percent: 1.0,
+    bandwidth_mib_s: Some(2.5), // 20 Mbps
+    workers: &[1, 4],
+    jobs: &[1],
+    repetitions: 5,
+};
+
+const SUITE_PROFILES: [SuiteProfile; 3] = [PROFILE_LOOPBACK, PROFILE_LOW_LATENCY, PROFILE_WAN];
+
+/// Mandatory axes: a release-suite report is only usable when every axis has a
+/// real measurement, and unavailable axes are reported as such (never zero).
+const SUITE_AXES: [&str; 5] = [
+    "throughput_mib_s",
+    "amplification",
+    "cpu_ns_per_byte",
+    "managed_memory_high_water_bytes",
+    "job_memory_high_water_bytes",
+];
+
+fn suite_profile(name: &str) -> Option<SuiteProfile> {
+    SUITE_PROFILES.iter().find(|p| p.name == name).copied()
+}
+
+/// Per-run measurement of one scenario repetition.
+#[derive(Debug, Clone, Default)]
+struct SuiteRun {
+    wall_secs: f64,
+    completed_bytes: u64,
+    network_bytes: u64,
+    wasted_bytes: u64,
+    retries: u64,
+    server_emitted: Option<u64>,
+    server_connections: Option<u64>,
+    server_requests: Option<u64>,
+    cpu_ns_per_byte: Option<f64>,
+    rss_kib: Option<u64>,
+    context_switches: Option<u64>,
+    managed_high_water_bytes: Option<u64>,
+    managed_limit_bytes: Option<u64>,
+    job_high_water_bytes: Option<u64>,
+    verified: bool,
+    error: Option<String>,
+}
+
+impl SuiteRun {
+    fn throughput_mib_s(&self) -> Option<f64> {
+        if self.wall_secs <= 0.0 {
+            return None;
+        }
+        Some(self.completed_bytes as f64 / self.wall_secs / (MIB as f64))
+    }
+
+    /// Network amplification: wire bytes per unique completed byte. The
+    /// fixture server's own emitted-byte counter is preferred when present
+    /// (it includes bytes lost to resets); otherwise the client's wire counter
+    /// is used and labelled as such.
+    fn amplification(&self) -> Option<f64> {
+        if self.completed_bytes == 0 {
+            return None;
+        }
+        let wire = self.server_emitted.unwrap_or(self.network_bytes);
+        Some(wire as f64 / self.completed_bytes as f64)
+    }
+}
+
+/// Numeric aggregation over the repetitions of one scenario.
+#[derive(Debug, Clone, Default)]
+struct AxisSamples {
+    samples: Vec<f64>,
+}
+
+impl AxisSamples {
+    fn push(&mut self, value: Option<f64>) {
+        if let Some(value) = value {
+            if value.is_finite() {
+                self.samples.push(value);
+            }
+        }
+    }
+
+    fn median(&self) -> Option<f64> {
+        median_of(&self.samples)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match (
+            self.median(),
+            self.samples.iter().copied().reduce(f64::min),
+            self.samples.iter().copied().reduce(f64::max),
+        ) {
+            (Some(median), Some(min), Some(max)) => serde_json::json!({
+                "median": round6(median),
+                "min": round6(min),
+                "max": round6(max),
+                "spread_pct": round6(if median.abs() > f64::EPSILON { (max - min) / median * 100.0 } else { 0.0 }),
+                "samples": self.samples.iter().copied().map(round6).collect::<Vec<f64>>(),
+                "n": self.samples.len(),
+                "unavailable": false,
+            }),
+            _ => serde_json::json!({
+                "median": null,
+                "min": null,
+                "max": null,
+                "spread_pct": null,
+                "samples": [],
+                "n": 0,
+                "unavailable": true,
+            }),
+        }
+    }
+}
+
+fn median_of(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    })
+}
+
+fn round6(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// Machine-replay fingerprint: a report is only comparable against a baseline
+/// recorded on a matched host/configuration (design D7).
+fn suite_fingerprint(
+    profile: &SuiteProfile,
+    disk_label: &str,
+    dest_root: Option<&std::path::Path>,
+    fixture_args: &[String],
+) -> serde_json::Value {
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("model name")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(_, value)| value.trim().to_string())
+            })
+        });
+    let rustc = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let commit = std::env::var("GITHUB_SHA").ok().or_else(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|v| v.trim().to_string())
+    });
+    let logical_cpus = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    let fields = serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "kernel": kernel,
+        "cpu_model": cpu_model,
+        "logical_cpus": logical_cpus,
+        "rustc": rustc,
+        "commit": commit,
+        "disk_label": disk_label,
+        "dest_root": dest_root.map(|p| p.display().to_string()),
+        "profile": profile.name,
+        "profile_version": profile.version,
+        "dataset_bytes": profile.dataset_bytes,
+        "fixture_args": fixture_args,
+    });
+    let digest = suite_digest(&fields);
+    serde_json::json!({
+        "fields": fields,
+        "id": digest,
+    })
+}
+
+/// Stable short digest over the canonical fingerprint JSON (first 16 hex chars).
+fn suite_digest(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(value).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest.chars().take(16).collect()
+}
+
+/// UTC ISO-8601 timestamp without pulling in a date crate.
+fn iso8601_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil-from-days algorithm (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Process-isolated fixture server with the profile's shaping applied.
+struct SuiteFixture {
+    child: std::process::Child,
+    addr: std::net::SocketAddr,
+    sha256: String,
+    size: u64,
+    args: Vec<String>,
+    tls: bool,
+}
+
+impl SuiteFixture {
+    /// Spawn the fixture server for one run and read its startup protocol.
+    fn spawn(
+        bin: &str,
+        profile: &SuiteProfile,
+        size: u64,
+        seed: u64,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Option<Self> {
+        let mut args: Vec<String> = vec![
+            "--addr".into(),
+            "127.0.0.1:0".into(),
+            "--size".into(),
+            size.to_string(),
+            "--seed".into(),
+            seed.to_string(),
+        ];
+        if profile.rtt_ms > 0.0 {
+            args.push("--rtt-ms".into());
+            args.push(profile.rtt_ms.to_string());
+        }
+        if profile.jitter_ms > 0 {
+            args.push("--jitter-ms".into());
+            args.push(profile.jitter_ms.to_string());
+        }
+        if profile.loss_percent > 0.0 {
+            args.push("--loss-percent".into());
+            args.push(profile.loss_percent.to_string());
+        }
+        if let Some(bandwidth) = profile.bandwidth_mib_s {
+            args.push("--throttle-mib-s".into());
+            args.push(bandwidth.to_string());
+        }
+        if let Some((cert, key)) = tls {
+            args.push("--tls-cert".into());
+            args.push(cert.display().to_string());
+            args.push("--tls-key".into());
+            args.push(key.display().to_string());
+        }
+        let mut child = std::process::Command::new(bin)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut addr = None;
+        let mut sha256 = String::new();
+        let mut size = 0u64;
+        let mut ready = false;
+        for _ in 0..8 {
+            let mut line = String::new();
+            if std::io::BufRead::read_line(&mut reader, &mut line).ok()? == 0 {
+                break;
+            }
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("LISTENING ") {
+                addr = rest.parse().ok();
+            } else if let Some(rest) = line.strip_prefix("SHA256 ") {
+                sha256 = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("SIZE ") {
+                size = rest.parse().unwrap_or(0);
+            } else if line == "READY" {
+                ready = true;
+                break;
+            }
+        }
+        if !ready || addr.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        Some(Self {
+            child,
+            addr: addr?,
+            sha256,
+            size,
+            args,
+            tls: tls.is_some(),
+        })
+    }
+
+    fn base_url(&self) -> String {
+        if self.tls {
+            format!("https://localhost:{}/f.bin", self.addr.port())
+        } else {
+            format!("http://{}/f.bin", self.addr)
+        }
+    }
+}
+
+impl Drop for SuiteFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Write self-signed TLS material for the H2 fixture server and return the
+/// (cert, key) paths plus the CA bundle the client must trust.
+fn write_suite_tls_material(
+    dir: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).ok()?;
+    let cert_path = dir.join("suite-cert.pem");
+    let key_path = dir.join("suite-key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).ok()?;
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).ok()?;
+    Some((cert_path, key_path))
+}
+
+/// Everything one scenario repetition measured, plus the axes derived from it.
+#[allow(clippy::too_many_arguments)]
+async fn run_suite_repetition(
+    cfg: &EngineConfig,
+    url: &str,
+    dest_root: &std::path::Path,
+    jobs: u32,
+    expected_size: u64,
+    expected_hash: &str,
+    metrics: &Arc<kdown_engine::EngineMetrics>,
+    stats: Option<(&str, &EngineConfig)>,
+) -> SuiteRun {
+    let cpu0 = cpu_time();
+    let ctx0 = context_switches();
+    let wall0 = Instant::now();
+    let mut join = tokio::task::JoinSet::new();
+    for job in 0..jobs {
+        let cfg = cfg.clone();
+        let url = url.to_string();
+        let dest = dest_root.join(format!("job{job}.bin"));
+        let metrics = Arc::clone(metrics);
+        join.spawn(async move {
+            let transport = HttpTransport::from_config(&cfg).expect("transport");
+            let controller = DownloadController::with_metrics(transport, cfg, metrics);
+            controller.run(DownloadRequest::new(url, dest)).await
+        });
+    }
+    let mut completed_bytes = 0u64;
+    let mut network_bytes = 0u64;
+    let mut wasted_bytes = 0u64;
+    let mut retries = 0u64;
+    let mut verified = true;
+    let mut error: Option<String> = None;
+    while let Some(joined) = join.join_next().await {
+        match joined {
+            Ok(Ok(completed)) => {
+                completed_bytes += completed.accounting.completed_bytes;
+                network_bytes += completed.accounting.bytes_downloaded_from_network;
+                wasted_bytes += completed.accounting.wasted_bytes;
+                retries += completed.accounting.retries;
+                let (published, size_ok, hash_ok) =
+                    verify_output(&completed, expected_size, expected_hash);
+                if !(published && size_ok && hash_ok) {
+                    verified = false;
+                    error.get_or_insert_with(|| {
+                        format!("verification failed: published={published} size_ok={size_ok} hash_ok={hash_ok}")
+                    });
+                }
+            }
+            Ok(Err(run_error)) => {
+                verified = false;
+                error.get_or_insert_with(|| format!("run error: {run_error}"));
+            }
+            Err(join_error) => {
+                verified = false;
+                error.get_or_insert_with(|| format!("join error: {join_error}"));
+            }
+        }
+    }
+    let wall_secs = wall0.elapsed().as_secs_f64();
+    let cpu = cpu_time().saturating_sub(cpu0);
+    let cpu_ns_per_byte = if completed_bytes > 0 {
+        Some(cpu.as_secs_f64() * 1e9 / completed_bytes as f64)
+    } else {
+        None
+    };
+    let snapshot = metrics.snapshot();
+    let (managed_high_water_bytes, managed_limit_bytes) = snapshot
+        .transfer_memory
+        .as_ref()
+        .map_or((None, None), |view| {
+            (Some(view.aggregate.high_water), Some(view.aggregate.cap))
+        });
+    let job_high_water_bytes =
+        (snapshot.job_memory_high_water_max > 0).then_some(snapshot.job_memory_high_water_max);
+    let server = match stats {
+        Some((base, stats_cfg)) => {
+            let base = base.to_string();
+            let stats_cfg = stats_cfg.clone();
+            let fetched = fetch_isolated_stats(&stats_cfg, &base).await;
+            fetched.map_or((None, None, None), |(emitted, connections, requests)| {
+                (Some(emitted), Some(connections), Some(requests))
+            })
+        }
+        None => (None, None, None),
+    };
+    SuiteRun {
+        wall_secs,
+        completed_bytes,
+        network_bytes,
+        wasted_bytes,
+        retries,
+        server_emitted: server.0,
+        server_connections: server.1,
+        server_requests: server.2,
+        cpu_ns_per_byte,
+        rss_kib: {
+            let rss = peak_rss_kib();
+            (rss > 0).then_some(rss)
+        },
+        context_switches: Some(context_switches().saturating_sub(ctx0)),
+        managed_high_water_bytes,
+        managed_limit_bytes,
+        job_high_water_bytes,
+        verified,
+        error,
+    }
+}
+
+/// Run one profile end-to-end and write `metrics.json` plus a human report.
+#[allow(clippy::too_many_arguments)]
+fn run_suite(
+    profile: &SuiteProfile,
+    out_dir: Option<std::path::PathBuf>,
+    dest_root_override: Option<std::path::PathBuf>,
+    disk_label: Option<String>,
+    reps_override: Option<u32>,
+    dataset_override: Option<u64>,
+    seed: u64,
+    scenarios_filter: Option<String>,
+    require_axes: bool,
+) -> bool {
+    let Some(fixture_bin) = option_env!("CARGO_BIN_EXE_fixture_server") else {
+        eprintln!("fixture_server binary path unavailable (CARGO_BIN_EXE_fixture_server)");
+        return false;
+    };
+    let profile = SuiteProfile {
+        dataset_bytes: dataset_override.unwrap_or(profile.dataset_bytes),
+        repetitions: reps_override.unwrap_or(profile.repetitions).max(5),
+        ..*profile
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(12)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let disk_label = disk_label.unwrap_or_else(|| {
+        let probe_root = dest_root_override
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        detect_fs_type(&probe_root).unwrap_or_else(|| "unknown".to_string())
+    });
+    let scratch = tempfile::tempdir().expect("scratch tmpdir");
+    let tls_material = write_suite_tls_material(scratch.path());
+    // The fixture's flag set is part of the fingerprint: two runs that pin
+    // different shaping cannot be compared with each other.
+    let fingerprint_args = SuiteFixture::spawn(
+        fixture_bin,
+        &profile,
+        4 * MIB,
+        seed,
+        tls_material
+            .as_ref()
+            .map(|(cert, key)| (cert.as_path(), key.as_path())),
+    )
+    .map_or_else(Vec::new, |fixture| {
+        // Drop the incidental TLS material paths: they are regenerated in a
+        // fresh temp dir every run, so keeping them would make a matched host
+        // look unmatched. The shaping flags are what define the profile.
+        let mut cleaned = Vec::new();
+        let mut skip_next = false;
+        for arg in &fixture.args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == "--tls-cert" || arg == "--tls-key" {
+                skip_next = true;
+                continue;
+            }
+            cleaned.push(arg.clone());
+        }
+        cleaned.push(format!("tls={}", fixture.tls));
+        cleaned
+    });
+    let fingerprint = suite_fingerprint(
+        &profile,
+        &disk_label,
+        dest_root_override.as_deref(),
+        &fingerprint_args,
+    );
+    let out_dir = out_dir.unwrap_or_else(|| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benches/results/suite")
+            .join(profile.name)
+    });
+    let mut scenarios: Vec<serde_json::Value> = Vec::new();
+    let mut scaling: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut issues: Vec<String> = Vec::new();
+
+    for protocol in [Protocol::H1, Protocol::H2] {
+        let protocol_label = protocol.label().to_string();
+        for &workers in profile.workers {
+            for &jobs in profile.jobs {
+                let label = format!(
+                    "{}/{}/workers_{workers}/jobs_{jobs}",
+                    profile.name, protocol_label
+                );
+                if let Some(filter) = scenarios_filter.as_deref() {
+                    if !label.contains(filter) {
+                        continue;
+                    }
+                }
+                let mut run_rows: Vec<serde_json::Value> = Vec::new();
+                let mut throughput = AxisSamples::default();
+                let mut amplification = AxisSamples::default();
+                let mut cpu_per_byte = AxisSamples::default();
+                let mut managed = AxisSamples::default();
+                let mut job_high_water = AxisSamples::default();
+                let mut rss = AxisSamples::default();
+                let mut all_verified = true;
+                let mut first_error: Option<String> = None;
+                let mut managed_limit_bytes: Option<u64> = None;
+                let mut last_retries = 0u64;
+                let mut last_wasted = 0u64;
+                let mut cpu_total = Duration::ZERO;
+                let mut bytes_total = 0u64;
+                let mut managed_max = 0u64;
+                let mut managed_cap = None;
+                for rep in 0..profile.repetitions {
+                    let tls = if protocol == Protocol::H2 {
+                        tls_material
+                            .as_ref()
+                            .map(|(cert, key)| (cert.as_path(), key.as_path()))
+                    } else {
+                        None
+                    };
+                    let Some(fixture) = SuiteFixture::spawn(
+                        fixture_bin,
+                        &profile,
+                        profile.dataset_bytes,
+                        seed.wrapping_add(u64::from(rep)),
+                        tls,
+                    ) else {
+                        all_verified = false;
+                        first_error.get_or_insert_with(|| {
+                            format!("{label}: fixture server failed to start")
+                        });
+                        continue;
+                    };
+                    let expected_hash = fixture.sha256.clone();
+                    let expected_size = fixture.size;
+                    let mut cfg = EngineConfig::default();
+                    cfg.transfer.segmentation_threshold = if workers > 1 { 1 } else { u64::MAX };
+                    cfg.transfer.max_workers = workers;
+                    cfg.transfer.min_workers = workers.min(2);
+                    cfg.network.response_header_timeout = Duration::from_secs(60);
+                    cfg.network.read_idle_timeout = Duration::from_secs(60);
+                    if protocol == Protocol::H2 {
+                        cfg.h2_policy = H2ConnectionPolicy::Single;
+                        if let Some((cert, _)) = tls_material.as_ref() {
+                            cfg.tls.custom_ca_bundle = Some(cert.clone());
+                        }
+                    }
+                    let dest_dir = match dest_root_override.as_ref() {
+                        Some(root) => {
+                            let dir = root
+                                .join(profile.name)
+                                .join(format!("{protocol_label}-w{workers}-j{jobs}-r{rep}"));
+                            let _ = std::fs::remove_dir_all(&dir);
+                            std::fs::create_dir_all(&dir).expect("dest dir");
+                            dir
+                        }
+                        None => tempfile::tempdir().expect("dest tmpdir").keep(),
+                    };
+                    let metrics = kdown_engine::EngineMetrics::shared();
+                    let cpu_before = cpu_time();
+                    let base = if fixture.tls {
+                        format!("https://localhost:{}", fixture.addr.port())
+                    } else {
+                        format!("http://{}", fixture.addr)
+                    };
+                    let run = rt.block_on(run_suite_repetition(
+                        &cfg,
+                        &fixture.base_url(),
+                        &dest_dir,
+                        jobs,
+                        expected_size,
+                        &expected_hash,
+                        &metrics,
+                        Some((base.as_str(), &cfg)),
+                    ));
+                    cpu_total += cpu_time().saturating_sub(cpu_before);
+                    bytes_total += run.completed_bytes;
+                    managed_max = managed_max.max(run.managed_high_water_bytes.unwrap_or(0));
+                    managed_cap = run.managed_limit_bytes.or(managed_cap);
+                    let _ = std::fs::remove_dir_all(&dest_dir);
+                    throughput.push(run.throughput_mib_s());
+                    amplification.push(run.amplification());
+                    cpu_per_byte.push(run.cpu_ns_per_byte);
+                    managed.push(run.managed_high_water_bytes.map(|v| v as f64));
+                    job_high_water.push(run.job_high_water_bytes.map(|v| v as f64));
+                    rss.push(run.rss_kib.map(|v| v as f64));
+                    managed_limit_bytes = run.managed_limit_bytes.or(managed_limit_bytes);
+                    last_retries = run.retries;
+                    last_wasted = run.wasted_bytes;
+                    all_verified &= run.verified;
+                    if let Some(err) = run.error.as_ref() {
+                        first_error.get_or_insert_with(|| format!("{label}: {err}"));
+                    }
+                    run_rows.push(serde_json::json!({
+                        "repetition": rep,
+                        "wall_secs": round6(run.wall_secs),
+                        "completed_bytes": run.completed_bytes,
+                        "network_bytes": run.network_bytes,
+                        "wasted_bytes": run.wasted_bytes,
+                        "retries": run.retries,
+                        "server_emitted_bytes": run.server_emitted,
+                        "server_connections": run.server_connections,
+                        "server_requests": run.server_requests,
+                        "cpu_ns_per_byte": run.cpu_ns_per_byte.map(round6),
+                        "rss_kib": run.rss_kib,
+                        "context_switches": run.context_switches,
+                        "managed_memory_high_water_bytes": run.managed_high_water_bytes,
+                        "job_memory_high_water_bytes": run.job_high_water_bytes,
+                        "verified": run.verified,
+                        "error": run.error,
+                    }));
+                }
+                let mut unavailable_axes: Vec<&str> = Vec::new();
+                for (axis, samples) in [
+                    ("throughput_mib_s", &throughput),
+                    ("amplification", &amplification),
+                    ("cpu_ns_per_byte", &cpu_per_byte),
+                    ("managed_memory_high_water_bytes", &managed),
+                    ("job_memory_high_water_bytes", &job_high_water),
+                ] {
+                    if samples.median().is_none() {
+                        unavailable_axes.push(axis);
+                    }
+                }
+                if !all_verified {
+                    issues.push(format!(
+                        "{label}: verification failed: {}",
+                        first_error.unwrap_or_default()
+                    ));
+                }
+                if require_axes && !unavailable_axes.is_empty() {
+                    issues.push(format!(
+                        "{label}: unavailable mandatory axes: {unavailable_axes:?}"
+                    ));
+                }
+                // Aggregate CPU per byte: /proc CPU ticks are 10 ms, which is
+                // too coarse for a single sub-second run, so the gated axis is
+                // the cumulative CPU over every repetition.
+                let cpu_ns_per_byte_aggregate = if bytes_total > 0 {
+                    Some(round6(cpu_total.as_secs_f64() * 1e9 / bytes_total as f64))
+                } else {
+                    None
+                };
+                if cpu_ns_per_byte_aggregate.is_some() {
+                    unavailable_axes.retain(|axis| *axis != "cpu_ns_per_byte");
+                }
+                let managed_peak = if managed_max > 0 {
+                    managed = AxisSamples {
+                        samples: vec![managed_max as f64],
+                    };
+                    Some(managed_max)
+                } else {
+                    None
+                };
+                let throughput_median = throughput.median();
+                if let Some(value) = throughput_median {
+                    scaling
+                        .entry(protocol_label.clone())
+                        .or_default()
+                        .push(serde_json::json!({
+                            "workers": workers,
+                            "jobs": jobs,
+                            "throughput_mib_s": round6(value),
+                        }));
+                }
+                scenarios.push(serde_json::json!({
+                    "id": label,
+                    "profile": profile.name,
+                    "profile_version": profile.version,
+                    "protocol": protocol_label,
+                    "dataset_bytes": profile.dataset_bytes,
+                    "workers": workers,
+                    "jobs": jobs,
+                    "repetitions": profile.repetitions,
+                    "throughput_mib_s": throughput.to_json(),
+                    "amplification": amplification.to_json(),
+                    "cpu_ns_per_byte": cpu_per_byte.to_json(),
+                    "managed_memory_high_water_bytes": managed.to_json(),
+                    "managed_memory_limit_bytes": managed_cap.or(managed_limit_bytes),
+                    "managed_memory_peak_bytes": managed_peak,
+                    "cpu_ns_per_byte_aggregate": cpu_ns_per_byte_aggregate,
+                    "cpu_seconds_total": round6(cpu_total.as_secs_f64()),
+                    "bytes_total": bytes_total,
+                    "job_memory_high_water_bytes": job_high_water.to_json(),
+                    "rss_kib": rss.to_json(),
+                    "retries": last_retries,
+                    "wasted_bytes": last_wasted,
+                    "verification": if all_verified { "ok".to_string() } else { "failed".to_string() },
+                    "unavailable_axes": unavailable_axes,
+                    "runs": run_rows,
+                }));
+                println!(
+                    "{:38} thrpt {:>10} MiB/s  amp {:>6}  cpu {:>8} ns/B  managed {:>9} B",
+                    label,
+                    throughput
+                        .median()
+                        .map_or("unavailable".to_string(), |v| format!("{v:.1}")),
+                    amplification
+                        .median()
+                        .map_or("unavailable".to_string(), |v| format!("{v:.3}")),
+                    cpu_per_byte
+                        .median()
+                        .map_or("unavailable".to_string(), |v| format!("{v:.1}")),
+                    managed
+                        .median()
+                        .map_or("unavailable".to_string(), |v| format!("{v:.0}")),
+                );
+            }
+        }
+    }
+
+    // Scaling efficiency against the single-worker, single-job session point
+    // (loopback is the profile where the server can actually absorb it).
+    let mut scaling_view = serde_json::Map::new();
+    for (protocol, points) in &scaling {
+        let baseline = points
+            .iter()
+            .find(|p| p["workers"] == 1 && p["jobs"] == 1)
+            .and_then(|p| p["throughput_mib_s"].as_f64());
+        let annotated: Vec<serde_json::Value> = points
+            .iter()
+            .map(|point| {
+                let workers = point["workers"].as_f64().unwrap_or(1.0);
+                let jobs = point["jobs"].as_f64().unwrap_or(1.0);
+                let efficiency = match (baseline, point["throughput_mib_s"].as_f64()) {
+                    (Some(base), Some(value)) if base > 0.0 => {
+                        Some(round6(value / (base * workers * jobs)))
+                    }
+                    _ => None,
+                };
+                serde_json::json!({
+                    "workers": point["workers"],
+                    "jobs": point["jobs"],
+                    "throughput_mib_s": point["throughput_mib_s"],
+                    "scaling_efficiency": efficiency,
+                })
+            })
+            .collect();
+        scaling_view.insert(protocol.clone(), serde_json::Value::Array(annotated));
+    }
+
+    let validation_ok = issues.is_empty();
+    let report = serde_json::json!({
+        "schema": "kdown.bench.suite/1",
+        "generated_at": iso8601_now(),
+        "profile": {
+            "name": profile.name,
+            "version": profile.version,
+            "dataset_bytes": profile.dataset_bytes,
+            "rtt_ms": profile.rtt_ms,
+            "jitter_ms": profile.jitter_ms,
+            "loss_percent": profile.loss_percent,
+            "bandwidth_mib_s": profile.bandwidth_mib_s,
+            "workers": profile.workers,
+            "jobs": profile.jobs,
+            "repetitions": profile.repetitions,
+            "disk_label": disk_label,
+            "seed": seed,
+        },
+        "fingerprint": fingerprint,
+        "axes": SUITE_AXES,
+        "scenarios": scenarios,
+        "scaling": scaling_view,
+        "validation": {
+            "ok": validation_ok,
+            "require_axes": require_axes,
+            "issues": issues,
+        },
+    });
+    let _ = std::fs::create_dir_all(&out_dir);
+    let json_path = out_dir.join("metrics.json");
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) => {
+            let _ = std::fs::write(&json_path, text);
+            println!("suite report: {}", json_path.display());
+        }
+        Err(err) => eprintln!("failed to serialize suite report: {err}"),
+    }
+    let _ = std::fs::write(out_dir.join("report.md"), suite_markdown(&report));
+    validation_ok
+}
+
+/// Human-readable summary next to the machine-readable report.
+fn suite_markdown(report: &serde_json::Value) -> String {
+    let mut out = String::from("# Release performance suite\n\n");
+    let profile = &report["profile"];
+    out.push_str(&format!(
+        "- Profile: `{}` v{}; dataset {} MiB; RTT {} ms; jitter {} ms; loss {}%; bandwidth {}\n",
+        profile["name"].as_str().unwrap_or("?"),
+        profile["version"],
+        profile["dataset_bytes"].as_u64().unwrap_or(0) / MIB,
+        profile["rtt_ms"],
+        profile["jitter_ms"],
+        profile["loss_percent"],
+        profile["bandwidth_mib_s"],
+    ));
+    out.push_str(&format!(
+        "- Fingerprint: `{}` (disk `{}`); repetitions {}; generated {}\n\n",
+        report["fingerprint"]["id"].as_str().unwrap_or("?"),
+        profile["disk_label"].as_str().unwrap_or("?"),
+        profile["repetitions"],
+        report["generated_at"].as_str().unwrap_or("?"),
+    ));
+    out.push_str("\n| Scenario | Throughput MiB/s (median) | Spread % | Amplification | CPU ns/B | Managed high-water B | Cap B | Verify |\n|\n");
+    out.push_str("|---|---|---|---|---|---|---|---|\n");
+    if let Some(scenarios) = report["scenarios"].as_array() {
+        for scenario in scenarios {
+            let axis = |name: &str| {
+                scenario[name]["median"]
+                    .as_f64()
+                    .map_or_else(|| "unavailable".to_string(), |v| format!("{v:.3}"))
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                scenario["id"].as_str().unwrap_or("?"),
+                axis("throughput_mib_s"),
+                axis("spread_pct"),
+                axis("amplification"),
+                axis("cpu_ns_per_byte"),
+                scenario["managed_memory_high_water_bytes"]["max"]
+                    .as_f64()
+                    .map_or_else(|| "unavailable".to_string(), |v| format!("{v:.0}")),
+                scenario["managed_memory_limit_bytes"]
+                    .as_u64()
+                    .map_or_else(|| "unavailable".to_string(), |v| v.to_string()),
+                scenario["verification"].as_str().unwrap_or("?"),
+            ));
+        }
+    }
+    let issues = &report["validation"]["issues"];
+    out.push_str("\n## Validation\n\n");
+    if report["validation"]["ok"].as_bool().unwrap_or(false) {
+        out.push_str("Every mandatory axis has a measured value and every run verified.\n");
+    } else {
+        for issue in issues.as_array().into_iter().flatten() {
+            out.push_str(&format!("- {}\n", issue.as_str().unwrap_or("?")));
+        }
+    }
+    out
+}
+
+/// Suite CLI entry: `<profile>|all` plus the optional overrides.
+#[allow(clippy::too_many_arguments)]
+fn run_suite_cli(
+    profile_arg: &str,
+    args: &[String],
+    out_dir: Option<std::path::PathBuf>,
+    dest_root: Option<std::path::PathBuf>,
+    disk_label: Option<String>,
+    reps: Option<u32>,
+    dataset: Option<u64>,
+    scenarios_filter: Option<String>,
+) -> bool {
+    let profiles: Vec<SuiteProfile> = if profile_arg == "all" {
+        SUITE_PROFILES.to_vec()
+    } else {
+        match suite_profile(profile_arg) {
+            Some(profile) => vec![profile],
+            None => {
+                eprintln!(
+                    "unknown suite profile {profile_arg:?}; expected loopback, low-latency, wan or all"
+                );
+                return false;
+            }
+        }
+    };
+    let seed = arg_value(args, "--suite-seed")
+        .and_then(|v| parse_u64_arg(&v))
+        .unwrap_or(20260927);
+    let mut ok = true;
+    for profile in profiles {
+        println!(
+            "== release suite: {} (dataset {} MiB, reps {}) ==",
+            profile.name,
+            dataset.unwrap_or(profile.dataset_bytes) / MIB,
+            reps.unwrap_or(profile.repetitions).max(5)
+        );
+        let profile_out = out_dir.as_ref().map(|dir| {
+            if profile_arg == "all" {
+                dir.join(profile.name)
+            } else {
+                dir.clone()
+            }
+        });
+        ok &= run_suite(
+            &profile,
+            profile_out,
+            dest_root.clone(),
+            disk_label.clone(),
+            reps,
+            dataset,
+            seed,
+            scenarios_filter.clone(),
+            true,
+        );
+    }
+    ok
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // Release performance suite (tasks 6.1-6.4), opt-in so criterion stays the
+    // default target: `--suite <loopback|low-latency|wan|all>` emits
+    // benches/results/suite/<profile>/metrics.json with one machine-readable
+    // row per scenario and axis. `--suite-out`, `--reps`, `--dataset`,
+    // `--dest-dir`, `--disk-label`, `--suite-scenario` and `--suite-seed`
+    // override the pinned defaults for replay on a matched host.
+    if let Some(profile_arg) = arg_value(&args, "--suite") {
+        let out_dir = arg_value(&args, "--suite-out").map(std::path::PathBuf::from);
+        let dest_root = arg_value(&args, "--dest-dir").map(std::path::PathBuf::from);
+        let disk_label = arg_value(&args, "--disk-label");
+        let reps = arg_value(&args, "--reps").and_then(|v| v.parse::<u32>().ok());
+        let dataset = arg_value(&args, "--dataset").and_then(|v| parse_size_arg(&v));
+        let scenarios_filter = arg_value(&args, "--suite-scenario");
+        let ok = run_suite_cli(
+            &profile_arg,
+            &args,
+            out_dir,
+            dest_root,
+            disk_label,
+            reps,
+            dataset,
+            scenarios_filter,
+        );
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    // Suite axis self-check (task 6.1): with no profile argument the pinned
+    // profile table and its mandatory axis list are validated without running
+    // any download, so a broken axis list fails the PR lane instead of a gate.
+    if args.iter().any(|a| a == "--suite-axes") {
+        let mut ok = SUITE_AXES.len() == 5;
+        for profile in SUITE_PROFILES {
+            ok &= profile.repetitions >= 5;
+            ok &= !profile.workers.is_empty() && !profile.jobs.is_empty();
+            ok &= profile.dataset_bytes > 0;
+        }
+        println!(
+            "suite axes: {SUITE_AXES:?}; profiles: {:?}",
+            SUITE_PROFILES.iter().map(|p| p.name).collect::<Vec<_>>()
+        );
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     // Matrix modes (task 1.3) intercept the criterion CLI: opt-in via
     // `--matrix-smoke` (CI-bounded grid) or `--matrix-manual` (multi-GiB and
     // 16-worker runs). Default remains the criterion smoke scenarios.
-    let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--matrix-smoke") {
         run_matrix(MatrixMode::Smoke);
         return;
