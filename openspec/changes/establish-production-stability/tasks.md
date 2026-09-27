@@ -36,7 +36,7 @@
 ## 5. Verification CI and release evidence
 
 - [x] 5.1 Add locked dependency audit and bounded property/fuzz-corpus jobs to PR CI, preserving the three-OS correctness matrix; verify CI config and run the audit/property/corpus commands successfully or record actionable advisory blockers.
-- [ ] 5.2 Add scheduled/release per-target real fuzz jobs with time limits and retained corpora/seeds plus long-running scheduler/checkpoint/commit/concurrent-job stress; verify a failed seed makes its job red and produces a replay artifact.
+- [x] 5.2 Add scheduled/release per-target real fuzz jobs with time limits and retained corpora/seeds plus long-running scheduler/checkpoint/commit/concurrent-job stress; verify a failed seed makes its job red and produces a replay artifact.
 - [ ] 5.3 Add applicable targeted Miri and sanitizer/equivalent concurrency/dynamic jobs on supported runners with explicit unavailable-tool handling; verify checker failures or missing mandatory evidence block release rather than silently pass.
 - [ ] 5.4 Assemble a machine-checkable release evidence manifest covering correctness, durability, resource bound, interoperability, stress, security and known high-severity defect triage; verify missing/failed/stale mandatory evidence prevents a production-stable verdict.
 

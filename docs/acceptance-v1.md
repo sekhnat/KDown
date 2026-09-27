@@ -26,6 +26,7 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Destination ownership and crash recovery | `destination_lease` contention/release tests, controller conflict cases, and `crash_restart_tests`; persistent unlocked lockfiles remain reusable |
 | Disk/sink errors stop workers | sink tests and controller terminal-error paths |
 | Cancellation settles workers | handle-control and runtime-control suites |
+| Scheduled parser fuzz and state-machine stress | [run 36308902628](https://github.com/sekhnat/KDown/actions/runs/36308902628): all five bounded parser targets and three seeded stress rounds passed. [Run 36308390829](https://github.com/sekhnat/KDown/actions/runs/36308390829) found the `..*` filename-invariant false positive; its seed is retained and covered by `regression_2026_09_27_fuzzer_dotdot_component_not_traversal`. |
 
 ## Performance
 
