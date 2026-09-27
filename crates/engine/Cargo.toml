@@ -114,6 +114,10 @@ name = "http_edge_cases_tests"
 path = "tests/http_edge_cases_tests.rs"
 
 [[test]]
+name = "platform_fs_tests"
+path = "tests/platform_fs_tests.rs"
+
+[[test]]
 name = "wire_amplification_tests"
 path = "tests/wire_amplification_tests.rs"
 

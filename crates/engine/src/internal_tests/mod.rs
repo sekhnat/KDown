@@ -70,3 +70,6 @@ mod metrics_transfer_tests;
 
 #[path = "../../tests/sink_fault_tests.rs"]
 mod sink_fault_tests;
+
+#[path = "../../tests/platform_lease_tests.rs"]
+mod platform_lease_tests;
