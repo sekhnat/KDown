@@ -176,7 +176,8 @@ wire overhead. H2 pays roughly twice the CPU per byte of H1 at this shape.
 | AddressSanitizer (targeted) | `scripts/dynamic_checks.sh address` | **unavailable** — nightly `rust-src` for `-Zbuild-std` is missing locally |
 | ThreadSanitizer (targeted) | `scripts/dynamic_checks.sh thread` | **unavailable** — same limitation; CI records the runner's result |
 
-Machine-readable verdict (merged local fragments, no reviewed exceptions):
+Machine-readable verdict (13 merged local fragments recorded against commit
+`a8a51b3`, no reviewed exceptions):
 
 ```
 PRODUCTION STABILITY NOT DECLARED: 16 blocking item(s)
@@ -198,8 +199,8 @@ PRODUCTION STABILITY NOT DECLARED: 16 blocking item(s)
   blocked: category:security_dynamic: no passing evidence for this required category
 ```
 
-Reproduce against the revision this report describes (`4caf56e`) with the 13
-recorded fragments:
+All 13 fragments were recorded against commit `a8a51b3` (the revision this
+report describes). Reproduce the verdict with:
 
 ```sh
 cp release/evidence-manifest.json /tmp/manifest.json
