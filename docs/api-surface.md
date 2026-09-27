@@ -81,8 +81,9 @@ the public API. `fuzz_targets` is compiled only behind the non-default
   `DownloadController::{with_execution, with_execution_and_metrics}` are
   retired as external injection seams. Deterministic scripted adapters remain
   in the crate for internal conformance tests. See `docs/migration-0.1.md`.
-- `DownloadResult` / `ResultStatus` are removed; terminal outcomes are
-  `Result<CompletedDownload, DownloadRunError>`.
+- `DownloadResult` / `ResultStatus` are removed from the public API (a
+  crate-private status type of the same name remains internal); terminal
+  outcomes are `Result<CompletedDownload, DownloadRunError>`.
 
 ## Compatibility policy
 

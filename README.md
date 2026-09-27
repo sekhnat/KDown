@@ -59,6 +59,37 @@ cargo run --release --example download -- \
   https://example.test/archive.tar.zst archive.tar.zst
 ```
 
+## Supported surface and versioning
+
+`kdown-engine` 0.1 was followed by a **breaking** API cleanup: success and
+failure are unambiguous, the supported surface is a documented whitelist, and
+the previously advertised injection seams are retired.
+
+- Terminal outcomes are `Result<CompletedDownload, DownloadRunError>`:
+  `Ok` means a verified, published download. Every other outcome is a typed
+  `Transfer`, `Infrastructure` or `Cancelled` error, so a failed download is
+  never a successful `Result` (`DownloadResult`/`ResultStatus` are removed).
+- Import paths: `DownloadController`, `DownloadRequest`, `DownloadHandle`,
+  `CancelMode`, `JobState`, the outcome/error types, `EngineConfig`,
+  `HttpTransport` and the metrics/event types are re-exported at the crate
+  root. The scheduler, job, I/O, resume (beyond the checkpoint-store injection
+  surface), observability and fuzz modules are implementation details, not
+  consumer API.
+- Retired seams: `http::HttpExecution`, `http::HttpExecutor`,
+  `http::scripted::*`, `http::probe::ProbeMetadata` and
+  `DownloadController::with_execution*` have no supported replacement;
+  construct a real `HttpTransport` with `DownloadController::new` (or
+  `with_metrics`) instead.
+- Policy: the supported surface follows SemVer with `#[non_exhaustive]` enums
+  on expansion-prone types, and the MSRV (Rust 1.85) may only move in a major
+  release. Signature drift is caught by the external consumer fixture,
+  the retired-seam negative test and `scripts/api_surface_check.sh`.
+
+See [`docs/api-surface.md`](docs/api-surface.md) for the exact whitelist,
+[`docs/migration-0.1.md`](docs/migration-0.1.md) for the old-to-new migration
+tables, and [`docs/api-compatibility.md`](docs/api-compatibility.md) for the
+semver/MSRV policy and drift checks.
+
 ## Live metrics and runtime controls
 
 While a job runs, `DownloadHandle::snapshot()` returns a coherent
@@ -113,6 +144,16 @@ HTTP/2 streams (`HttpProtocolStats::requests_h1()` / `h2_streams()` /
 are not exposed by the underlying client, so the corresponding accessor
 reports `None`: that axis is labeled unavailable rather than fabricated.
 
+The same `EngineMetrics::snapshot()` carries the transfer-memory budget view
+(`MetricsSnapshot::transfer_memory`), sampled by the engine at every job
+terminal: `scope` states what is accounted and what deliberately is not, and
+`aggregate`/`components` report `cap`, `current` and `high_water` for the
+engine-wide pool and for each component (`network_ingress`, `frames`,
+`writer`, `checkpoint`). `job_memory_high_water_max` reports the largest
+single-job high-water. Before the first sample the field is `None` —
+unmeasured telemetry is never reported as zero. `MetricsSnapshot` is
+`Serialize`, so a JSON export is just `serde_json::to_value(metrics.snapshot())`.
+
 A `DownloadController` also shares an origin registry across its jobs.
 Requests to the same final HTTP(S) origin use cancellable, fair admission;
 429/503 responses and capped `Retry-After` delay subsequent requests from
@@ -143,15 +184,33 @@ pipelined writer's reservation quantum, not Hyper's socket read size.
 remain the production path; enable it to try the shared bounded executor.
 The public `buffer_pool_max_bytes` budget (128 MiB default) bounds the
 standalone `BufferPool` only; the transfer path does not use that pool.
-Transfer-pipeline memory is bounded end-to-end by `transfer_memory`
-(design D3): per-job and engine-wide aggregate caps with per-component
-maxima — network ingress (HTTP/1 read buffers and HTTP/2 flow-control
-windows are configured to the cap, and every connection's worst-case
-footprint is carved out of the aggregate up front), held/queued frames,
-writer-held bytes, and checkpoint serialization — all admitted through one
-fair, cancellation-aware ledger with typed over-budget refusal. Kernel
-socket buffers, allocator arenas, and runtime stacks stay outside the
-accounted guarantee (documented in the metrics `scope` field).
+
+`EngineConfig::transfer_memory` bounds the whole pipeline (defaults are
+production-safe; caps must satisfy `job ≤ aggregate` and
+`component ≤ job`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `aggregate_max_bytes` | 64 MiB | Engine-wide ceiling every accounted component of every concurrent job sums into |
+| `job_max_bytes` | 8 MiB | Per-job cap across all components of one download |
+| `network_ingress_max_bytes` | 1 MiB | Client ingress: HTTP/1 read buffers, header metadata and HTTP/2 flow-control windows admitted before frame ownership |
+| `frames_max_bytes` | 2 MiB | Held/queued payload frames moving from ingress toward the writer |
+| `writer_max_bytes` | 2 MiB | Queued and in-flight writes (subsumes the legacy `write_budget` caps) |
+| `checkpoint_max_bytes` | 1 MiB | In-memory range metadata plus the serialized checkpoint a save may hold |
+
+Every transfer-path allocation is admitted through one fair,
+cancellation-aware ledger (design D3): the caps above are reserved before the
+bytes are held, ownership moves with zero-copy `Bytes` without charging twice,
+reservations are released on drop/ack/failure/cancel, and an atomic allocation
+larger than a binding cap is refused with a typed error instead of waiting
+while holding capacity. HTTP/1 and HTTP/2 ingress shapes are derived from the
+ingress cap (read buffer, flow-control windows, header-list ceiling) and each
+connection's worst-case footprint is carved out of the aggregate before
+dialing, so client buffering is bounded before frames are admitted rather than
+paused after the fact. The live view of all of this is the
+`MetricsSnapshot::transfer_memory` block described above; kernel socket
+buffers, allocator arenas and runtime stacks stay outside the accounted
+guarantee (named in that snapshot's `scope`).
 
 ## Safety and durability
 
@@ -194,7 +253,9 @@ python3 scripts/release_gate.py status --manifest /tmp/manifest.json --commit "$
 See [`docs/acceptance-v1.md`](docs/acceptance-v1.md) for the v1 acceptance
 mapping, [`docs/performance-report-v1.md`](docs/performance-report-v1.md) for
 the multi-axis performance results, matched-host baselines, thresholds and the
-current production-stability blockers, and
+current production-stability blockers,
+[`docs/regression-triage.md`](docs/regression-triage.md) for the seed/fixture
+retention and severity-triage process, and
 [`release/evidence-manifest.json`](release/evidence-manifest.json) for the gate
 definitions. The historical loopback criterion baseline remains at
 [`crates/engine/benches/results/baseline.md`](crates/engine/benches/results/baseline.md).
@@ -245,8 +306,17 @@ Defaults are production-safe and unchanged from earlier releases:
 - **Memory** — the legacy writer holds one received frame per active
   worker; the opt-in pipelined executor uses pre-read and queued-write
   byte budgets to bound outstanding frames. Both paths avoid extra
-  `BufferPool` copies. `buffer_pool_max_bytes` bounds only the standalone
-  pool, NOT Hyper's internal ingress buffers.
+  `BufferPool` copies. Transfer-path allocations on both paths are admitted
+  through the single `transfer_memory` ledger described above: the HTTP client
+  is built with an exact HTTP/1 read buffer, bounded HTTP/2 connection/stream
+  windows and a response header-list ceiling, and each connection's worst-case
+  ingress footprint is reserved before dialing, so ingress, held/queued frames,
+  writer-held bytes and checkpoint state are bounded per job and engine-wide.
+  OS socket buffers, allocator arenas, runtime stacks and client internals
+  beyond the configured windows remain outside the accounted guarantee (named
+  in the snapshot `scope`, never reported as zero). `buffer_pool_max_bytes`
+  bounds only the standalone `BufferPool`, which the transfer path does not
+  use.
 - **Preallocation** — `preallocate_output` sizes the temp file logically
   (`set_len`); opt-in `preallocate_physical` attempts a fallocate-style
   reservation where supported and falls back silently elsewhere. Real
