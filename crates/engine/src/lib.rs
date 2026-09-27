@@ -98,13 +98,17 @@
 //!
 //! ## Redaction
 //!
-//! [`Redactor`] strips URL userinfo and caller-marked sensitive query
-//! parameters. Authorization, Cookie, Set-Cookie, and proxy-authorization
-//! values are redacted at the logging/error boundary. Proxy and credential
-//! providers do not transfer long-term secret ownership to the engine.
+//! [`Redactor`] strips URL userinfo and masks every query value by
+//! default, because an unfamiliar query key cannot be assumed non-secret;
+//! caller-marked keys and the
+//! [`Redactor::with_marked_query_params_only`] opt-down remain available.
+//! Authorization, Cookie, Set-Cookie, and proxy-authorization values are
+//! redacted at the logging/error boundary. Proxy and credential providers
+//! do not transfer long-term secret ownership to the engine.
 //!
-//! See `KDownSpec.md` for the complete language-neutral architecture and
-//! `docs/acceptance-v1.md` for the §42 acceptance review.
+//! See `docs/acceptance-v1.md` for the acceptance review,
+//! `docs/api-surface.md` for the supported surface and
+//! `docs/api-compatibility.md` for the compatibility policy.
 
 // Test builds alias the crate as its own external name so relocated
 // integration tests keep their `kdown_engine::` import paths while

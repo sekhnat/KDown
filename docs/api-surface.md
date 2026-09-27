@@ -89,3 +89,24 @@ the public API. `fuzz_targets` is compiled only behind the non-default
 
 See `docs/api-compatibility.md` for the semver/MSRV policy and the drift
 checks that guard this whitelist.
+
+## Behavior notes for supported types
+
+- `Redactor::new()` masks URL userinfo and every query value by default.
+  `Redactor::with_sensitive_query_params` marks extra names (additive), and
+  `Redactor::with_marked_query_params_only` opts down to userinfo plus
+  marked names. `DownloadRequest`/`RequestSpec` `Debug` output uses the
+  default policy; the wire URL is never rewritten.
+- `EventStream::next()` returns `None` after the job's terminal outcome
+  once queued events are drained, even while the `DownloadHandle` (and its
+  `EventHub`) is retained. `EventStream::is_finished()` exposes the signal.
+- `DownloadError::AdmissionRejected { active, cap }` is returned when
+  `max_active_jobs` is exceeded; it is non-retryable, category `MemoryCap`,
+  and is delivered before any transfer or artifact write.
+- `TransferAccounting::wire_amplification()` counts received payload once
+  over unique output coverage (`completed_bytes` plus
+  `bytes_reused_from_checkpoint`); it is `None` when that coverage is zero.
+- `Checkpoint` is a v2 model: persisted JSON omits request/final URLs and
+  carries owned-temp identity plus a bounded covered-byte digest. A custom
+  `CheckpointStore` must protect its own storage and must not add URL or
+  credential fields of its own.

@@ -198,9 +198,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn correlation_redacts_origin_userinfo() {
+    fn correlation_redacts_origin_userinfo_and_query_values() {
+        // Correlation origins are diagnostic: userinfo is stripped and
+        // every query value is masked (task 5.3).
         let c = Correlation::new().origin("https://alice:secret@cdn.example/f?token=x");
-        assert_eq!(c.origin.as_deref(), Some("https://cdn.example/f?token=x"));
+        assert_eq!(
+            c.origin.as_deref(),
+            Some("https://cdn.example/f?token=REDACTED")
+        );
     }
 
     #[test]

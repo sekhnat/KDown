@@ -1,4 +1,4 @@
-//! Deterministic misbehaving-HTTP test server (`KDownSpec.md` §36.2).
+//! Deterministic misbehaving-HTTP test server (§36.2).
 //!
 //! Supports three registration styles:
 //! 1. Static content with correct or lying range behavior (`serve_static` /

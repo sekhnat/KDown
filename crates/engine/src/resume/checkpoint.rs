@@ -47,7 +47,17 @@ impl From<CheckpointError> for DownloadError {
 pub struct Checkpoint {
     pub format_version: u32,
     pub job_id: String,
+    /// In-memory only: the original request URL. Never serialized and never
+    /// loaded from a store — the default sidecar must not retain raw URL
+    /// credentials (task 5.4) and admission does not read it back (the
+    /// opaque [`Self::job_id`] plus validators and the local binding
+    /// identify the resource). A legacy sidecar carrying URL fields loads
+    /// without reviving them.
+    #[serde(skip)]
     pub original_url: String,
+    /// In-memory only: the probe's redirect-resolved URL. Never serialized,
+    /// for the same reason as [`Self::original_url`].
+    #[serde(skip)]
     pub final_url: String,
     /// Opaque identity of the temp file for cross-restart validation.
     pub temp_path_identity: String,
@@ -150,37 +160,30 @@ impl Checkpoint {
 
         let mut total = FIXED_OVERHEAD;
         let mut add = |value: u64| -> Result<(), CheckpointError> {
-            total = total
-                .checked_add(value)
-                .ok_or(CheckpointError::Overflow)?;
+            total = total.checked_add(value).ok_or(CheckpointError::Overflow)?;
             Ok(())
         };
 
-        for field in [
-            &self.job_id,
-            &self.original_url,
-            &self.final_url,
-            &self.temp_path_identity,
-            &self.created_at,
-            &self.updated_at,
-        ] {
+        // URLs are memory-only (`skip_serializing`): they are absent from
+        // the persisted JSON and must not be charged here.
+        for field in [&self.temp_path_identity, &self.created_at, &self.updated_at] {
             add(json_string(field.len())?)?;
         }
         add(json_optional_string(self.owned_temp_identity.as_deref())?)?;
         add(json_optional_string(self.covered_digest.as_deref())?)?;
         add(json_optional_string(self.validators.etag.as_deref())?)?;
-        add(json_optional_string(self.validators.last_modified.as_deref())?)?;
+        add(json_optional_string(
+            self.validators.last_modified.as_deref(),
+        )?)?;
         add(if self.validators.etag_is_weak {
             4 // `true`
         } else {
             BOOL_COST
         })?;
         add(NUMBER_COST)?; // total_size
-        add(
-            count(self.completed_ranges.len())?
-                .checked_mul(RANGE_ENTRY_COST)
-                .ok_or(CheckpointError::Overflow)?,
-        )?;
+        add(count(self.completed_ranges.len())?
+            .checked_mul(RANGE_ENTRY_COST)
+            .ok_or(CheckpointError::Overflow)?)?;
         for digest in &self.expected_hashes {
             add(json_string(digest.algorithm.len())?)?;
             add(json_string(digest.hex.len())?)?;
@@ -299,7 +302,7 @@ impl Checkpoint {
     }
 
     /// Stamp the v2 bounded covered-byte digest: SHA-256 over up to
-    /// [`COVERED_DIGEST_WINDOW`] bytes of the covered ranges, in order.
+    /// `COVERED_DIGEST_WINDOW` bytes of the covered ranges, in order.
     ///
     /// Large covered sets leave the digest `None`; identity and remote
     /// validators still carry the binding. A failed read also leaves it
@@ -360,8 +363,8 @@ pub fn owned_temp_identity(temp_path: &Path) -> Option<String> {
 /// SHA-256 over up to [`COVERED_DIGEST_WINDOW`] covered bytes, in range
 /// order. `None` when nothing was covered or a read failed.
 fn covered_digest(temp_path: &Path, ranges: &[ByteRange]) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
     use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
 
     if ranges.is_empty() {
         return None;
@@ -421,7 +424,12 @@ mod tests {
         cp.record_completed(0, 99);
         cp.record_completed(200, 299);
         let json = cp.to_json().expect("serialize");
-        let back = Checkpoint::from_json(&json).expect("deserialize");
+        let mut back = Checkpoint::from_json(&json).expect("deserialize");
+        // URLs are memory-only (task 5.4): a round trip does not revive them.
+        assert!(back.original_url.is_empty());
+        assert!(back.final_url.is_empty());
+        back.original_url = cp.original_url.clone();
+        back.final_url = cp.final_url.clone();
         assert_eq!(back, cp);
         assert_eq!(back.completed_ranges, vec![(0, 99), (200, 299)]);
         assert_eq!(back.completed_bytes(), 200);
@@ -439,6 +447,50 @@ mod tests {
         );
         let back = Checkpoint::from_json(&json).expect("unknown field tolerated");
         assert_eq!(back.format_version, CHECKPOINT_FORMAT_VERSION);
+    }
+
+    /// Task 5.4: the default sidecar representation contains no URL text,
+    /// so a signed URL's userinfo and query values cannot leak to disk.
+    #[test]
+    fn serialized_json_never_contains_urls() {
+        let mut cp = Checkpoint::new(
+            "job-1",
+            "https://user:URL-USERINFO-SECRET@cdn.test/file?token=URL-QUERY-SECRET",
+            "temp-identity",
+        );
+        cp.final_url = "https://cdn.test/file?token=FINAL-URL-SECRET".to_string();
+        let json = cp.to_json().expect("serialize");
+        for secret in [
+            "URL-USERINFO-SECRET",
+            "URL-QUERY-SECRET",
+            "FINAL-URL-SECRET",
+        ] {
+            assert!(
+                !json.contains(secret),
+                "URL secret `{secret}` persisted: {json}"
+            );
+        }
+        assert!(!json.contains("original_url"), "field persisted: {json}");
+        assert!(!json.contains("final_url"), "field persisted: {json}");
+        // The checked bound still covers the URL-free serialization.
+        assert!(cp.checked_serialized_size().expect("bound") >= json.len() as u64);
+    }
+
+    /// A sidecar written before the URL fields were dropped still loads
+    /// (unknown-field tolerant) without reviving the URL text.
+    #[test]
+    fn legacy_url_fields_load_without_being_revived() {
+        let cp = sample();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&cp.to_json().expect("json")).expect("value");
+        value["original_url"] =
+            serde_json::json!("https://user:OLD-SECRET@cdn.test/f?token=OLD-QUERY");
+        value["final_url"] = serde_json::json!("https://cdn.test/f?token=OLD-FINAL");
+        let json = serde_json::to_string(&value).expect("json");
+        let loaded = Checkpoint::from_json(&json).expect("legacy sidecar still loads");
+        assert!(loaded.original_url.is_empty());
+        assert!(loaded.final_url.is_empty());
+        assert_eq!(loaded.format_version, CHECKPOINT_FORMAT_VERSION);
     }
 
     #[test]
@@ -494,7 +546,9 @@ mod tests {
         // length.
         std::fs::remove_file(&temp).expect("remove");
         std::fs::write(&temp, b"verified-bytes").expect("replant");
-        let err = cp.verify_local_binding(&temp).expect_err("identity mismatch");
+        let err = cp
+            .verify_local_binding(&temp)
+            .expect_err("identity mismatch");
         assert!(err.contains("identity"), "{err}");
     }
 

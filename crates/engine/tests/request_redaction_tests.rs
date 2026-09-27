@@ -161,3 +161,87 @@ fn proxy_config_debug_never_contains_userinfo_credentials() {
     let direct = format!("{:?}", config.proxy);
     assert!(!direct.contains("proxy-sentinel"));
 }
+
+/// URL secrets are masked in diagnostics while the non-secret shape of
+/// the target stays identifiable (task 5.3).
+const URL_SENTINELS: [&str; 2] = ["sentinel-userinfo-value", "sentinel-query-value"];
+
+fn assert_no_url_sentinels(rendered: &str) {
+    for sentinel in URL_SENTINELS {
+        assert!(
+            !rendered.contains(sentinel),
+            "URL secret `{sentinel}` leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn download_request_debug_redacts_url_userinfo_and_query_values() {
+    let request = DownloadRequest::new(
+        "https://user:sentinel-userinfo-value@example.test/file?token=sentinel-query-value",
+        "file".into(),
+    );
+    let rendered = format!("{request:?}");
+    assert_no_url_sentinels(&rendered);
+    assert!(
+        rendered.contains("example.test/file"),
+        "the target must stay identifiable: {rendered}"
+    );
+}
+
+#[test]
+fn request_spec_debug_redacts_url_userinfo_and_query_values() {
+    let spec = RequestSpec {
+        url: "https://user:sentinel-userinfo-value@example.test/file?token=sentinel-query-value"
+            .to_string(),
+        headers: sentinel_headers(),
+        range: None,
+        validators: None,
+        identity_encoding: true,
+        sensitive: true,
+    };
+    let rendered = format!("{spec:?}");
+    assert_no_url_sentinels(&rendered);
+    assert!(
+        rendered.contains("example.test/file"),
+        "the target must stay identifiable: {rendered}"
+    );
+}
+
+#[test]
+fn redirect_resolution_errors_redact_url_secrets() {
+    // Invalid-scheme Location carrying a query secret.
+    let error = kdown_engine::http::redirect::resolve_redirect(
+        "https://example.test/file",
+        "1http://cdn.test/f?token=sentinel-query-value",
+    )
+    .expect_err("the invalid scheme must be rejected");
+    assert_no_url_sentinels(&format!("{error} {error:?}"));
+
+    // Unparseable current URL with userinfo and a query secret: the
+    // InvalidUrl message must not echo either.
+    let error = kdown_engine::http::redirect::resolve_redirect(
+        "https://user:sentinel-userinfo-value@exa mple.test/f?token=sentinel-query-value",
+        "/next",
+    )
+    .expect_err("the current URL must fail to parse");
+    assert_no_url_sentinels(&format!("{error} {error:?}"));
+}
+
+#[tokio::test]
+async fn transport_parse_failure_never_echoes_url_secrets() {
+    let cfg = EngineConfig::default();
+    let transport =
+        kdown_engine::http::transport::HttpTransport::from_config(&cfg).expect("transport");
+    let controller = kdown_engine::job::controller::DownloadController::new(transport, cfg);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let request = DownloadRequest::new(
+        "https://user:sentinel-userinfo-value@exa mple.test/file?token=sentinel-query-value",
+        dir.path().join("out.bin"),
+    );
+    let error = controller
+        .run(request)
+        .await
+        .expect_err("the URL must fail to parse");
+    assert_no_url_sentinels(&format!("{error} {error:?}"));
+}

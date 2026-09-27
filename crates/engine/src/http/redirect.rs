@@ -58,9 +58,7 @@ pub enum RedirectAction {
     /// Follow the redirect. `location` is the *resolved absolute URL* of the
     /// next hop (relative, protocol-relative and dot-segment locations are
     /// resolved against the current request URL before comparison).
-    Follow {
-        location: String,
-    },
+    Follow { location: String },
     /// Not a redirect response; treat as final.
     Final,
     /// Redirect chain is invalid; the engine must fail.
@@ -297,7 +295,10 @@ pub(crate) fn resolve_redirect(current: &str, location: &str) -> Result<String, 
     }
     if location.starts_with("//") {
         let base = Uri::try_from(current)
-            .map_err(|e| DownloadError::InvalidUrl(format!("{current}: {e}")))?;
+            // Diagnostics only; the resolved target stays raw on success.
+            .map_err(|e| {
+                DownloadError::InvalidUrl(format!("{}: {e}", crate::redact::redacted_url(current)))
+            })?;
         let scheme = base.scheme_str().unwrap_or("http");
         return Ok(format!("{scheme}:{location}"));
     }
@@ -314,14 +315,17 @@ pub(crate) fn resolve_redirect(current: &str, location: &str) -> Result<String, 
             return Ok(location.to_string());
         }
         return Err(DownloadError::InvalidUrl(format!(
-            "invalid redirect scheme in {location}"
+            // Diagnostics only: the Location value can carry query secrets.
+            "invalid redirect scheme in {}",
+            crate::redact::redacted_url(location)
         )));
     }
-    let base = Uri::try_from(current)
-        .map_err(|e| DownloadError::InvalidUrl(format!("{current}: {e}")))?;
+    let base = Uri::try_from(current).map_err(|e| {
+        DownloadError::InvalidUrl(format!("{}: {e}", crate::redact::redacted_url(current)))
+    })?;
     let authority = base
         .authority()
-        .ok_or_else(|| DownloadError::InvalidUrl(current.to_string()))?
+        .ok_or_else(|| DownloadError::InvalidUrl(crate::redact::redacted_url(current)))?
         .as_str();
     let scheme = base.scheme_str().unwrap_or("http");
     let without_fragment = location.split('#').next().unwrap_or(location);
@@ -460,7 +464,12 @@ mod tests {
     #[test]
     fn relative_location_resolves_against_current_url() {
         let mut t = RedirectTracker::new(RedirectPolicy::default());
-        let d = t.decide(302, Some("../other/file.bin"), "http://a.example/dir/one.bin", &[]);
+        let d = t.decide(
+            302,
+            Some("../other/file.bin"),
+            "http://a.example/dir/one.bin",
+            &[],
+        );
         assert_eq!(
             d.action,
             RedirectAction::Follow {
@@ -476,7 +485,12 @@ mod tests {
             }
         );
         let mut t3 = RedirectTracker::new(RedirectPolicy::default());
-        let d3 = t3.decide(302, Some("?token=1"), "http://a.example/dir/one.bin?old=2", &[]);
+        let d3 = t3.decide(
+            302,
+            Some("?token=1"),
+            "http://a.example/dir/one.bin?old=2",
+            &[],
+        );
         assert_eq!(
             d3.action,
             RedirectAction::Follow {
@@ -531,7 +545,12 @@ mod tests {
         // outgoing request headers here).
         let mut t = RedirectTracker::new(RedirectPolicy::default());
         let outgoing = vec![("Cookie".to_string(), "session=1".to_string())];
-        let d = t.decide(302, Some("http://other.example/f"), "http://origin.example/f", &outgoing);
+        let d = t.decide(
+            302,
+            Some("http://other.example/f"),
+            "http://origin.example/f",
+            &outgoing,
+        );
         assert!(d.strip_credentials);
     }
 

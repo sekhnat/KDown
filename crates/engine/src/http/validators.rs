@@ -78,11 +78,7 @@ impl ResourceValidators {
     pub fn comparable_generation(&self, current: &Self) -> Result<(), String> {
         if let Some(saved) = &self.etag {
             if !self.etag_is_weak {
-                if current
-                    .etag
-                    .as_ref()
-                    .is_some_and(|_| !current.etag_is_weak)
-                {
+                if current.etag.as_ref().is_some_and(|_| !current.etag_is_weak) {
                     // `same_generation` already verified the values match.
                     return Ok(());
                 }

@@ -193,3 +193,34 @@ async fn successful_job_logs_correlated_without_secrets() {
     let origin_field = records.iter().any(|r| r.contains("origin=http"));
     assert!(origin_field, "no origin correlation field in {records:?}");
 }
+
+/// Signed-URL query secrets must not reach logs or the terminal error even
+/// when the job fails (task 5.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_url_secrets_never_appear_in_logs_or_errors() {
+    let server = TestServer::new()
+        .serve_handler("/signed.bin", |_| {
+            ScriptedResponse::new(403).with_body(b"forbidden".to_vec())
+        })
+        .start()
+        .await
+        .expect("server");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let url = server.url("/signed.bin?X-Amz-Signature=URL-QUERY-SECRET&token=OTHER-URL-SECRET");
+    let req = test_request(url, dir.path().join("out.bin"));
+    let (_before, records, result) = run_with_capture(server.url("/"), req).await;
+    let error = result.expect_err("the 403 job must fail");
+    let rendered = format!("{error} {error:?}");
+    for secret in ["URL-QUERY-SECRET", "OTHER-URL-SECRET"] {
+        assert!(
+            !rendered.contains(secret),
+            "URL secret `{secret}` leaked through the terminal error: {rendered}"
+        );
+        for record in &records {
+            assert!(
+                !record.contains(secret),
+                "URL secret `{secret}` leaked into logs: {record}"
+            );
+        }
+    }
+}

@@ -93,19 +93,27 @@ lane_correctness() {
   local os_lc
   os_lc="$(host_os)"
   run_lane "correctness_workspace_tests_${os_lc}" correctness 30 "ci-lane:correctness" \
-    "Locked workspace build, full test matrix and clippy on ${os_lc}." \
+    "Locked workspace build, full test matrix and clippy on ${os_lc}, plus the targeted P1 control/fault and secret-diagnostic regressions." \
     "cargo build --workspace --all-targets --locked" \
     "cargo test --workspace --all-targets --locked" \
-    "cargo clippy --workspace --all-targets --locked -- -D warnings"
+    "cargo clippy --workspace --all-targets --locked -- -D warnings" \
+    "cargo test --locked -p kdown-engine --test handle_control_tests" \
+    "cargo test --locked -p kdown-engine --test metrics_tests" \
+    "cargo test --locked -p kdown-engine --test redaction_audit_tests" \
+    "cargo test --locked -p kdown-engine --lib resume::checkpoint"
 }
 
 lane_durability() {
   local os_lc
   os_lc="$(host_os)"
   run_lane "durability_platform_matrix_${os_lc}" durability 30 "ci-lane:durability" \
-    "Platform filesystem/lease/publication matrix plus checkpoint crash/restart recovery on ${os_lc}." \
+    "Platform filesystem/lease/publication matrix, checkpoint crash/restart recovery, byte-exact publication and durable save ordering on ${os_lc}." \
     "cargo test --locked -p kdown-engine --test platform_fs_tests" \
-    "cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1"
+    "cargo test --locked -p kdown-engine --test publication_tests" \
+    "cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1" \
+    "cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1" \
+    "cargo test --locked -p kdown-engine --lib internal_tests::resume_tests -- --test-threads=1" \
+    "cargo test --locked -p kdown-engine --lib internal_tests::checkpoint_seam_tests -- --test-threads=1"
 }
 
 lane_resource_bound() {

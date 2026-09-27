@@ -257,10 +257,16 @@ impl FileSink {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(SinkError(DownloadError::from_io(&e))),
         }
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
+        // Owner-only by construction (task 5.4): the partial output can hold
+        // downloaded content, so other directory users must not read it.
+        let mut options = File::options();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&temp_path)
             .map_err(|e| DownloadError::from_io(&e))
             .map_err(SinkError)?;
@@ -302,6 +308,14 @@ impl FileSink {
                 "temporary output {} changed while opening",
                 temp_path.display()
             ))));
+        }
+        // Tighten a resumed partial to owner-only (task 5.4). Best effort:
+        // filesystems without POSIX modes cannot enforce it, and resume must
+        // not fail over permissions we cannot express.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
         let mut sink = Self::from_file(destination, temp_path, file, false, false);
         sink.set_keep_on_drop(true);
@@ -454,13 +468,8 @@ impl FileSink {
         };
         self.file = None;
         self.finalized = true; // Drop must preserve the temp file on failure.
-        let outcome = publish::publish_verified(
-            &self.temp_path,
-            &self.destination,
-            mode,
-            identity,
-        )
-        .map_err(|error| {
+        let outcome = publish::publish_verified(&self.temp_path, &self.destination, mode, identity)
+            .map_err(|error| {
                 let download_error = if mode == PublishMode::NoReplace
                     && error.kind() == std::io::ErrorKind::AlreadyExists
                 {
@@ -613,7 +622,8 @@ impl Drop for FileSink {
 /// # Errors
 /// [`SinkError`] when the entry is missing, irregular or multiply linked.
 pub(crate) fn validate_owned_regular_file(path: &Path) -> Result<(), SinkError> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| SinkError(DownloadError::from_io(&e)))?;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| SinkError(DownloadError::from_io(&e)))?;
     if !meta.file_type().is_file() {
         return Err(SinkError(DownloadError::SinkOpen(format!(
             "partial output {} is not a regular file",
@@ -676,6 +686,46 @@ mod tests {
             spec.temp_path_for(&dest),
             dest.with_file_name("out.bin.part")
         );
+    }
+
+    /// Task 5.4: fresh partial output is owner-only on creation.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_creation_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, dest) = tmpdir();
+        let sink = FileSink::create_exclusive(&dest, &TempFileSpec::default(), false, false)
+            .expect("create");
+        let mode = std::fs::metadata(sink.temp_path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "partial output must not be group/world readable"
+        );
+        drop(sink);
+        dir.close().expect("cleanup");
+    }
+
+    /// A resumed partial is tightened to owner-only on open.
+    #[cfg(unix)]
+    #[test]
+    fn resumed_partial_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, dest) = tmpdir();
+        let temp = TempFileSpec::default().temp_path_for(&dest);
+        std::fs::write(&temp, b"partial").expect("seed");
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let sink = FileSink::open_owned(&dest, &TempFileSpec::default()).expect("open owned");
+        let mode = std::fs::metadata(sink.temp_path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "resumed partial must be tightened");
+        drop(sink);
+        dir.close().expect("cleanup");
     }
 
     #[test]

@@ -133,6 +133,13 @@ from retransferred overhead. Every non-success terminal outcome is a typed
 partial accounting and retained-artifact disposition, so a failed transfer
 is never a successful `Result`.
 
+`accounting.wire_amplification()` reports payload received from the network
+over unique output coverage (`completed_bytes` plus
+`bytes_reused_from_checkpoint`), counting every wire byte once: retries
+inflate the numerator, a mostly-reused resume can report below `1.0`, and a
+job with no unique coverage reports `None`. The benchmark harness's
+server-emitted-byte amplification is a separate, explicitly labeled axis.
+
 Beyond per-job counters, the transport exposes protocol-level
 instrumentation shared by every job it serves:
 `HttpTransport::connection_limits()` reports live physical connections
@@ -218,13 +225,34 @@ guarantee (named in that snapshot's `scope`).
   CA bundles require explicit `EngineConfig::tls` configuration.
 - HTTP→HTTPS redirects are allowed; HTTPS→HTTP downgrade redirects are
   denied by default.
-- Credentials do not cross origins by default and are redacted from logs.
+- Credentials do not cross origins by default, including over multi-hop
+  redirects and in segmented workers; explicit opt-in is required.
+  URL userinfo and every query value are masked in `Debug`, error and log
+  diagnostics (header values are never formatted), while the URL sent on
+  the wire is unchanged.
+- A fresh job never writes through or publishes a pre-existing `.part`
+  entry, symlink or hard link; engine-created partials and checkpoint
+  sidecars are owner-only (`0600`) on Unix, and a resumed partial is
+  tightened on open. Publication trusts the destination directory: keep
+  downloads in a directory whose writers you control — a non-cooperating
+  writer with directory access can race path operations on some
+  platforms, which pathname checks cannot eliminate.
 - Downloads use `<destination>.part` plus an atomic `<destination>.kdown`
   checkpoint sidecar. `DurabilityMode::Performance` records page-cache
   acknowledgements; `DurabilityMode::Durable` flushes data before checkpoint
   ranges are recorded.
-- The destination is committed only after exact-size and requested hash
-  verification succeed.
+- Resume requires a comparable strong ETag or eligible matching
+  Last-Modified plus the checkpoint's local binding to the partial file;
+  checkpoints without comparable evidence are discarded and restarted, and
+  pre-v2 checkpoint files restart conservatively. Raw request/final URLs are
+  never persisted in a default sidecar.
+- `transfer.job_deadline` bounds the whole job from admission (probe, body
+  waits, retries, verification and the decision to publish), `max_active_jobs`
+  rejects an over-cap `start` with a typed `AdmissionRejected` before any
+  artifact is written, and `EventStream::next()` ends after the terminal
+  outcome even while the caller still holds the handle.
+- The destination is committed only after exact accepted-byte coverage and
+  requested-hash verification succeed.
 
 ## Verification
 

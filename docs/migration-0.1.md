@@ -38,6 +38,17 @@ item.
 | `DownloadController::with_execution_and_metrics(...)` | No supported replacement — use `DownloadController::with_metrics(transport, config, metrics)` |
 | `metrics.record_result(&DownloadResult)` / `record_task_error(&DownloadError)` | `EngineMetrics::record_completed(&CompletedDownload)` / `record_run_error(&DownloadRunError)` |
 
+## Behavioral changes (checkpoint, privacy, lifetime)
+
+| Area | Change |
+|---|---|
+| Checkpoint format | New checkpoints are v2: they bind persisted ranges to the owned temp-file identity and a bounded digest of covered bytes, and the persisted JSON contains no request/final URL. v1 files fail validation and restart conservatively; a sidecar written by an older v2 build still loads (its URL fields are ignored, never revived). Delete old `.part`/sidecar pairs if you do not want the conservative restart. |
+| Redactor defaults | `Redactor::new()` masks userinfo and **every** query value; `with_sensitive_query_params` is retained, and `with_marked_query_params_only` restores the previous opt-in-only behavior. Request URLs sent on the wire are never changed. |
+| Event streams | `EventStream::next()` drains queued events and then returns `None` once the job is terminal, even while a `DownloadHandle` (and its hub) is retained; previously it could wait forever. |
+| Job lifetime | `transfer.job_deadline` is enforced end to end; `max_active_jobs` rejects an over-cap `start` with `DownloadError::AdmissionRejected` (category `MemoryCap`) before any artifact is written; atomic publication is the commit boundary, so a post-commit expiry reports success truthfully. |
+| File permissions | Engine-created `.part` files and checkpoint sidecars are owner-only (`0600`) on Unix; a resumed partial is tightened on open. |
+
+
 ## Verification
 
 - **External consumer examples compile:** `crates/engine/examples/download.rs`

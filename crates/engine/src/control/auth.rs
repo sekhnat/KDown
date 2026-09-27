@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::DownloadError;
 
-
 /// What a challenge response looked like (§29 scope/challenge input).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
@@ -186,9 +185,12 @@ pub(crate) struct SharedCredentials {
 impl std::fmt::Debug for SharedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedCredentials")
-            .field("headers", &crate::redact::RedactedHeaders(
-                &self.headers.read().unwrap_or_else(|e| e.into_inner()),
-            ))
+            .field(
+                "headers",
+                &crate::redact::RedactedHeaders(
+                    &self.headers.read().unwrap_or_else(|e| e.into_inner()),
+                ),
+            )
             .field("has_provider", &self.provider.is_some())
             .field("stages_used", &self.stages_used.load(Ordering::SeqCst))
             .field("sensitive", &self.sensitive)

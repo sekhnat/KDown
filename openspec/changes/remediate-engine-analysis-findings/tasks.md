@@ -29,16 +29,16 @@
 
 ## 5. P2: Metrics, Events, and Secret-safe Diagnostics
 
-- [ ] 5.1 Correct `TransferAccounting::wire_amplification` to count received payload once and document reused-byte denominator separately from benchmark server-emitted amplification; verify 150/100/50 = 1.5 and real retry/resume tests in both modes.
-- [ ] 5.2 Add a per-job terminal signal to `EventStream` so retained handles do not keep `next()` pending forever; verify completed, failed, cancelled, lagged and handle-retained subscriber tests.
-- [ ] 5.3 Redact URL userinfo and all query values in `DownloadRequest`, `RequestSpec`, error and event diagnostics without changing transport URLs; verify sentinel-secret unit/integration tests for parse failures, redirects and caller-marked keys.
-- [ ] 5.4 Remove raw original/final URLs from new default checkpoint persistence where not required, restrict sidecar/temp permissions, and document custom-store trust; verify signed-URL disk-content/permissions tests and safe migration/restart behavior.
+- [x] 5.1 Correct `TransferAccounting::wire_amplification` to count received payload once and document reused-byte denominator separately from benchmark server-emitted amplification; verify 150/100/50 = 1.5 and real retry/resume tests in both modes.
+- [x] 5.2 Add a per-job terminal signal to `EventStream` so retained handles do not keep `next()` pending forever; verify completed, failed, cancelled, lagged and handle-retained subscriber tests.
+- [x] 5.3 Redact URL userinfo and all query values in `DownloadRequest`, `RequestSpec`, error and event diagnostics without changing transport URLs; verify sentinel-secret unit/integration tests for parse failures, redirects and caller-marked keys.
+- [x] 5.4 Remove raw original/final URLs from new default checkpoint persistence where not required, restrict sidecar/temp permissions, and document custom-store trust; verify signed-URL disk-content/permissions tests and safe migration/restart behavior.
 
 ## 6. Release Evidence and Documentation
 
-- [ ] 6.1 In `scripts/release_gate.py`, check every prerequisite's timestamp and candidate commit before satisfaction and require a revision for production verdicts; verify `self-test` includes old/wrong-commit smoke, missing commit, future evidence, equivalence and reviewed-exception cases.
-- [ ] 6.2 Update `docs/acceptance-v1.md`, `README.md`, migration/API notes and `docs/performance-report-v1.md` to describe corrected guarantees, checkpoint incompatibility, trusted-directory boundary, deadline/admission/event behavior and limits of historical performance/RSS evidence; verify examples and doc links resolve.
-- [ ] 6.3 Repair `lib.rs` reference to missing `KDownSpec.md`, enable `[lints] workspace = true` for `crates/engine`, and strengthen supported-signature external consumer checks; verify `cargo check --locked --workspace --all-targets`, rustdoc, lint and consumer fixture pass without disabling relevant lints.
+- [x] 6.1 In `scripts/release_gate.py`, check every prerequisite's timestamp and candidate commit before satisfaction and require a revision for production verdicts; verify `self-test` includes old/wrong-commit smoke, missing commit, future evidence, equivalence and reviewed-exception cases.
+- [x] 6.2 Update `docs/acceptance-v1.md`, `README.md`, migration/API notes and `docs/performance-report-v1.md` to describe corrected guarantees, checkpoint incompatibility, trusted-directory boundary, deadline/admission/event behavior and limits of historical performance/RSS evidence; verify examples and doc links resolve.
+- [x] 6.3 Repair `lib.rs` reference to missing `KDownSpec.md`, enable `[lints] workspace = true` for `crates/engine`, and strengthen supported-signature external consumer checks; verify `cargo check --locked --workspace --all-targets`, rustdoc, lint and consumer fixture pass without disabling relevant lints.
 
 ## 7. Cross-platform Acceptance Before Stability Claim
 

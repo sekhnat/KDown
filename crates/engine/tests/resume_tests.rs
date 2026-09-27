@@ -379,6 +379,21 @@ async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
         result.accounting.bytes_reused_from_checkpoint,
         prefix_len as u64
     );
+    // Task 5.1: resumed bytes are unique output coverage, so the denominator
+    // counts the reused prefix and a mostly-reused resume reports below 1.0
+    // (only the 48 KiB tail crossed the wire for 64 KiB of output).
+    assert_eq!(
+        result.accounting.bytes_downloaded_from_network,
+        content.len() as u64 - prefix_len as u64
+    );
+    let amplification = result
+        .accounting
+        .wire_amplification()
+        .expect("nonzero coverage");
+    assert!(
+        amplification < 1.0,
+        "reused coverage lowers wire amplification: {amplification}"
+    );
     // Committed download leaves no resumable state (§14.6 step 5).
     assert!(store.load(&identity).expect("load").is_none());
     assert!(!temp.exists());

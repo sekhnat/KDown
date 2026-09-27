@@ -11,6 +11,9 @@ license.workspace = true
 # only the supported-surface facade tests remain external targets.
 autotests = false
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal"] }
 rand = "0.9"

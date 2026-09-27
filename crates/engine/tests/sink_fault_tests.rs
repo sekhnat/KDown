@@ -407,8 +407,7 @@ async fn durable_cadence_sync_failure_never_persists_the_frontier() {
         "sync failure surfaces as a checkpoint-category failure: {error:?}"
     );
     assert!(!dest.exists(), "nothing may be published");
-    let store = FileCheckpointStore::new(dir.path(), StoreDurabilityMode::Durable)
-        .expect("store");
+    let store = FileCheckpointStore::new(dir.path(), StoreDurabilityMode::Durable).expect("store");
     assert!(
         store.load(&identity).expect("load").is_none(),
         "a failed sync must never persist a frontier"

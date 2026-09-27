@@ -10,9 +10,10 @@ Subcommands:
   check                       print the verdict; non-zero exit unless stable
   status                      human-readable per-gate table
   self-test                   prove, with synthetic manifests, that missing /
-                              failed / stale / non-approving / unavailable /
-                              untriaged-defect evidence all block the verdict
-                              (and that PR smoke alone never approves release)
+                              failed / stale / future / other-commit / missing-revision /
+                              non-approving / unavailable / untriaged-defect evidence
+                              all block the verdict (and that PR smoke alone never
+                              approves release)
 
 Blocking rules (spec: "Layered CI and auditable release evidence"):
   * a required gate with no evidence                -> blocked
@@ -24,6 +25,11 @@ Blocking rules (spec: "Layered CI and auditable release evidence"):
   * `passed_equivalent` without a named equivalent  -> blocked
   * older than the gate's `max_age_days`            -> blocked (stale)
   * recorded against a different commit             -> blocked (stale)
+  * a production verdict requested without a release
+    revision                                         -> blocked (fail closed)
+  * freshness/commit checks apply to non-approving
+    prerequisite gates too (PR/smoke evidence is
+    never satisfied by stale or other-commit data)
   * a high-severity defect without triage and a
     documented mitigation/exception                 -> blocked
 A category with no passing gate also blocks: deleting a gate definition cannot
@@ -119,6 +125,14 @@ def evaluate(manifest: dict, now: datetime, commit: str | None) -> dict:
             "manifest",
             "manifest declares no required gates/categories; evidence coverage cannot be established",
         )
+    # Production stability is revision-bound: a verdict requested without
+    # a candidate revision fails closed instead of skipping the binding
+    # check (task 6.1).
+    if commit is None:
+        block(
+            "release-commit",
+            "no release revision supplied; production stability is revision-bound",
+        )
     for gate_id, gate in gates.items():
         entry = evidence.get(gate_id)
         if entry is None:
@@ -149,15 +163,9 @@ def evaluate(manifest: dict, now: datetime, commit: str | None) -> dict:
         if status == "passed_equivalent" and not entry.get("equivalent"):
             block(gate_id, "passed_equivalent without a named equivalent")
             continue
-        if not entry.get("approves_release", False):
-            if not gate.get("approves_release", True):
-                # A non-approving prerequisite gate (for example the PR
-                # benchmark smoke): it must pass, but it never counts as
-                # release-approving evidence for its category.
-                satisfied.append(gate_id)
-                continue
-            block(gate_id, "evidence does not approve release (smoke/advisory only)")
-            continue
+        # Freshness and revision binding are checked for EVERY passing
+        # gate — including non-approving prerequisites — before the evidence
+        # is categorized as approving or advisory (task 6.1).
         max_age = int(gate.get("max_age_days", 30))
         try:
             recorded = parse_time(entry["recorded_at"])
@@ -171,12 +179,21 @@ def evaluate(manifest: dict, now: datetime, commit: str | None) -> dict:
         if age < timedelta(0):
             block(gate_id, "evidence timestamp is in the future")
             continue
-        if commit and entry.get("commit") not in (commit,):
+        if commit is not None and entry.get("commit") != commit:
             block(
                 gate_id,
                 f"evidence commit {entry.get('commit')!r} does not match the release commit "
                 f"{commit!r}",
             )
+            continue
+        if not entry.get("approves_release", False):
+            if gate.get("approves_release", True):
+                block(gate_id, "evidence does not approve release (smoke/advisory only)")
+                continue
+            # A passing non-approving prerequisite (for example the PR
+            # benchmark smoke): fresh and revision-bound, but it never
+            # counts as release-approving evidence for its category.
+            satisfied.append(gate_id)
             continue
         satisfied.append(gate_id)
         approving.append(gate_id)
@@ -427,6 +444,67 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             ],
         ),
     )
+
+    # Non-approving prerequisites are freshness- and revision-checked too
+    # (task 6.1): a stale or wrong-commit smoke fragment is not satisfied.
+    prereq_gates = [
+        {
+            "id": "approving",
+            "category": "correctness",
+            "max_age_days": 30,
+            "approves_release": True,
+            "summary": "approving",
+            "producer": "self-test",
+        },
+        {
+            "id": "smoke",
+            "category": "correctness",
+            "max_age_days": 7,
+            "approves_release": False,
+            "summary": "smoke",
+            "producer": "self-test",
+        },
+    ]
+    for label, overrides in (
+        ("stale prerequisite", {"recorded_at": stale}),
+        ("wrong-commit prerequisite", {"commit": "def456"}),
+    ):
+        result = evaluate(
+            _synthetic(
+                prereq_gates,
+                [
+                    _entry("approving", "correctness"),
+                    _entry("smoke", "correctness", approves_release=False, **overrides),
+                ],
+            ),
+            now,
+            "abc123",
+        )
+        if result["production_stable"]:
+            failures.append(f"{label}: expected the verdict to be blocked")
+        if "smoke" not in {item["id"] for item in result["blocked"]}:
+            failures.append(f"{label}: the prerequisite gate was not reported as blocked")
+
+    # No release revision: production stability fails closed.
+    no_commit = evaluate(_synthetic([gate], [_entry("g", "correctness")]), now, None)
+    if no_commit["production_stable"]:
+        failures.append("missing commit: expected the verdict to be blocked")
+    if "release-commit" not in {item["id"] for item in no_commit["blocked"]}:
+        failures.append("missing commit: the revision binding was not reported as blocked")
+
+    # Future-dated evidence is not fresh (clock skew or fabrication).
+    expect_block(
+        "future evidence",
+        verdict(
+            [
+                _entry(
+                    "g",
+                    "correctness",
+                    recorded_at=(now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+            ]
+        ),
+    )
     # A category with no passing gate blocks even when every listed gate passes:
     # deleting a gate definition must not shrink the evidence set.
     expect_block(
@@ -520,7 +598,11 @@ def main(argv: list[str]) -> int:
 
     for name, func in (("check", cmd_check), ("status", cmd_status)):
         check_parser = sub.add_parser(name, parents=[common])
-        check_parser.add_argument("--commit", default=None)
+        check_parser.add_argument(
+            "--commit",
+            default=None,
+            help="release revision to bind a production verdict to; without it the verdict is blocked",
+        )
         check_parser.add_argument("--now", default=None, help="override the evaluation time (ISO-8601)")
         check_parser.add_argument("--json", action="store_true")
         check_parser.set_defaults(func=func)

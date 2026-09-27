@@ -782,16 +782,15 @@ mod tests {
         let temp = dir.path().join("out.part");
         std::fs::write(&temp, vec![0u8; 1000]).expect("temp");
         let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
-        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators()) else {
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators())
+        else {
             panic!("validator-free state restarts conservatively");
         };
         assert!(!plan.is_resuming(), "no validator means no reuse");
         assert_eq!(plan.sequential().offset, 0);
         assert_eq!(store.deleted_identities(), vec!["identity".to_string()]);
         assert!(
-            plan.warnings()
-                .iter()
-                .any(|w| w.contains("not comparable")),
+            plan.warnings().iter().any(|w| w.contains("not comparable")),
             "the restart must explain the missing evidence: {:?}",
             plan.warnings()
         );
@@ -804,7 +803,8 @@ mod tests {
         let temp = dir.path().join("out.part");
         std::fs::write(&temp, vec![0u8; 500]).expect("temp");
         let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
-        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators()) else {
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&remote_without_validators())
+        else {
             panic!("missing current validator restarts; it is not a change");
         };
         assert!(!plan.is_resuming());
@@ -872,7 +872,8 @@ mod tests {
         let temp = dir.path().join("out.part");
         std::fs::write(&temp, vec![0u8; 1000]).expect("temp");
         let pending = begin(ResumePolicy::Allowed, &store, &temp).expect("pending");
-        let AdmissionDecision::Proceed(plan) = pending.finalize(&validators_for("\"gen-1\"")) else {
+        let AdmissionDecision::Proceed(plan) = pending.finalize(&validators_for("\"gen-1\""))
+        else {
             panic!("comparable strong validators admit the checkpoint");
         };
         assert!(plan.is_resuming());

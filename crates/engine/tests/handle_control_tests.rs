@@ -192,23 +192,29 @@ async fn active_job_cap_rejects_immediately_and_releases_on_completion() {
     let dir = tempfile::tempdir().expect("tmp");
     let first_dest = dir.path().join("first.bin");
     let second_dest = dir.path().join("second.bin");
-    let mut cfg = EngineConfig::default();
-    cfg.max_active_jobs = 1;
+    let cfg = EngineConfig {
+        max_active_jobs: 1,
+        ..EngineConfig::default()
+    };
     let c = DownloadController::new(
         HttpTransport::new(cfg.network.clone()).expect("transport"),
         cfg,
     );
 
-    let (first_handle, first_join) =
-        c.start(DownloadRequest::new(server.url("/capped"), first_dest.clone()));
+    let (first_handle, first_join) = c.start(DownloadRequest::new(
+        server.url("/capped"),
+        first_dest.clone(),
+    ));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         first_handle.snapshot().network_bytes > 0,
         "the first job is admitted and transferring"
     );
 
-    let (_second_handle, second_join) =
-        c.start(DownloadRequest::new(server.url("/capped"), second_dest.clone()));
+    let (_second_handle, second_join) = c.start(DownloadRequest::new(
+        server.url("/capped"),
+        second_dest.clone(),
+    ));
     let error = tokio::time::timeout(Duration::from_secs(10), second_join)
         .await
         .expect("no hang")
@@ -235,8 +241,10 @@ async fn active_job_cap_rejects_immediately_and_releases_on_completion() {
         .await
         .expect("no hang");
     let third_dest = dir.path().join("third.bin");
-    let (_third_handle, third_join) =
-        c.start(DownloadRequest::new(server.url("/capped"), third_dest.clone()));
+    let (_third_handle, third_join) = c.start(DownloadRequest::new(
+        server.url("/capped"),
+        third_dest.clone(),
+    ));
     let completed = tokio::time::timeout(Duration::from_secs(60), third_join)
         .await
         .expect("no hang")
@@ -316,7 +324,10 @@ async fn deadline_interrupts_retry_after_backoff() {
     .await
     .expect("bounded expiry")
     .expect_err("the deadline must fail the job");
-    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::DeadlineExceeded
+    );
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the 30s backoff must be interrupted, took {:?}",
@@ -349,7 +360,10 @@ async fn deadline_expires_while_paused() {
         .expect("a paused job must still expire")
         .expect("task")
         .expect_err("the deadline must fail the paused job");
-    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::DeadlineExceeded
+    );
     assert!(!dest.exists());
 }
 
@@ -377,7 +391,10 @@ async fn deadline_interrupts_slow_body() {
     .await
     .expect("bounded expiry")
     .expect_err("the deadline must fail the job");
-    assert_eq!(error.category(), kdown_engine::ErrorCategory::DeadlineExceeded);
+    assert_eq!(
+        error.category(),
+        kdown_engine::ErrorCategory::DeadlineExceeded
+    );
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "slow bodies must stop promptly, took {:?}",

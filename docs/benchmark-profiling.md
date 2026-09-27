@@ -367,11 +367,14 @@ approximation on both sides of an A/B), not absolute network truth.
 
 ### Engine-side gauges (task 0.4)
 
-- `TransferAccounting::wire_amplification()` — received payload (network +
-  re-received waste) / unique completed bytes; `None` when nothing uniquely
-  completed (undefined, never fabricated). This engine counts each wire byte
-  once in `bytes_downloaded_from_network` and charges duplicates to
-  `wasted_bytes`, so their sum is what crossed the wire.
+- `TransferAccounting::wire_amplification()` — payload received from the
+  network (`bytes_downloaded_from_network`, each wire byte counted once)
+  divided by unique output coverage (`completed_bytes` plus checkpoint-
+  `bytes_reused_from_checkpoint`); a mostly-reused resume may report below
+  `1.0`; `None` when nothing uniquely completed (undefined, never
+  fabricated). `wasted_bytes` is informational and must not be added to the
+  numerator a second time. The benchmark harness's server-emitted-byte
+  amplification (see above) is a separate, explicitly labeled axis.
 - `SegmentedJob::split_count()` — live-tail split events.
 - `SegmentedJob::active_workers()` — workers actually holding a lease
   (distinct from `desired_workers`).

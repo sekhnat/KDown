@@ -168,22 +168,16 @@ pub(crate) fn publish_verified(
     if let Some(expected) = identity {
         let meta = std::fs::symlink_metadata(temporary)?;
         if !meta.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "temporary output {} is no longer a regular file",
-                    temporary.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "temporary output {} is no longer a regular file",
+                temporary.display()
+            )));
         }
         if !expected.matches(&meta) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "temporary output {} changed after verification",
-                    temporary.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "temporary output {} changed after verification",
+                temporary.display()
+            )));
         }
     }
     #[cfg(test)]
@@ -550,8 +544,13 @@ mod tests {
         std::fs::remove_file(&temporary).expect("remove verified entry");
         std::fs::write(&temporary, b"impostor bytes").expect("plant impostor");
 
-        publish_verified(&temporary, &destination, PublishMode::Replace, Some(identity))
-            .expect_err("a changed entry must not publish");
+        publish_verified(
+            &temporary,
+            &destination,
+            PublishMode::Replace,
+            Some(identity),
+        )
+        .expect_err("a changed entry must not publish");
         assert!(!destination.exists(), "nothing may be published");
         assert_eq!(
             std::fs::read(&temporary).expect("impostor preserved"),
@@ -571,8 +570,13 @@ mod tests {
         std::fs::remove_file(&temporary).expect("remove verified entry");
         std::os::unix::fs::symlink(&scratch, &temporary).expect("plant symlink");
 
-        publish_verified(&temporary, &destination, PublishMode::Replace, Some(identity))
-            .expect_err("a symlinked entry must not publish");
+        publish_verified(
+            &temporary,
+            &destination,
+            PublishMode::Replace,
+            Some(identity),
+        )
+        .expect_err("a symlinked entry must not publish");
         assert!(!destination.exists(), "nothing may be published");
         assert_eq!(
             std::fs::read(&scratch).expect("read scratch"),

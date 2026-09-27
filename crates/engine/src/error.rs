@@ -1,4 +1,4 @@
-//! Structured error taxonomy per `KDownSpec.md` §20.
+//! Structured error taxonomy (§20).
 //!
 //! Every error carries a stable [`ErrorCategory`], a retryability hint, and
 //! optional origin/status/segment context. Sensitive data is redacted at
@@ -362,19 +362,35 @@ pub struct TransferAccounting {
 }
 
 impl TransferAccounting {
-    /// Wire amplification: total received payload divided by uniquely
-    /// completed bytes. Received payload is the network counter plus
-    /// re-received waste (each wire byte is counted once, either in
-    /// [`TransferAccounting::bytes_downloaded_from_network`] or in
-    /// [`TransferAccounting::wasted_bytes`]). `None` when the denominator
-    /// is zero — the metric is undefined there, never fabricated.
+    /// Wire amplification: payload bytes received from the network divided
+    /// by the unique output bytes they produced (§19.1, task 5.1).
+    ///
+    /// The numerator is [`TransferAccounting::bytes_downloaded_from_network`]:
+    /// every wire payload byte counted exactly once. Retries that re-deliver
+    /// data therefore inflate it. [`TransferAccounting::wasted_bytes`] is
+    /// informational only — it marks received bytes a stream did not keep,
+    /// which the network counter already includes, so adding it would count
+    /// those bytes a second time.
+    ///
+    /// The denominator is the unique output coverage:
+    /// [`TransferAccounting::completed_bytes`] plus
+    /// [`TransferAccounting::bytes_reused_from_checkpoint`], because
+    /// checkpoint-reused bytes are legitimately part of the output. A
+    /// mostly-reused resume can therefore report a ratio below `1.0`.
+    ///
+    /// `None` when the denominator is zero — the metric is undefined there,
+    /// never fabricated. Benchmark amplification measured from
+    /// server-emitted bytes is a separate axis (see
+    /// `docs/benchmark-profiling.md`).
     #[must_use]
     pub fn wire_amplification(&self) -> Option<f64> {
-        if self.completed_bytes == 0 {
+        let unique_output = self
+            .completed_bytes
+            .saturating_add(self.bytes_reused_from_checkpoint);
+        if unique_output == 0 {
             None
         } else {
-            let received = self.bytes_downloaded_from_network + self.wasted_bytes;
-            Some(received as f64 / self.completed_bytes as f64)
+            Some(self.bytes_downloaded_from_network as f64 / unique_output as f64)
         }
     }
 }
@@ -610,6 +626,55 @@ mod terminal_outcome_tests {
             elapsed: Duration::from_secs(1),
             ..TransferAccounting::default()
         }
+    }
+
+    /// Task 5.1: the received payload is counted once. The historical
+    /// `network + wasted` numerator double-counted bytes that both crossed the
+    /// wire and were marked redundant, reporting 2.0 for this input.
+    #[test]
+    fn wire_amplification_counts_received_payload_once() {
+        let accounting = TransferAccounting {
+            bytes_downloaded_from_network: 150,
+            completed_bytes: 100,
+            wasted_bytes: 50,
+            ..empty_accounting()
+        };
+        assert_eq!(accounting.wire_amplification(), Some(1.5));
+    }
+
+    /// Reused checkpoint bytes are real output coverage, so they sit in the
+    /// denominator: a mostly-reused resume reports below 1.0.
+    #[test]
+    fn wire_amplification_denominator_includes_reused_coverage() {
+        let accounting = TransferAccounting {
+            bytes_downloaded_from_network: 150,
+            completed_bytes: 50,
+            bytes_reused_from_checkpoint: 100,
+            wasted_bytes: 50,
+            ..empty_accounting()
+        };
+        assert_eq!(accounting.wire_amplification(), Some(1.0));
+
+        let mostly_reused = TransferAccounting {
+            bytes_downloaded_from_network: 50,
+            completed_bytes: 50,
+            bytes_reused_from_checkpoint: 950,
+            ..empty_accounting()
+        };
+        assert_eq!(mostly_reused.wire_amplification(), Some(0.05));
+    }
+
+    /// No unique output coverage means the ratio is undefined, even when
+    /// bytes crossed the wire.
+    #[test]
+    fn wire_amplification_is_undefined_without_unique_coverage() {
+        let no_coverage = TransferAccounting {
+            bytes_downloaded_from_network: 100,
+            wasted_bytes: 100,
+            ..empty_accounting()
+        };
+        assert_eq!(no_coverage.wire_amplification(), None);
+        assert_eq!(empty_accounting().wire_amplification(), None);
     }
 
     /// Every error variant lands in exactly one terminal failure domain,

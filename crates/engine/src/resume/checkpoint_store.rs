@@ -20,6 +20,18 @@ pub enum DurabilityMode {
 }
 
 /// Storage abstraction (§34): pluggable (sidecar, SQLite, app state).
+///
+/// ## Trust boundary
+///
+/// The engine no longer puts raw request/final URLs in a checkpoint
+/// ([`crate::resume::checkpoint::Checkpoint`] serializes neither), so the
+/// engine-authored bytes this trait receives are secret-free apart from
+/// remotely supplied validator text. The store itself, however, is
+/// caller-controlled: it must protect its own storage (owner-only
+/// permissions, exclusive temp creation, atomic replace) and must not add
+/// or retain extra request context such as URLs, headers, or provider
+/// output. Sidecar temp/old versions and backups are the store's
+/// responsibility (task 5.4).
 pub trait CheckpointStore: Send + Sync {
     /// Load a checkpoint; `Ok(None)` when absent.
     ///
@@ -575,8 +587,8 @@ mod tests {
     #[test]
     fn symlinked_sidecar_is_never_read_or_deleted_through() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
-            .expect("store");
+        let store =
+            FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
         let mut cp = Checkpoint::new("job-symlink", "https://example/f", "tmp");
         cp.record_completed(0, 4);
         let json = cp.to_json().expect("json");
@@ -610,8 +622,8 @@ mod tests {
     #[test]
     fn save_replaces_a_symlinked_sidecar_without_touching_its_target() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
-            .expect("store");
+        let store =
+            FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
         let mut cp = Checkpoint::new("job-swap", "https://example/f", "tmp");
         cp.record_completed(0, 4);
         let scratch = dir.path().join("unrelated.scratch");
@@ -634,12 +646,49 @@ mod tests {
     fn default_sidecar_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tmp");
-        let store = FileCheckpointStore::new(dir.path(), DurabilityMode::Performance)
-            .expect("store");
+        let store =
+            FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
         let mut cp = Checkpoint::new("job-perm", "https://example/f", "tmp");
         cp.record_completed(0, 4);
         store.save_atomic(&cp).expect("save");
         let mode = std::fs::metadata(dir.path().join("job-perm.kdown"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "sidecar must not be group/world readable");
+    }
+
+    /// Task 5.4: a signed URL's secrets are absent from the sidecar bytes
+    /// and from the store's temp residue, and the file is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_bytes_never_contain_url_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tmp");
+        let store =
+            FileCheckpointStore::new(dir.path(), DurabilityMode::Performance).expect("store");
+        let mut cp = Checkpoint::new(
+            "job-signed",
+            "https://user:SIDECAR-USERINFO-SECRET@cdn.test/f?token=SIDECAR-QUERY-SECRET",
+            "tmp",
+        );
+        cp.final_url = "https://cdn.test/f?token=SIDECAR-FINAL-SECRET".to_string();
+        cp.record_completed(0, 4);
+        store.save_atomic(&cp).expect("save");
+        let path = dir.path().join("job-signed.kdown");
+        let bytes = std::fs::read(&path).expect("read sidecar");
+        let text = String::from_utf8_lossy(&bytes);
+        for secret in [
+            "SIDECAR-USERINFO-SECRET",
+            "SIDECAR-QUERY-SECRET",
+            "SIDECAR-FINAL-SECRET",
+        ] {
+            assert!(
+                !text.contains(secret),
+                "URL secret `{secret}` written to the sidecar: {text}"
+            );
+        }
+        let mode = std::fs::metadata(&path)
             .expect("metadata")
             .permissions()
             .mode();

@@ -75,7 +75,10 @@ impl std::fmt::Debug for DownloadRequest {
         // credentials may travel under arbitrary header names.
         // Only header NAMES are diagnostic and stay visible.
         f.debug_struct("DownloadRequest")
-            .field("url", &self.url)
+            // The URL is diagnostic only: userinfo and every query value
+            // are masked so signed-URL secrets never reach logs (§35.3,
+            // task 5.3). The request still uses `self.url` verbatim.
+            .field("url", &crate::redact::redacted_url(&self.url))
             .field("destination", &self.destination)
             // Header values can carry credentials under any name; only the
             // names are diagnostic, so values are never formatted.
@@ -179,6 +182,20 @@ pub struct DownloadHandle {
     /// Serializes runtime-control update+event pairs (see the field comment
     /// at construction).
     runtime_control: std::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for DownloadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Control-observation view: internals (hub, counters, locks) stay
+        // opaque; the job's identity and lifecycle flags are diagnostic.
+        f.debug_struct("DownloadHandle")
+            .field("id", &self.id)
+            .field("state", &self.state.get())
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("paused", &self.cancel.is_paused())
+            .field("cancel_mode", &self.cancel_mode())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DownloadHandle {
@@ -342,6 +359,15 @@ pub struct DownloadController {
     /// RAII permit per running job, acquired synchronously in [`Self::start`]
     /// and released on success, failure, cancellation or task abort.
     active_jobs: Arc<tokio::sync::Semaphore>,
+}
+
+impl std::fmt::Debug for DownloadController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadController")
+            .field("config", &self.config)
+            .field("active_jobs", &self.active_jobs.available_permits())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Deprecated alias of [`DownloadController`], kept for source
@@ -638,6 +664,12 @@ impl DownloadController {
             .job_deadline
             .map(|budget| std::time::Instant::now() + budget);
         let join = tokio::spawn(async move {
+            // Terminal event-stream signal (§19.4, task 5.2): held for the
+            // whole task, so every exit path — success, failure, cancellation,
+            // admission rejection, panic, or abort — lets retained-handle
+            // subscribers drain and end instead of waiting forever.
+            let _terminal_guard =
+                crate::metrics::events::TerminalGuard::new(Arc::clone(&inner_hub));
             let Some(_admission_permit) = admission_permit else {
                 // Immediate typed rejection: no transfer begins and no
                 // artifact is written for a job that was never admitted.
@@ -1902,9 +1934,9 @@ impl DownloadController {
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
                             cp.set_owned_temp_identity(sink.temp_path());
                             cp.set_covered_digest(sink.temp_path());
-                            if let Err(e) =
-                                self.persist_checkpoint(&job_ledger, &store, &sink, &cp)
-                                    .await
+                            if let Err(e) = self
+                                .persist_checkpoint(&job_ledger, &store, &sink, &cp)
+                                .await
                             {
                                 // A failed cadence save must stop the job:
                                 // transfer continues would claim resumable
@@ -1949,9 +1981,9 @@ impl DownloadController {
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
                             cp.set_owned_temp_identity(sink.temp_path());
                             cp.set_covered_digest(sink.temp_path());
-                            if let Err(e) =
-                                self.persist_checkpoint(&job_ledger, &store, &sink, &cp)
-                                    .await
+                            if let Err(e) = self
+                                .persist_checkpoint(&job_ledger, &store, &sink, &cp)
+                                .await
                             {
                                 // Pause must not claim a resumable state
                                 // that failed to persist: stop with the

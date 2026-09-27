@@ -4,11 +4,32 @@
 //! credentials into `Display` output; this module is the enforcement point
 //! for log records and for error messages that must quote URLs.
 
-/// Redacts sensitive URL components and caller-marked query parameters.
-#[derive(Debug, Clone, Default)]
+/// Redacts sensitive URL components for diagnostics.
+///
+/// The default policy is the safe one (§35.3, task 5.3): userinfo is
+/// removed and **every** query value is masked, because the engine cannot
+/// know which unfamiliar query key carries a secret (signed URLs put
+/// credentials under arbitrary names). Callers that know their query keys
+/// are not secret can opt down with
+/// [`Redactor::with_marked_query_params_only`];
+/// [`Redactor::with_sensitive_query_params`] marks extra names and stays
+/// supported.
+#[derive(Debug, Clone)]
 pub struct Redactor {
     /// Case-insensitive query parameter names to treat as secrets.
     sensitive_query_params: Vec<String>,
+    /// Mask every query value (the default); when `false`, only
+    /// `sensitive_query_params` values are masked.
+    mask_all_query_values: bool,
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self {
+            sensitive_query_params: Vec::new(),
+            mask_all_query_values: true,
+        }
+    }
 }
 
 /// Query/header names that are always redacted (§35.3).
@@ -22,6 +43,16 @@ pub const SENSITIVE_HEADER_NAMES: &[&str] = &[
 /// Fixed placeholder used wherever a credential-bearing value would
 /// otherwise be formatted.
 pub(crate) const REDACTED_VALUE: &str = "<redacted>";
+
+/// Render a URL for diagnostics under the default policy: userinfo is
+/// removed and every query value is masked (§35.3, task 5.3). `Debug`
+/// impls and error messages that must quote a request target use this so
+/// signed-URL secrets never reach logs; the URL sent on the wire is never
+/// changed.
+#[must_use]
+pub(crate) fn redacted_url(url: &str) -> String {
+    Redactor::new().redact_url(url)
+}
 
 /// Debug formatter for request-header collections.
 ///
@@ -51,7 +82,10 @@ impl Redactor {
     }
 
     /// Register an additional query parameter name as sensitive
-    /// (e.g., signed-URL tokens). Matching is case-insensitive.
+    /// (e.g., signed-URL tokens). Matching is case-insensitive. Under the
+    /// default policy every value is already masked, so this is additive
+    /// and retained for callers that opt down with
+    /// [`Redactor::with_marked_query_params_only`].
     #[must_use]
     pub fn with_sensitive_query_params(mut self, params: &[&str]) -> Self {
         self.sensitive_query_params
@@ -59,10 +93,23 @@ impl Redactor {
         self
     }
 
-    /// Redact userinfo and sensitive query parameters from a URL string.
+    /// Opt down to masking only userinfo and the marked query parameters.
     ///
+    /// Every other query value is left readable, so use this only when the
+    /// caller knows none of them are secret. The default masks every
+    /// query value because an unfamiliar key's secrecy cannot be
+    /// determined safely (task 5.3).
+    #[must_use]
+    pub fn with_marked_query_params_only(mut self) -> Self {
+        self.mask_all_query_values = false;
+        self
+    }
+
+    /// Redact userinfo and query values from a URL string for diagnostics.
+    ///
+    /// Under the default policy
     /// `https://user:secret@example.com/x?token=abc&ok=1` becomes
-    /// `https://example.com/x?token=REDACTED&ok=1`.
+    /// `https://example.com/x?token=REDACTED&ok=REDACTED`.
     #[must_use]
     pub fn redact_url(&self, url: &str) -> String {
         let (scheme, rest) = match url.split_once("://") {
@@ -84,9 +131,6 @@ impl Redactor {
     }
 
     fn redact_query_only(&self, s: &str) -> String {
-        if self.sensitive_query_params.is_empty() {
-            return s.to_string();
-        }
         let (base, query) = match s.split_once('?') {
             Some((b, q)) => (b, q),
             None => return s.to_string(),
@@ -94,18 +138,19 @@ impl Redactor {
         let parts: Vec<String> = query
             .split('&')
             .map(|kv| match kv.split_once('=') {
-                Some((k, _))
-                    if self
-                        .sensitive_query_params
-                        .iter()
-                        .any(|p| k.eq_ignore_ascii_case(p)) =>
-                {
-                    format!("{k}=REDACTED")
-                }
+                Some((k, _)) if self.masks_query_value(k) => format!("{k}=REDACTED"),
                 _ => kv.to_string(),
             })
             .collect();
         format!("{base}?{}", parts.join("&"))
+    }
+
+    fn masks_query_value(&self, name: &str) -> bool {
+        self.mask_all_query_values
+            || self
+                .sensitive_query_params
+                .iter()
+                .any(|p| name.eq_ignore_ascii_case(p))
     }
 }
 
@@ -114,11 +159,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_userinfo() {
+    fn strips_userinfo_and_every_query_value_by_default() {
         let r = Redactor::new();
         assert_eq!(
-            r.redact_url("https://alice:hunter2@example.com/file.bin?x=1"),
-            "https://example.com/file.bin?x=1"
+            r.redact_url("https://alice:hunter2@example.com/file.bin?x=1&token=abc"),
+            "https://example.com/file.bin?x=REDACTED&token=REDACTED"
         );
     }
 
@@ -127,20 +172,42 @@ mod tests {
         let r = Redactor::new().with_sensitive_query_params(&["token", "Signature"]);
         assert_eq!(
             r.redact_url("https://cdn.example.com/f?Token=abc&Signature=xyz&keep=1"),
-            "https://cdn.example.com/f?Token=REDACTED&Signature=REDACTED&keep=1"
+            "https://cdn.example.com/f?Token=REDACTED&Signature=REDACTED&keep=REDACTED"
+        );
+    }
+
+    #[test]
+    fn marked_only_policy_keeps_unmarked_values() {
+        let r = Redactor::new()
+            .with_sensitive_query_params(&["signature"])
+            .with_marked_query_params_only();
+        assert_eq!(
+            r.redact_url("https://cdn.example.com/f?Signature=xyz&page=2"),
+            "https://cdn.example.com/f?Signature=REDACTED&page=2"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_masked_without_any_configuration() {
+        // The default policy cannot know whether `X-Amz-Signature` or an
+        // unfamiliar key is secret, so every value is masked (task 5.3).
+        let r = Redactor::new();
+        assert_eq!(
+            r.redact_url("https://cdn.example.com/f?X-Amz-Signature=secret&next=/x?y"),
+            "https://cdn.example.com/f?X-Amz-Signature=REDACTED&next=REDACTED"
         );
     }
 
     #[test]
     fn leaves_clean_urls_untouched() {
-        let r = Redactor::new().with_sensitive_query_params(&["token"]);
+        let r = Redactor::new();
         assert_eq!(
             r.redact_url("https://example.com/plain"),
             "https://example.com/plain"
         );
         assert_eq!(
             r.redact_url("https://example.com/f?a=1&b=2"),
-            "https://example.com/f?a=1&b=2"
+            "https://example.com/f?a=REDACTED&b=REDACTED"
         );
     }
 

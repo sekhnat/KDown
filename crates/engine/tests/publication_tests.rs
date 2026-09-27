@@ -102,8 +102,7 @@ async fn unknown_length_body_over_stale_part_publishes_only_acknowledged_bytes()
     assert!(completed.final_path.exists());
     let output = std::fs::read(&dest).expect("read output");
     assert_eq!(
-        output,
-        b"new",
+        output, b"new",
         "the published output must be exactly the acknowledged stream"
     );
 }
@@ -128,7 +127,10 @@ async fn known_length_body_over_stale_part_publishes_only_the_resource() {
         .expect("download completes");
     assert!(completed.final_path.exists());
     let output = std::fs::read(&dest).expect("read output");
-    assert_eq!(output, content, "no stale byte may reach the published file");
+    assert_eq!(
+        output, content,
+        "no stale byte may reach the published file"
+    );
 }
 
 /// Interrupted unknown-length body: the stream dies before EOF, so no
@@ -153,10 +155,7 @@ async fn interrupted_unknown_length_body_never_publishes() {
         request(server.url("/flaky"), &dest),
     )
     .await;
-    assert!(
-        result.is_err(),
-        "an interrupted body must fail: {result:?}"
-    );
+    assert!(result.is_err(), "an interrupted body must fail: {result:?}");
     assert!(
         !dest.exists(),
         "an interrupted body must never publish output at {}",
@@ -263,8 +262,7 @@ async fn symlink_at_part_entry_never_touches_unrelated_file() {
     let dest = dir.path().join("out.bin");
     let scratch = dir.path().join("unrelated.scratch");
     std::fs::write(&scratch, b"UNRELATED-SCRATCH").expect("scratch");
-    std::os::unix::fs::symlink(&scratch, dir.path().join("out.bin.part"))
-        .expect("plant symlink");
+    std::os::unix::fs::symlink(&scratch, dir.path().join("out.bin.part")).expect("plant symlink");
 
     let completed = run(
         EngineConfig::default(),
@@ -334,7 +332,8 @@ async fn resume_over_swapped_part_symlink_is_safe() {
     };
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = DownloadController::new(transport, cfg);
-    let (handle, join) = controller.start(DownloadRequest::new(server.url("/file.bin"), dest.clone()));
+    let (handle, join) =
+        controller.start(DownloadRequest::new(server.url("/file.bin"), dest.clone()));
     handle.set_rate_limit(128 * 1024);
     tokio::time::sleep(Duration::from_millis(400)).await;
     handle.cancel_with(CancelMode::KeepPartial);
@@ -376,6 +375,74 @@ async fn resume_over_swapped_part_symlink_is_safe() {
     );
 }
 
+/// Task 5.4: the default sidecar stores no raw URL text and is owner-only,
+/// and a signed-URL resume stays safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_url_sidecar_is_secret_free_and_owner_only() {
+    use kdown_engine::config::ResumePolicy;
+    use kdown_engine::CancelMode;
+
+    let content = fixtures::deterministic_bytes(1024 * 1024, 0x77);
+    let server = TestServer::new()
+        .serve_static("/file.bin", content.clone())
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let dest = dir.path().join("signed.bin");
+    let cfg = EngineConfig {
+        checkpoint_flush_interval: Duration::from_millis(50),
+        ..EngineConfig::default()
+    };
+    let transport = HttpTransport::from_config(&cfg).expect("transport");
+    let controller = DownloadController::new(transport, cfg);
+    let url = server.url("/file.bin?X-Amz-Signature=SIDECAR-URL-SECRET&token=SIDECAR-OTHER-SECRET");
+    let (handle, join) = controller.start(DownloadRequest::new(url.clone(), dest.clone()));
+    handle.set_rate_limit(128 * 1024);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    handle.cancel_with(CancelMode::KeepPartial);
+    let _ = tokio::time::timeout(Duration::from_secs(20), join).await;
+    assert!(!dest.exists(), "nothing published before the restart");
+    drop(controller);
+
+    // The default resolver names the sidecar by an opaque job identity
+    // (private to the crate): locate it by extension instead.
+    let sidecar = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "kdown"))
+        .expect("a checkpoint sidecar must have been persisted");
+    let bytes = std::fs::read(&sidecar).expect("read sidecar");
+    let text = String::from_utf8_lossy(&bytes);
+    for secret in ["SIDECAR-URL-SECRET", "SIDECAR-OTHER-SECRET"] {
+        assert!(
+            !text.contains(secret),
+            "URL secret `{secret}` persisted: {text}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&sidecar)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "sidecar must not be group/world readable");
+    }
+
+    // Safe restart: resume (or conservatively restart) and publish exactly.
+    let transport = HttpTransport::from_config(&EngineConfig::default()).expect("transport");
+    let controller = DownloadController::new(transport, EngineConfig::default());
+    let mut retry = DownloadRequest::new(url, dest.clone());
+    retry.resume = ResumePolicy::Allowed;
+    let completed = tokio::time::timeout(Duration::from_secs(30), controller.run(retry))
+        .await
+        .expect("no hang")
+        .expect("resume completes");
+    assert_eq!(completed.final_path, dest);
+    assert_eq!(std::fs::read(&dest).expect("read output"), content);
+}
+
 // ---- Validator-comparable resume admission (task 3.2) ----
 
 /// A checkpoint store returning one fixed checkpoint for any job identity
@@ -396,7 +463,8 @@ impl CheckpointStore for FixedCheckpointStore {
     }
 
     fn delete(&self, _job_identity: &str) -> Result<(), CheckpointError> {
-        self.deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.deletes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.checkpoint.lock().expect("checkpoint lock") = None;
         Ok(())
     }
@@ -452,8 +520,7 @@ async fn complete_checkpoint_without_validators_refetches_instead_of_publishing(
 
     let cfg = EngineConfig::default();
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = DownloadController::new(transport, cfg)
-        .with_checkpoint_resolver(resolver);
+    let controller = DownloadController::new(transport, cfg).with_checkpoint_resolver(resolver);
     let mut req = request(server.url("/file.bin"), &dest);
     req.resume = ResumePolicy::Allowed;
     let completed = tokio::time::timeout(Duration::from_secs(60), controller.run(req))
@@ -503,8 +570,7 @@ async fn disappearing_etag_discards_the_checkpoint_and_refetches() {
 
     let cfg = EngineConfig::default();
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = DownloadController::new(transport, cfg)
-        .with_checkpoint_resolver(resolver);
+    let controller = DownloadController::new(transport, cfg).with_checkpoint_resolver(resolver);
     let mut req = request(server.url("/file.bin"), &dest);
     req.resume = ResumePolicy::Allowed;
     tokio::time::timeout(Duration::from_secs(60), controller.run(req))
@@ -544,8 +610,7 @@ async fn complete_checkpoint_with_matching_strong_etag_may_skip_the_get() {
 
     let cfg = EngineConfig::default();
     let transport = HttpTransport::from_config(&cfg).expect("transport");
-    let controller = DownloadController::new(transport, cfg)
-        .with_checkpoint_resolver(resolver);
+    let controller = DownloadController::new(transport, cfg).with_checkpoint_resolver(resolver);
     let mut req = request(server.url("/file.bin"), &dest);
     req.resume = ResumePolicy::Allowed;
     tokio::time::timeout(Duration::from_secs(60), controller.run(req))

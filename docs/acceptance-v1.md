@@ -1,6 +1,6 @@
 # KDown v1 acceptance review
 
-Phase-5 hardening review against `KDownSpec.md` §42. Evidence is the
+Phase-5 hardening review (§42). Evidence is the
 repository's unit/integration/property suites and the loopback benchmark
 baseline in `crates/engine/benches/results/baseline.md`.
 
@@ -11,7 +11,9 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Exact HTTP/1.1 output | `single_stream_tests`, `segmented_tests`, randomized disconnect suites |
 | Exact segmented ranges | `range_validation_tests`, `phase3_exit_tests`, scheduler property suite |
 | HTTP/2 byte-exact output | `h2_tests::h2_segmented_download_is_byte_exact` |
-| Resume never mixes generations | `resume_tests`, generation-change tests in controller suite |
+| Byte-exact accepted coverage (preallocation, stale partials, interrupts) | `publication_tests` short/stale-tail/preallocated-hole cases; `allocation_tests`, `single_stream_tests`, `segmented_tests` |
+| Redirect credential isolation (H1/H2, absolute/relative, multi-hop, opt-in) | `http_edge_cases_tests`, `h2_tests` credential regressions; redirect resolution unit suite |
+| Resume never mixes generations | `resume_tests`, `publication_tests` validator/binding admission cases; checkpoints without comparable validators or with pre-v2 formats restart conservatively |
 | Hash mismatch prevents commit | integrity cases in `single_stream_tests`, `metrics_tests` |
 | >4 GiB offsets | `phase3_exit_tests::oversized_4gib_sparse_download_exact` |
 | Race-safe overwrite publication | Real-file `io::publish` tests cover no-replace conflicts, atomic replacement observation, and non-destructive failure; the suite runs in the Ubuntu/macOS/Windows CI matrix |
@@ -44,9 +46,12 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Criterion | Evidence |
 |---|---|
 | Start/pause/resume/cancel/limit controls | `handle_control_tests`, runtime-control suites |
-| Observe progress/events | atomic counters/events module; event API documentation |
+| Observe progress/events | atomic counters/events module; a retained-handle `EventStream::next()` ends after the terminal outcome (`metrics_tests` terminal-stream cases, events unit tests) |
+| Enforced deadline, prompt cancellation, bounded admission | `handle_control_tests` deadline latency cases; `sink_fault_tests` commit-boundary races; `active_job_cap_rejects_immediately_and_releases_on_completion` |
 | Structured errors | `DownloadError` taxonomy; error-category assertions throughout |
 | Replaceable transport/sink/checkpoint layers | `HttpTransport`, `Sink`, `CheckpointStore` interfaces |
+| Workspace lint wiring | `crates/engine` opts into the workspace lint set: `clippy::all` plus `unsafe_code`/`missing_debug_implementations` are enforced in the `-D warnings` clippy lane; `pedantic`/`unwrap_used`/`expect_used` stay declared-but-off with the cleanup follow-up recorded in the root `Cargo.toml` |
+| Public API drift | `scripts/api_surface_check.sh` inventory plus exact-signature proofs in `tests/external_consumer_fixture.rs` |
 
 ## Security
 
@@ -55,8 +60,9 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | TLS validation by default | `security_tests::invalid_certificate_fails_by_default` |
 | Explicit custom CA | `security_tests::custom_ca_bundle_honored` |
 | No HTTPS downgrade | redirect-policy security test and redirect integration suite |
-| No cross-origin credentials | `transport_integration::credentials_stripped_on_cross_origin_redirect` |
-| Secret-safe logs/errors | `redaction_audit_tests`, `Redactor` unit tests |
+| No cross-origin credentials | `http_edge_cases_tests` and `h2_tests` credential regressions (absolute/relative, multi-hop, default vs opt-in, segmented workers); `transport_integration::credentials_stripped_on_cross_origin_redirect` |
+| Secret-safe logs/errors | `redaction_audit_tests`, `request_redaction_tests`, `Redactor` unit tests: userinfo and every query value masked by default, header values never formatted |
+| Partial-file ownership and sidecar privacy | symlink/hardlink/entry-swap fixtures in `publication_tests`, identity-bound publication in `io::publish`; sidecar bytes carry no URLs and owner-only permissions on Unix; trusted-destination-directory precondition documented |
 | Server filenames cannot traverse | `security_tests` sanitization cases; fuzz target |
 | Resource bounds | endless-header, redirect-loop, checkpoint/range parser tests |
 | SSRF restrictions | allow/block `AddressFilter` tests |
@@ -70,8 +76,12 @@ needs (three-OS correctness and durability, resource bound, interoperability,
 scheduled fuzz/stress lanes, dependency audit, targeted dynamic checks, and the
 loopback/low-latency/WAN performance profiles). Each verification lane records a
 JSON fragment (`scripts/evidence_io.py`); the gate aggregates them and refuses
-the verdict for missing, failed, stale, non-approving, fingerprint-mismatched or
-unavailable evidence, and for untriaged high-severity defects:
+the verdict for missing, failed, stale, future-dated, wrong-commit,
+unavailable, fingerprint-mismatched or non-approving evidence, for a check
+requested without an explicit candidate revision, and for untriaged
+high-severity defects. Freshness and revision binding are checked for every
+required gate before it is counted satisfied — including non-approving
+PR/smoke prerequisites, which still never approve a release:
 
 ```sh
 cp release/evidence-manifest.json /tmp/manifest.json
@@ -81,8 +91,10 @@ python3 scripts/release_gate.py check  --manifest /tmp/manifest.json --commit "$
 ```
 
 `python3 scripts/release_gate.py self-test` proves the blocking semantics
-(missing / failed / stale / non-approving / unavailable / untriaged-defect),
-including that the PR benchmark smoke can never approve a release.
+(missing / failed / stale / future / other-commit / missing-revision /
+non-approving / unavailable / untriaged-defect), including that a stale or
+wrong-commit smoke fragment satisfies nothing and that the PR benchmark
+smoke can never approve a release.
 
 **Status: production stability is NOT declared for this revision.** The local
 verification run passed the Linux correctness, durability, resource-bound,
@@ -91,7 +103,10 @@ lanes, and recorded `unavailable` for the dynamic checkers (no nightly
 toolchain on this host), `failed` for the loopback performance profile (host
 noise limit), and no evidence for the macOS/Windows and fuzz lanes (CI-only).
 The full verdict, blockers and evidence are in
-[`docs/performance-report-v1.md`](performance-report-v1.md) §4–§7.
+[`docs/performance-report-v1.md`](performance-report-v1.md) §4–§7. The passing
+targeted regressions above are not by themselves a full-workspace or
+all-platform audit: this revision carries no production-stability claim until
+the commit-bound, cross-platform evidence set in the manifest is complete.
 
 ## Verification commands
 

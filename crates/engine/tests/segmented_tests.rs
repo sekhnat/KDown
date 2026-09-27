@@ -438,6 +438,18 @@ async fn segmented_resume_reuses_all_completed_ranges() {
         result.accounting.bytes_reused_from_checkpoint,
         2 * prefix_len as u64
     );
+    // Task 5.1: the denominator is unique output coverage, so reused ranges
+    // lower the ratio below the reuse-excluding one for the same wire bytes.
+    let amplification = result
+        .accounting
+        .wire_amplification()
+        .expect("nonzero coverage");
+    let excluding_reuse = result.accounting.bytes_downloaded_from_network as f64
+        / result.accounting.completed_bytes as f64;
+    assert!(
+        amplification < excluding_reuse,
+        "reused ranges must count as output: {amplification} vs {excluding_reuse}"
+    );
     // No residue after commit (§14.6 step 5).
     assert!(store.load(&identity).expect("load").is_none());
     assert!(!temp.exists());

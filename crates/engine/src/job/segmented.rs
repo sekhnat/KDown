@@ -173,6 +173,18 @@ pub struct SegmentedJob {
     worker_progress: Vec<Arc<LeaseProgress>>,
 }
 
+impl std::fmt::Debug for SegmentedJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Job-scoped observation only; scheduler internals and per-worker
+        // cells are not diagnostic.
+        f.debug_struct("SegmentedJob")
+            .field("total_size", &self.total_size)
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("desired_workers", &self.desired_workers)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One worker's published progress record (§13.3): read as ONE coherent
 /// observation — lease id, generation and written-through offset always come
 /// from the same publication, never mixed across generations.
@@ -1787,9 +1799,7 @@ async fn transfer_lease(
             }) => {
                 if let Some(challenge) = &challenge {
                     if provided_here {
-                        return Err(WorkerError::Fatal(
-                            DownloadError::AuthenticationRequired,
-                        ));
+                        return Err(WorkerError::Fatal(DownloadError::AuthenticationRequired));
                     }
                     match job.credentials.provide(challenge) {
                         // New credentials were latched: retry the same
@@ -1802,9 +1812,7 @@ async fn transfer_lease(
                         // declined: fail closed exactly like the sequential
                         // path (no unbounded authentication retries).
                         Ok(false) => {
-                            return Err(WorkerError::Fatal(
-                                DownloadError::AuthenticationRequired,
-                            ));
+                            return Err(WorkerError::Fatal(DownloadError::AuthenticationRequired));
                         }
                         Err(provider_error) => {
                             return Err(WorkerError::Fatal(provider_error));

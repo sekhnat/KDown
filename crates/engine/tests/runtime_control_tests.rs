@@ -563,13 +563,15 @@ async fn single_stream_restart_counts_wasted_bytes() {
         "unique coverage is exact: {result:?}"
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    // Wire amplification (task 0.4): the restart's re-received prefix
-    // inflates network payload above unique completion.
+    // Wire amplification (task 5.1): the retry resumes at the acknowledged
+    // frontier, so the failed streams' retained prefixes are received exactly
+    // once and the ratio is network / unique coverage = 1.0. Adding the
+    // `wasted_bytes` markers again reported 1.75 for this fixture.
     let amp = result
         .accounting
         .wire_amplification()
         .expect("nonzero denominator");
-    assert!(amp > 1.0, "single-stream restart amplification {amp}");
+    assert_eq!(amp, 1.0, "received payload is counted once: {amp}");
 }
 
 /// Increase → decrease → increase (task 8.2): dormant workers reactivate on

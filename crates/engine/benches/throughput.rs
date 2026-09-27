@@ -95,7 +95,7 @@ pub mod fixtures {
     /// Fixture content behind the bench servers: in-memory (small smoke
     /// fixtures) or synthetic (block-derived; serves any range of any size
     /// without allocating the whole file).
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub enum ContentSource {
         InMemory(std::sync::Arc<Vec<u8>>),
         /// `len` bytes derived from per-block xorshift runs (`seed`).

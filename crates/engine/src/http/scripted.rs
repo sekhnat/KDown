@@ -178,7 +178,8 @@ impl std::fmt::Debug for CallRecord {
         // output keeps header names but never formats their values.
         f.debug_struct("CallRecord")
             .field("kind", &self.kind)
-            .field("url", &self.url)
+            // Diagnostics only: userinfo and query values are masked.
+            .field("url", &crate::redact::redacted_url(&self.url))
             .field("range", &self.range)
             .field("headers", &crate::redact::RedactedHeaders(&self.headers))
             .finish()
@@ -415,7 +416,9 @@ impl ProbeStep {
         }
         if let Some(url) = &self.url {
             if *url != call.url {
-                why.push(format!("expected url {url:?}, observed {:?}", call.url));
+                let expected = crate::redact::redacted_url(url);
+                let observed = crate::redact::redacted_url(&call.url);
+                why.push(format!("expected url {expected:?}, observed {observed:?}"));
             }
         }
         why.extend(header_mismatches(&self.headers, &call.headers));
@@ -441,7 +444,7 @@ impl ProbeStep {
     fn summary(&self) -> String {
         let mut s = String::from("probe");
         if let Some(url) = &self.url {
-            s.push_str(&format!(" url={url:?}"));
+            s.push_str(&format!(" url={:?}", crate::redact::redacted_url(url)));
         }
         if let Some(v) = self.verify_range_support {
             s.push_str(&format!(" verify_range_support={v}"));
@@ -598,7 +601,9 @@ impl TransferStep {
         }
         if let Some(url) = &self.url {
             if *url != call.url {
-                why.push(format!("expected url {url:?}, observed {:?}", call.url));
+                let expected = crate::redact::redacted_url(url);
+                let observed = crate::redact::redacted_url(&call.url);
+                why.push(format!("expected url {expected:?}, observed {observed:?}"));
             }
         }
         why.extend(header_mismatches(&self.headers, &call.headers));
@@ -649,7 +654,7 @@ impl TransferStep {
     fn summary(&self) -> String {
         let mut s = String::from("transfer");
         if let Some(url) = &self.url {
-            s.push_str(&format!(" url={url:?}"));
+            s.push_str(&format!(" url={:?}", crate::redact::redacted_url(url)));
         }
         if let Some(full) = self.intent_full {
             s.push_str(if full {

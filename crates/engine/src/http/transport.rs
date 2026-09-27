@@ -134,7 +134,9 @@ impl std::fmt::Debug for RequestSpec {
         // Request headers carry caller credentials under arbitrary names;
         // debug output keeps the names but never formats the values.
         f.debug_struct("RequestSpec")
-            .field("url", &self.url)
+            // Diagnostics only: userinfo and every query value are masked;
+            // the transport still dispatches to `self.url` verbatim.
+            .field("url", &crate::redact::redacted_url(&self.url))
             .field("headers", &crate::redact::RedactedHeaders(&self.headers))
             .field("range", &self.range)
             .field("validators", &self.validators)
@@ -372,7 +374,10 @@ impl HttpTransport {
 
     fn uri(&self, url: &str) -> Result<Uri, DownloadError> {
         url.parse::<Uri>()
-            .map_err(|e| DownloadError::InvalidUrl(format!("{url}: {e}")))
+            // Never echo raw userinfo/query values in a parse failure.
+            .map_err(|e| {
+                DownloadError::InvalidUrl(format!("{}: {e}", crate::redact::redacted_url(url)))
+            })
     }
 
     /// HEAD probe (§10.2 step 1). HTTP-private: the semantic seam's
@@ -897,7 +902,6 @@ impl HttpExecutor for HttpTransport {
         })
     }
 }
-
 
 /// Map hyper client errors onto the taxonomy (§17.1).
 pub(crate) fn classify_transport_error(e: &hyper_util::client::legacy::Error) -> DownloadError {

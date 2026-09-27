@@ -12,8 +12,9 @@ use std::time::Duration;
 
 // Supported crate-root re-exports.
 use kdown_engine::{
-    CancelMode, CompletedDownload, DownloadController, DownloadRequest, DownloadRunError,
-    EngineConfig, EngineMetrics, FailureDomain, HttpTransport, ProgressSnapshot, Redactor,
+    CancelMode, Checkpoint, CompletedDownload, DownloadController, DownloadError, DownloadHandle,
+    DownloadRequest, DownloadRunError, EngineConfig, EngineMetrics, FailureDomain, HttpTransport,
+    ProgressSnapshot, Redactor, TransferAccounting,
 };
 // Observation type (pre-narrowing path; re-exported at the root after the
 // visibility change).
@@ -54,6 +55,61 @@ fn nameability() {
     let _: Option<ErrorCategory> = None;
     let _: Option<FailureDomain> = None;
     let _: Option<Duration> = None;
+}
+
+/// The exact future shape of `EventStream::next()` (an alias keeps the
+/// signature proof readable and clippy-clean).
+type NextFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<kdown_engine::Event>> + 'a>>;
+
+/// Exact-signature proofs for the supported surface (task 6.3): a change to
+/// any parameter or return type here fails the fixture build, not only the
+/// inventory script. Covers the controls, diagnostics, checkpoint and event
+/// surfaces reinforced by the remediation change.
+#[test]
+fn supported_signature_proofs() {
+    let _: fn() -> Redactor = Redactor::new;
+    let _: fn(Redactor, &[&str]) -> Redactor = Redactor::with_sensitive_query_params;
+    let _: fn(Redactor) -> Redactor = Redactor::with_marked_query_params_only;
+    let _: fn(&Redactor, &str) -> String = Redactor::redact_url;
+    let _: fn(&TransferAccounting) -> Option<f64> = TransferAccounting::wire_amplification;
+    let _: fn(&DownloadHandle) -> ProgressSnapshot = DownloadHandle::snapshot;
+    let _: fn(&DownloadHandle) -> JobState = DownloadHandle::state;
+    let _: fn(&DownloadHandle) -> EventStream = DownloadHandle::events;
+    let _: fn(&DownloadHandle, CancelMode) = DownloadHandle::cancel_with;
+    let _: fn(&DownloadHandle) -> Option<u64> = DownloadHandle::rate_limit;
+    let _: fn(&DownloadHandle, u64) = DownloadHandle::set_rate_limit;
+    let _: fn(&EventStream) -> bool = EventStream::is_finished;
+    // `next()` is async: prove the exact future output type.
+    let _: for<'a> fn(&'a mut EventStream) -> NextFuture<'a> = |stream| Box::pin(stream.next());
+    let _: fn(String, PathBuf) -> DownloadRequest = |url, dest| DownloadRequest::new(url, dest);
+    let _: fn() -> EngineConfig = EngineConfig::default;
+    let _: fn(&EngineConfig) -> Result<HttpTransport, DownloadError> = HttpTransport::from_config;
+
+    // Lifetime controls shipped with the remediation change.
+    let mut config = EngineConfig::default();
+    config.transfer.job_deadline = Some(Duration::from_secs(30));
+    config.max_active_jobs = 8;
+    let _: Option<Duration> = config.transfer.job_deadline;
+    assert_eq!(config.max_active_jobs, 8);
+
+    // Admission refusal is a matchable, non-retryable typed variant.
+    let admission = DownloadError::AdmissionRejected { active: 1, cap: 2 };
+    match admission {
+        DownloadError::AdmissionRejected { active, cap } => {
+            let _: u32 = active;
+            let _: u32 = cap;
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    // v2 checkpoint constructor and local-binding fields.
+    let mut checkpoint =
+        Checkpoint::new("identity", "https://example.test/f?token=sentinel", "tmp");
+    checkpoint.owned_temp_identity = Some("path|0:0".to_string());
+    checkpoint.covered_digest = Some("digest".to_string());
+    let _: Option<String> = checkpoint.owned_temp_identity;
+    let _: Option<String> = checkpoint.covered_digest;
 }
 
 async fn drive(url: String, destination: PathBuf) -> Result<CompletedDownload, DownloadRunError> {

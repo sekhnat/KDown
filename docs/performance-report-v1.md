@@ -26,7 +26,7 @@ Each scenario row carries every axis independently:
 | Axis | Field | Notes |
 |---|---|---|
 | Throughput | `throughput_mib_s` | median/min/max/best-of-N + `spread_pct` over the repetitions |
-| Network amplification | `amplification` | fixture-server emitted bytes ÷ unique completed bytes |
+| Network amplification | `amplification` | fixture-server **emitted** bytes ÷ unique completed bytes (a distinct, explicitly labeled axis from the engine's `TransferAccounting::wire_amplification()`, which counts payload received from the network once — retries inflate it — over unique output coverage including checkpoint reuse) |
 | CPU per byte | `cpu_ns_per_byte` + `cpu_ns_per_byte_aggregate` | `/proc` ticks are 10 ms, so the gated value is the cumulative CPU over all repetitions of a scenario |
 | Transfer-pipeline memory high-water | `managed_memory_high_water_bytes` + `managed_memory_peak_bytes` | engine-accounted ledger high-water plus its configured cap; RSS is recorded only as an auxiliary axis |
 | Job/worker scaling | `scaling.<protocol>[]` | goodput and efficiency at every worker/job scale point |
@@ -267,3 +267,4 @@ engine regression. Disposition (not a silent threshold weakening):
 | PR-3 | macOS and Windows lanes are CI-only | Both OS correctness and durability gates block the local verdict | CI matrix artifacts merged into the manifest via `release_gate.py merge` (or the `ci_run_id` dispatch input) |
 | PR-4 | Baseline fingerprints are host-specific by design | A run on a different host records `unavailable` (fingerprint mismatch) rather than a bogus comparison | record/review a baseline per matched environment |
 | PR-5 | `RUSTSEC-2025-0134` (unmaintained `rustls-pemfile`) is a visible warning; `RUSTSEC-2026-0009` is a reviewed dev-only exception | Neither is a vulnerability today, but both are pre-release review items | replace the PEM parser (non-ring/rustls-pemfile path) and re-check the `time`/`rcgen` MSRV interaction before tagging |
+| PR-6 | `managed_memory_high_water_bytes` is engine-accounted pipeline memory, not total process RSS, and the loopback/WAN numbers are comparative on one pinned host | Historical figures cannot support absolute throughput, memory or cross-hardware claims | observe production-like RSS and rerun the multi-axis profiles on matched controlled hardware before any stability claim |

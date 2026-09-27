@@ -593,7 +593,7 @@ struct RecordedH2Request {
 struct H2CredServer {
     addr: std::net::SocketAddr,
     ca_pem: Vec<u8>,
-    requests: Arc<std::sync::Mutex<Vec<RecordedH2Request>>>
+    requests: Arc<std::sync::Mutex<Vec<RecordedH2Request>>>,
 }
 
 impl H2CredServer {
@@ -662,20 +662,25 @@ async fn start_h2_cred_server(behavior: H2CredBehavior) -> H2CredServer {
                                     .get("authorization")
                                     .and_then(|v| v.to_str().ok())
                                     .map(str::to_string);
-                                requests.lock().expect("requests lock").push(
-                                    RecordedH2Request {
+                                requests
+                                    .lock()
+                                    .expect("requests lock")
+                                    .push(RecordedH2Request {
                                         method: method.clone(),
                                         path: path.clone(),
                                         authorization: authorization.clone(),
-                                    },
-                                );
+                                    });
                                 match behavior {
-                                    H2CredBehavior::Redirect(location) => hyper::Response::builder()
-                                        .status(302)
-                                        .header("location", location)
-                                        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
-                                        .map(Ok::<_, std::convert::Infallible>)
-                                        .expect("redirect response"),
+                                    H2CredBehavior::Redirect(location) => {
+                                        hyper::Response::builder()
+                                            .status(302)
+                                            .header("location", location)
+                                            .body(http_body_util::Full::new(
+                                                hyper::body::Bytes::new(),
+                                            ))
+                                            .map(Ok::<_, std::convert::Infallible>)
+                                            .expect("redirect response")
+                                    }
                                     H2CredBehavior::Serve {
                                         content,
                                         require_authorization,
@@ -778,9 +783,7 @@ async fn h2_cross_origin_redirect_strips_authorization() {
 
     let origin_requests = origin.requests();
     assert!(
-        origin_requests
-            .iter()
-            .any(|r| r.authorization.is_some()),
+        origin_requests.iter().any(|r| r.authorization.is_some()),
         "the origin must receive the caller credentials: {origin_requests:?}"
     );
     let peer_requests = peer.requests();
@@ -827,7 +830,10 @@ async fn h2_same_origin_segmented_requests_keep_authorization() {
         .iter()
         .filter(|r| r.method == "GET" && r.path == "/file.bin")
         .collect();
-    assert!(!data_gets.is_empty(), "segmented GETs must run: {requests:?}");
+    assert!(
+        !data_gets.is_empty(),
+        "segmented GETs must run: {requests:?}"
+    );
     assert!(
         data_gets
             .iter()

@@ -28,6 +28,8 @@ struct Fingerprint {
     wasted_bytes: u64,
     retries: u64,
     segment_requests: u64,
+    /// `TransferAccounting::wire_amplification()` bits (`None` undefined).
+    amplification_bits: Option<u64>,
     /// SHA-256 of the published output file (empty when nothing published).
     output: String,
     /// Terminal classification: Ok, or the error's debug form.
@@ -46,6 +48,7 @@ fn fingerprint(
             wasted_bytes: completed.accounting.wasted_bytes,
             retries: completed.accounting.retries,
             segment_requests: completed.accounting.segment_requests,
+            amplification_bits: completed.accounting.wire_amplification().map(f64::to_bits),
             output: fixtures::file_sha256(dest),
             outcome: "Ok".into(),
         },
@@ -56,6 +59,7 @@ fn fingerprint(
             wasted_bytes: error.accounting().wasted_bytes,
             retries: error.accounting().retries,
             segment_requests: error.accounting().segment_requests,
+            amplification_bits: error.accounting().wire_amplification().map(f64::to_bits),
             output: String::new(),
             outcome: format!("{error:?}"),
         },
@@ -169,6 +173,14 @@ async fn replay_loss_is_identical_across_modes() {
         );
         assert_eq!(first.outcome, "Ok", "30% loss must still recover ({name})");
         assert!(first.retries > 0, "loss must produce retries ({name})");
+        // Task 5.1: amplification is received-once network bytes over unique
+        // output coverage — never `network + wasted`.
+        let unique = first.completed_bytes + first.reused_bytes;
+        assert_eq!(
+            first.amplification_bits,
+            Some((first.network_bytes as f64 / unique as f64).to_bits()),
+            "amplification must be received-once over unique coverage ({name})"
+        );
     }
 }
 
@@ -202,6 +214,20 @@ async fn replay_mid_body_resets_are_identical_and_bounded() {
         first.retries >= 2,
         "mid-body resets produce retries: retries={}",
         first.retries
+    );
+    assert!(
+        first.wasted_bytes > 0,
+        "failed stream prefixes are marked wasted: {first:?}"
+    );
+    // Task 5.1 regression: the retained prefixes charged to `wasted_bytes`
+    // already crossed the wire and are in `network_bytes`; adding them again
+    // reported 1.75 for this fixture. Every wire byte was received exactly
+    // once, so the corrected ratio is network / unique coverage = 1.0.
+    assert_eq!(
+        first.amplification_bits,
+        Some(1.0f64.to_bits()),
+        "received payload must be counted once (network={})",
+        first.network_bytes
     );
 }
 
@@ -252,5 +278,9 @@ async fn total_loss_fails_deterministically_with_identical_accounting() {
     assert_eq!(
         first.completed_bytes, 0,
         "nothing completes under total loss"
+    );
+    assert_eq!(
+        first.amplification_bits, None,
+        "no unique coverage means an undefined amplification"
     );
 }

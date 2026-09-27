@@ -51,6 +51,17 @@ pub struct LimitedConn {
     ingress: Option<ConnectionIngressReservation>,
 }
 
+impl std::fmt::Debug for LimitedConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The socket and ingress handles are not diagnostic; connection
+        // flags are.
+        f.debug_struct("LimitedConn")
+            .field("proxied", &self.proxied)
+            .field("alpn_h2_requested", &self.alpn_h2_requested)
+            .finish_non_exhaustive()
+    }
+}
+
 enum ConnIo {
     Plain(tokio::net::TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),

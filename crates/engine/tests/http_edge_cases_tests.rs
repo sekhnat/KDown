@@ -459,7 +459,10 @@ async fn cross_origin_get_redirect_without_probe_redirect_strips_authorization()
     fixtures::assert_bytes_exact(&output, &content);
 
     let peer_requests = peer.requests().await;
-    assert!(!peer_requests.is_empty(), "the GET redirect target must be reached");
+    assert!(
+        !peer_requests.is_empty(),
+        "the GET redirect target must be reached"
+    );
     assert!(
         peer_requests.iter().all(|r| r.method == "GET"),
         "only the transfer GET is redirected: {}",
@@ -591,7 +594,11 @@ async fn segmented_protected_resource_authenticates_every_range_get() {
     fixtures::assert_bytes_exact(&output, &content);
     let requests = server.requests().await;
     let gets: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
-    assert!(!gets.is_empty(), "segmented GETs must run: {}", describe(&requests));
+    assert!(
+        !gets.is_empty(),
+        "segmented GETs must run: {}",
+        describe(&requests)
+    );
     assert!(
         gets.iter().all(|r| saw_authorization(r)),
         "every segmented range GET must carry the configured authorization: {}",
@@ -642,10 +649,13 @@ async fn credential_provider_token_reaches_segmented_workers() {
         describe(&requests)
     );
     let gets: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
-    assert!(!gets.is_empty(), "segmented GETs must run: {}", describe(&requests));
     assert!(
-        gets
-            .iter()
+        !gets.is_empty(),
+        "segmented GETs must run: {}",
+        describe(&requests)
+    );
+    assert!(
+        gets.iter()
             .all(|r| r.header("x-api-key") == Some(PROVIDER_TOKEN)),
         "provider credentials must reach every segmented GET: {}",
         describe(&requests)
@@ -761,7 +771,9 @@ async fn caller_proxy_authorization_never_reaches_origin() {
     let requests = server.requests().await;
     assert!(!requests.is_empty());
     assert!(
-        requests.iter().all(|r| r.header("proxy-authorization").is_none()),
+        requests
+            .iter()
+            .all(|r| r.header("proxy-authorization").is_none()),
         "caller proxy credentials must never reach an origin: {}",
         describe(&requests)
     );

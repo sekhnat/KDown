@@ -90,6 +90,11 @@ pub struct EventHub {
     tx: broadcast::Sender<Event>,
     cadence: Duration,
     last_progress: std::sync::Mutex<Option<Instant>>,
+    /// Per-job terminal signal: set once the job reaches any terminal
+    /// outcome (success, failure, cancellation, or admission rejection). It
+    /// lets a subscriber end its stream even while the caller still retains
+    /// the handle — and therefore this hub's sender (§19.4, task 5.2).
+    terminal: tokio::sync::watch::Sender<bool>,
 }
 
 /// Minimum smoothed rate (B/s) below which ETA is omitted (§19.3).
@@ -99,13 +104,18 @@ impl EventHub {
     #[must_use]
     pub fn new(buffer: usize, cadence: Duration) -> (Self, EventStream) {
         let (tx, rx) = broadcast::channel(buffer.max(1));
+        let (terminal, terminal_rx) = tokio::sync::watch::channel(false);
         (
             Self {
                 tx,
                 cadence,
                 last_progress: std::sync::Mutex::new(None),
+                terminal,
             },
-            EventStream { rx },
+            EventStream {
+                rx,
+                terminal: terminal_rx,
+            },
         )
     }
 
@@ -126,11 +136,30 @@ impl EventHub {
         let _ = self.tx.send(event);
     }
 
+    /// Mark the job terminal: every current and future subscriber stream
+    /// drains its queued events and then ends instead of waiting for the
+    /// retained hub to drop (§19.4, task 5.2). Idempotent and safe from any
+    /// terminal path; a caller that keeps the [`DownloadHandle`] alive cannot
+    /// keep a subscriber blocked. The internal drop guard also closes the
+    /// stream on panic and abort paths.
+    ///
+    /// [`DownloadHandle`]: crate::DownloadHandle
+    pub fn finish(&self) {
+        let _ = self.terminal.send(true);
+    }
+
+    /// Whether the job has reached a terminal outcome.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        *self.terminal.borrow()
+    }
+
     /// Subscribe to future events (§7.3).
     #[must_use]
     pub fn subscribe(&self) -> EventStream {
         EventStream {
             rx: self.tx.subscribe(),
+            terminal: self.terminal.subscribe(),
         }
     }
 
@@ -220,24 +249,61 @@ impl EwmaRate {
 }
 
 /// Receiver side handed to callers (§7.3 `events()`).
+///
+/// The stream ends after the job's terminal signal even while the caller
+/// retains the [`DownloadHandle`] (and with it the broadcast sender): it
+/// drains everything already queued, then returns `None` (task 5.2). A
+/// lagged subscriber skips the lost events and still observes termination;
+/// the handle's snapshot and state remain the recovery path for the final
+/// outcome (§19.4).
+///
+/// [`DownloadHandle`]: crate::DownloadHandle
 #[derive(Debug)]
 pub struct EventStream {
     rx: broadcast::Receiver<Event>,
+    terminal: tokio::sync::watch::Receiver<bool>,
 }
 
 impl EventStream {
+    /// The next queued event, or `None` once the job is terminal and its
+    /// queued events are drained. Never waits on a finished job, even when
+    /// the hub sender is still alive.
     pub async fn next(&mut self) -> Option<Event> {
         loop {
-            match self.rx.recv().await {
+            // Drain whatever is already queued before considering the
+            // terminal state, so a late signal cannot drop final events.
+            match self.rx.try_recv() {
                 Ok(event) => return Some(event),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Closed) => return None,
+            }
+            if *self.terminal.borrow() {
+                return None;
+            }
+            tokio::select! {
+                received = self.rx.recv() => match received {
+                    Ok(event) => return Some(event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+                changed = self.terminal.changed() => {
+                    // The hub is gone (or finished): re-loop to drain and
+                    // then end. `changed()` returning Err means the
+                    // terminal sender was dropped, which also closes the
+                    // broadcast channel.
+                    if changed.is_err() {
+                        return None;
+                    }
+                    continue;
+                }
             }
         }
     }
 
     /// Try to collect all currently pending events without awaiting. Lagged
     /// events are skipped; the snapshot API is the recovery path (§19.4).
+    /// Returns `None` when nothing is queued — including after termination.
     pub fn try_next(&mut self) -> Option<Event> {
         loop {
             match self.rx.try_recv() {
@@ -246,6 +312,32 @@ impl EventStream {
                 Err(_) => return None,
             }
         }
+    }
+
+    /// Whether the job that owns this stream has reached a terminal
+    /// outcome. A finished stream yields `None` from [`Self::next`] once
+    /// its queue is drained.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        *self.terminal.borrow()
+    }
+}
+
+/// Marks a hub terminal when dropped, covering every exit path of the run
+/// task — success, failure, cancellation, admission rejection, panic, and
+/// task abort (task 5.2).
+#[derive(Debug)]
+pub(crate) struct TerminalGuard(SharedHub);
+
+impl TerminalGuard {
+    pub(crate) fn new(hub: SharedHub) -> Self {
+        Self(hub)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -374,5 +466,78 @@ mod tests {
             }
             other => panic!("expected progress, got {other:?}"),
         }
+    }
+
+    /// Task 5.2: a retained handle keeps the broadcast sender alive, but a
+    /// finished job must not keep a subscriber's `next()` pending forever.
+    #[tokio::test]
+    async fn stream_ends_after_terminal_signal_with_hub_retained() {
+        let (hub, mut stream) = EventHub::new(16, Duration::from_millis(50));
+        hub.emit(Event::StateChanged {
+            from: JobState::Created,
+            to: JobState::Probing,
+        })
+        .await;
+        hub.emit(Event::Failed {
+            detail: "boom".into(),
+        })
+        .await;
+        hub.finish();
+        // Queued events drain first (the terminal signal never drops them),
+        // then the stream ends even though `hub` is still alive.
+        assert!(matches!(
+            stream.next().await,
+            Some(Event::StateChanged { .. })
+        ));
+        assert!(matches!(stream.next().await, Some(Event::Failed { .. })));
+        let ended = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("a finished stream must not block");
+        assert!(ended.is_none(), "drained terminal stream returns None");
+        assert!(stream.is_finished());
+        // A subscriber created after termination also ends immediately.
+        let mut late = hub.subscribe();
+        let ended = tokio::time::timeout(Duration::from_secs(1), late.next())
+            .await
+            .expect("late subscriber must not block");
+        assert!(ended.is_none());
+        // The retained hub is still complete and usable for snapshots.
+        assert!(hub.is_finished());
+    }
+
+    /// A lagged subscriber loses events but must still observe termination.
+    #[tokio::test]
+    async fn lagged_subscriber_still_observes_termination() {
+        let (hub, mut stream) = EventHub::new(2, Duration::from_millis(10));
+        for index in 0..10 {
+            hub.emit(Event::Warning {
+                detail: format!("w{index}"),
+            })
+            .await;
+        }
+        hub.finish();
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "a lagged subscriber must still see the stream end"
+        );
+    }
+
+    /// The drop guard closes the stream on panic/abort paths too.
+    #[tokio::test]
+    async fn terminal_guard_closes_stream_on_drop() {
+        let (hub, mut stream) = EventHub::new(16, Duration::from_millis(10));
+        let shared: SharedHub = Arc::new(hub);
+        let guard = TerminalGuard::new(Arc::clone(&shared));
+        assert!(!stream.is_finished());
+        drop(guard);
+        assert!(shared.is_finished());
+        let ended = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("guard drop must end the stream");
+        assert!(ended.is_none());
     }
 }
