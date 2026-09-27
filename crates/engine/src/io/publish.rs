@@ -111,11 +111,8 @@ pub(crate) fn install_test_gate(
     mode: PublishMode,
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
-
-    eprintln!(
-        "[gate] install {} mode={mode:?}",
-        destination.display()
-    );
+) {
+    eprintln!("[gate] install {} mode={mode:?}", destination.display());
     let gate = PUBLISH_TEST_GATE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     gate.lock()
         .expect("publish test gate lock")
@@ -139,10 +136,7 @@ fn wait_at_test_gate(destination: &Path, mode: PublishMode) {
     };
     match matching {
         Some(gate) => {
-            eprintln!(
-                "[gate] entered {} mode={mode:?}",
-                destination.display()
-            );
+            eprintln!("[gate] entered {} mode={mode:?}", destination.display());
             let _ = gate.entered.send(());
             // Bounded so a broken path cannot hang the suite, but generous
             // enough that a starved CI runtime (parallel sync-blocking fixtures)
@@ -156,10 +150,7 @@ fn wait_at_test_gate(destination: &Path, mode: PublishMode) {
                 destination.display()
             );
         }
-        None => eprintln!(
-            "[gate] miss {} mode={mode:?}",
-            destination.display()
-        ),
+        None => eprintln!("[gate] miss {} mode={mode:?}", destination.display()),
     }
 }
 
