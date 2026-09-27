@@ -34,6 +34,8 @@ jobs:
       # libFuzzer accepts an integer seed; the run number plus target and commit
       # is recorded so a minimized failure can be replayed exactly.
       FUZZ_SEED: ${{ github.run_number }}
+      # The repository toolchain file pins stable; cargo-fuzz's sanitizer flags require nightly.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
