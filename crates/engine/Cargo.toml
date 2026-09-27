@@ -106,6 +106,10 @@ name = "test_server_integration"
 path = "tests/test_server_integration.rs"
 
 [[test]]
+name = "network_conditions_tests"
+path = "tests/network_conditions_tests.rs"
+
+[[test]]
 name = "wire_amplification_tests"
 path = "tests/wire_amplification_tests.rs"
 

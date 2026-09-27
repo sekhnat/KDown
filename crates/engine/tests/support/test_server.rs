@@ -183,6 +183,76 @@ struct ServerState {
     /// Connection ordinal source (task 5.2): each accepted TCP connection
     /// gets the next id, so handlers can tell connections apart.
     conn_seq: std::sync::atomic::AtomicU64,
+    /// Deterministic network conditions (task 4.1), when configured.
+    network: Option<NetworkConditions>,
+    /// Global response ordinal: jitter and loss draws key off this so a
+    /// replay is stable even when connection counts differ.
+    response_seq: std::sync::atomic::AtomicU64,
+}
+
+/// Deterministic network-condition controls (task 4.1): latency, seeded
+/// jitter, seeded connection loss, bandwidth pacing and scripted mid-body
+/// resets, applied by the server itself so a replay of the same seed
+/// yields the same wire behavior.
+///
+/// Jitter and loss decisions are drawn per RESPONSE ordinal (a global
+/// counter across the server), not per connection: the engine's connection
+/// count is not a replay-stable quantity, but the request order is, so
+/// seeding on the response ordinal keeps replays byte-identical even when
+/// pooling opens a different number of sockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkConditions {
+    /// Seed for jitter and loss draws; recorded for replay.
+    pub seed: u64,
+    /// Fixed delay before each response head.
+    pub latency: std::time::Duration,
+    /// Uniform `0..=jitter_ms` extra delay per response (seeded).
+    pub jitter_ms: u64,
+    /// Per-response drop chance in permille (0..=1000, seeded): the
+    /// connection is accepted, the request read, and then dropped WITHOUT
+    /// a response (the client sees a connection error).
+    pub loss_permille: u16,
+    /// Body pacing in bytes per second (0 = unbounded): the body is
+    /// written in 16 KiB slices with proportional sleeps.
+    pub bandwidth_bytes_per_s: u64,
+    /// The first N responses (by global ordinal) hard-reset after half
+    /// their body: models a server that dies mid-body a few times and then
+    /// recovers, deterministically.
+    pub reset_first_responses: u64,
+}
+
+impl NetworkConditions {
+    /// A human-readable description embedding the seed, for test output
+    /// and failure replays.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "seed={} latency={:?} jitter_ms={} loss_permille={} bandwidth={} reset_first={}",
+            self.seed,
+            self.latency,
+            self.jitter_ms,
+            self.loss_permille,
+            self.bandwidth_bytes_per_s,
+            self.reset_first_responses
+        )
+    }
+
+    /// Seeded draw in `0..=modulus - 1` for the response ordinal.
+    fn draw(seed: u64, ordinal: u64, modulus: u64) -> u64 {
+        if modulus == 0 {
+            return 0;
+        }
+        // xorshift64 keyed by (seed, ordinal) — same family as
+        // `fixtures::deterministic_bytes`, deterministic across runs.
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(ordinal.wrapping_mul(0x517C_C1B7_2722_0A95))
+            | 1;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % modulus
+    }
 }
 
 /// Builder for a deterministic scripted HTTP server.
@@ -191,6 +261,7 @@ pub struct TestServer {
     handlers: HashMap<String, Handler>,
     scripts: Vec<(String, u32, ScriptedResponse)>,
     default_headers: HashMap<String, ExtraHeaders>,
+    network: Option<NetworkConditions>,
 }
 
 impl TestServer {
@@ -214,6 +285,13 @@ impl TestServer {
         handler: impl Fn(&RequestInfo) -> ScriptedResponse + Send + Sync + 'static,
     ) -> Self {
         self.handlers.insert(path.to_string(), Arc::new(handler));
+        self
+    }
+
+    /// Apply deterministic network conditions to every response (task 4.1).
+    #[must_use]
+    pub fn network(mut self, conditions: NetworkConditions) -> Self {
+        self.network = Some(conditions);
         self
     }
 
@@ -286,6 +364,8 @@ impl TestServer {
             requests: Mutex::new(Vec::new()),
             emitted: std::sync::atomic::AtomicU64::new(0),
             conn_seq: std::sync::atomic::AtomicU64::new(0),
+            network: self.network,
+            response_seq: std::sync::atomic::AtomicU64::new(0),
         });
         let loop_state = state.clone();
         tokio::spawn(async move {
@@ -474,10 +554,47 @@ async fn serve_conn(
             }
         }
 
-        if let Some(delay) = resp.header_delay {
+        // Network conditions (task 4.1): the ordinal is global across the
+        // server, so replays are stable across differing connection counts.
+        let ordinal = state.response_seq.fetch_add(1, Ordering::SeqCst);
+        if let Some(conditions) = state.network {
+            let lost = NetworkConditions::draw(conditions.seed, ordinal.wrapping_mul(2), 1000_u64)
+                < u64::from(conditions.loss_permille);
+            if lost {
+                // Accept + read + drop: the client observes a connection
+                // error (a deterministic "loss" event).
+                return Ok(());
+            }
+            let jitter = NetworkConditions::draw(
+                conditions.seed,
+                ordinal.wrapping_mul(2).wrapping_add(1),
+                conditions.jitter_ms.max(1),
+            );
+            let mut delay = conditions.latency;
+            delay += std::time::Duration::from_millis(jitter);
+            if let Some(base) = resp.header_delay {
+                delay += base;
+            }
+            tokio::time::sleep(delay).await;
+        } else if let Some(delay) = resp.header_delay {
             tokio::time::sleep(delay).await;
         }
-        write_response(&mut writer, &resp, &method, &state.emitted).await?;
+        let paced = state.network.map(|c| c.bandwidth_bytes_per_s).unwrap_or(0);
+        // Conditions-level mid-body reset: trim `resp` itself so the write
+        // AND the abrupt-close check below both see the cut.
+        if state
+            .network
+            .is_some_and(|c| ordinal < c.reset_first_responses)
+        {
+            let len: usize = if resp.omit_content_length {
+                resp.sparse_len.unwrap_or(0) as usize
+            } else {
+                resp.body.len()
+            };
+            let scripted_cut = resp.reset_after.unwrap_or(usize::MAX);
+            resp.reset_after = Some((len / 2).min(scripted_cut));
+        }
+        write_response(&mut writer, &resp, &method, &state.emitted, paced).await?;
         if resp.reset_after.is_some() {
             // Abrupt reset: close without clean shutdown.
             return Ok(());
@@ -490,6 +607,7 @@ async fn write_response(
     resp: &ScriptedResponse,
     method: &str,
     emitted: &std::sync::atomic::AtomicU64,
+    paced_bytes_per_s: u64,
 ) -> std::io::Result<()> {
     let reason = match resp.status {
         200 => "OK",
@@ -578,6 +696,9 @@ async fn write_response(
             if let Some(delay) = resp.chunk_delay {
                 writer.flush().await?;
                 tokio::time::sleep(delay).await;
+            } else if paced_bytes_per_s > 0 {
+                writer.flush().await?;
+                pace_slice(n, paced_bytes_per_s).await;
             }
             off += n;
         }
@@ -598,10 +719,33 @@ async fn write_response(
                 tokio::time::sleep(delay).await;
             }
         }
+        _ if paced_bytes_per_s > 0 && !bytes.is_empty() => {
+            for chunk in bytes.chunks(16 * 1024) {
+                writer.write_all(chunk).await?;
+                emitted.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                writer.flush().await?;
+                pace_slice(chunk.len() as u64, paced_bytes_per_s).await;
+            }
+        }
         _ => {
             writer.write_all(bytes).await?;
             emitted.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     writer.flush().await
+}
+
+/// Sleep for the time `bytes` would take at `bytes_per_s` (pacing, task
+/// 4.1); one millisecond minimum so a paced transfer cannot complete
+/// faster than its bandwidth allows.
+async fn pace_slice(bytes: u64, bytes_per_s: u64) {
+    if bytes == 0 || bytes_per_s == 0 {
+        return;
+    }
+    let micros = bytes
+        .wrapping_mul(1_000_000)
+        .checked_div(bytes_per_s)
+        .unwrap_or(0)
+        .max(1_000);
+    tokio::time::sleep(std::time::Duration::from_micros(micros)).await;
 }
