@@ -135,9 +135,13 @@ fn wait_at_test_gate(destination: &Path, mode: PublishMode) {
     };
     if let Some(gate) = matching {
         let _ = gate.entered.send(());
+        // Bounded so a broken path cannot hang the suite, but generous
+        // enough that a starved CI runtime (parallel sync-blocking fixtures)
+        // does not drop the receiver while the test is still waiting to
+        // release the commit (task 7.1 flake hardening).
         let _ = gate
             .release
-            .recv_timeout(std::time::Duration::from_secs(30));
+            .recv_timeout(std::time::Duration::from_secs(120));
     }
 }
 

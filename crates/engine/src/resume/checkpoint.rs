@@ -542,11 +542,18 @@ mod tests {
         let err = cp.verify_local_binding(&temp).expect_err("digest mismatch");
         assert!(err.contains("digest"), "{err}");
 
-        // Replacement object: the identity catches it even with the same
-        // length.
-        std::fs::remove_file(&temp).expect("remove");
-        std::fs::write(&temp, b"verified-bytes").expect("replant");
-        let err = cp
+        // A genuinely different object is caught by the stored identity.
+        // The check cannot rely on a same-directory delete/recreate handing
+        // out a new inode: filesystems may legally reuse the freed inode, so
+        // a fabricated different identity proves the identity branch
+        // deterministically (real replacement races are covered by the
+        // publication integration fixtures).
+        let mut replaced = cp.clone();
+        replaced.owned_temp_identity = Some(format!(
+            "{}|different",
+            cp.owned_temp_identity.as_deref().expect("identity")
+        ));
+        let err = replaced
             .verify_local_binding(&temp)
             .expect_err("identity mismatch");
         assert!(err.contains("identity"), "{err}");
