@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use kdown_engine::config::{DurabilityMode, EngineConfig, TransferPolicy};
 use kdown_engine::control::auth::{provider_fn, Challenge, CredentialDecision};
 use kdown_engine::control::CancellationToken;
@@ -16,14 +17,8 @@ use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::{HttpExecution, HttpFailure};
-use kdown_engine::job::controller::{
-    DownloadController, DownloadHandle, DownloadRequest, ResultStatus,
-};
+use kdown_engine::job::controller::{DownloadController, DownloadHandle, DownloadRequest};
 use kdown_engine::DownloadError;
-use support::fixtures::{assert_bytes_exact, deterministic_bytes};
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn cfg(threshold: u64) -> EngineConfig {
     let mut c = EngineConfig {
@@ -76,8 +71,7 @@ async fn scripted_sequential_success_exact_bytes() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.total_size, Some(300));
+    assert_eq!(result.accounting.total_size, Some(300));
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("out.bin.part").exists(), "no residue");
     scripted.assert_all_consumed();
@@ -100,7 +94,7 @@ async fn scripted_probe_retry_then_success() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg(u64::MAX));
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/retry.bin",
             dir.path().join("retry.bin"),
@@ -108,7 +102,6 @@ async fn scripted_probe_retry_then_success() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     let log = scripted.request_log();
     assert_eq!(log.len(), 3, "two probes + one transfer");
     scripted.assert_all_consumed();
@@ -158,9 +151,8 @@ async fn scripted_probe_challenge_consults_provider_once() {
     let mut req = DownloadRequest::new("https://scripted/auth.bin", dir.path().join("auth.bin"));
     req.credential_provider = Some(Arc::from(provider));
 
-    let result = c.run(req).await.expect("terminal");
+    let _ = c.run(req).await.expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "one provider stage");
     scripted.assert_all_consumed();
 }
@@ -194,7 +186,7 @@ async fn scripted_broken_advertised_ranges_fall_back_sequential() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg(128));
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/liar.bin",
             dir.path().join("liar.bin"),
@@ -202,7 +194,6 @@ async fn scripted_broken_advertised_ranges_fall_back_sequential() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("liar.bin")).expect("read"),
         &content,
@@ -232,7 +223,7 @@ async fn scripted_retryable_status_with_retry_after() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg(u64::MAX));
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/limited.bin",
             dir.path().join("limited.bin"),
@@ -240,7 +231,6 @@ async fn scripted_retryable_status_with_retry_after() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("limited.bin")).expect("read"),
         &content,
@@ -281,12 +271,11 @@ async fn scripted_auth_retry_limit_is_bounded() {
     let mut req = DownloadRequest::new("https://scripted/loop.bin", dir.path().join("loop.bin"));
     req.credential_provider = Some(Arc::from(provider));
 
-    let result = c.run(req).await.expect("terminal");
+    let result = c.run(req).await.expect_err("terminal");
 
-    assert_eq!(result.status, ResultStatus::Failed);
     assert_eq!(
-        result.error.as_ref().map(DownloadError::category),
-        Some(ErrorCategory::AuthenticationRequired),
+        result.category(),
+        ErrorCategory::AuthenticationRequired,
         "{result:?}"
     );
     assert_eq!(
@@ -319,7 +308,7 @@ async fn scripted_body_fault_after_prefix_retries_from_durable_prefix() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg(u64::MAX));
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/flaky.bin",
             dir.path().join("flaky.bin"),
@@ -327,7 +316,6 @@ async fn scripted_body_fault_after_prefix_retries_from_durable_prefix() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("flaky.bin")).expect("read"),
         &content,
@@ -361,12 +349,11 @@ async fn scripted_generation_change_fails_structured() {
             dir.path().join("gen.bin"),
         ))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
 
-    assert_eq!(result.status, ResultStatus::Failed);
     assert_eq!(
-        result.error.as_ref().map(|e| e.category()),
-        Some(ErrorCategory::ResourceChanged),
+        result.category(),
+        ErrorCategory::ResourceChanged,
         "{result:?}"
     );
     scripted.assert_all_consumed();
@@ -400,7 +387,7 @@ async fn scripted_cancellation_interrupts_pending_body_read() {
 async fn cancel_and_assert(
     handle: &DownloadHandle,
     join: tokio::task::JoinHandle<
-        Result<kdown_engine::job::controller::DownloadResult, DownloadError>,
+        Result<kdown_engine::error::CompletedDownload, kdown_engine::error::DownloadRunError>,
     >,
     started: std::time::Instant,
 ) {
@@ -409,9 +396,11 @@ async fn cancel_and_assert(
         .await
         .expect("no hang: cancellation interrupts the pending read")
         .expect("join")
-        .expect("terminal result");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
-    assert!(matches!(result.error, Some(DownloadError::Cancelled)));
+        .expect_err("terminal result");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "cancellation converged promptly"
@@ -445,12 +434,11 @@ async fn scripted_pause_then_resume_delivers_byte_exact() {
     // Give the controller a bounded moment to observe the pause, then
     // resume; delivery continues from the same owned source.
     handle.resume_now();
-    let result = tokio::time::timeout(Duration::from_secs(5), join)
+    let _ = tokio::time::timeout(Duration::from_secs(5), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("pause.bin")).expect("read"),
         &content,
@@ -506,8 +494,7 @@ async fn scripted_segmented_multi_worker_covers_file() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.total_size, Some(4000));
+    assert_eq!(result.accounting.total_size, Some(4000));
     assert_bytes_exact(
         &std::fs::read(dir.path().join("seg.bin")).expect("read"),
         &content,
@@ -565,7 +552,7 @@ async fn scripted_segmented_429_coordinates_origin_backoff() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg);
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/coord.bin",
             dir.path().join("coord.bin"),
@@ -573,7 +560,6 @@ async fn scripted_segmented_429_coordinates_origin_backoff() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("coord.bin")).expect("read"),
         &content,
@@ -612,11 +598,13 @@ async fn scripted_segmented_retry_exhaustion() {
             dir.path().join("exhaust.bin"),
         ))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
 
-    assert_eq!(result.status, ResultStatus::Failed);
     assert!(
-        matches!(result.error, Some(DownloadError::RetryExhausted { .. })),
+        matches!(
+            result.as_engine_error(),
+            Some(DownloadError::RetryExhausted { .. })
+        ),
         "structured exhaustion: {result:?}"
     );
     scripted.assert_all_consumed();
@@ -661,7 +649,7 @@ async fn scripted_segmented_tail_retry_resumes_from_durable_prefix() {
     let dir = tempfile::tempdir().expect("tmp");
     let c = scripted_controller(&scripted, cfg);
 
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/tail.bin",
             dir.path().join("tail.bin"),
@@ -669,7 +657,6 @@ async fn scripted_segmented_tail_retry_resumes_from_durable_prefix() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(
         &std::fs::read(dir.path().join("tail.bin")).expect("read"),
         &content,
@@ -710,12 +697,11 @@ async fn scripted_segmented_validator_change_invalidates_whole_job() {
             dir.path().join("genchange.bin"),
         ))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
 
-    assert_eq!(result.status, ResultStatus::Failed);
     assert_eq!(
-        result.error.as_ref().map(|e| e.category()),
-        Some(ErrorCategory::ResourceChanged),
+        result.category(),
+        ErrorCategory::ResourceChanged,
         "{result:?}"
     );
     // No output committed from mixed generations.
@@ -769,12 +755,11 @@ async fn scripted_invalid_ranged_resume_fails_before_body() {
     let result = c
         .run(DownloadRequest::new(dest_url, dest.clone()))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
 
-    assert_eq!(result.status, ResultStatus::Failed);
     assert_eq!(
-        result.error.as_ref().map(DownloadError::category),
-        Some(ErrorCategory::InvalidRangeResponse),
+        result.category(),
+        ErrorCategory::InvalidRangeResponse,
         "{result:?}"
     );
     // Only the tail was requested — the committed prefix is never

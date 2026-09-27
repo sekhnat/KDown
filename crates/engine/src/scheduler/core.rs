@@ -8,6 +8,9 @@
 //! one short-lived lock per acquire/report/complete/fail — never per chunk
 //! (§13.3).
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,6 +322,7 @@ impl SegmentScheduler {
     }
 
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn total_size(&self) -> u64 {
         self.total_size
     }

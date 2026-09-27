@@ -1,0 +1,27 @@
+error[E0432]: unresolved import `kdown_engine::job::controller::DownloadResult`
+ --> tests/ui/retired_seam/download_result_is_removed.rs:3:5
+  |
+3 | use kdown_engine::job::controller::DownloadResult;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^--------------
+  |                                    |
+  |                                    no `DownloadResult` in `job::controller`
+  |
+help: a similar name exists in the module
+  |
+3 - use kdown_engine::job::controller::DownloadResult;
+3 + use kdown_engine::job::controller::DownloadRequest;
+  |
+
+error[E0603]: module `job` is private
+ --> tests/ui/retired_seam/download_result_is_removed.rs:3:19
+  |
+3 | use kdown_engine::job::controller::DownloadResult;
+  |                   ^^^  ---------- module `controller` is not publicly re-exported
+  |                   |
+  |                   private module
+  |
+note: the module `job` is defined here
+ --> src/lib.rs
+  |
+  | mod job;
+  | ^^^^^^^

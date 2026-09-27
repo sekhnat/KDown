@@ -3,23 +3,20 @@
 //! evidence for resolver selection, lifecycle-wide adapter use, mutation
 //! ordering, and observable save/delete failure semantics.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use super::support::checkpoint::ScriptedCheckpointStore;
+use super::support::fixtures::deterministic_bytes;
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::validators::ResourceValidators;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{
-    CancelMode, DownloadController, DownloadRequest, ResultStatus,
-};
+use kdown_engine::job::controller::{CancelMode, DownloadController, DownloadRequest};
 use kdown_engine::job::JobState;
 use kdown_engine::metrics::events::Event;
 use kdown_engine::resume::checkpoint::Checkpoint;
@@ -28,8 +25,6 @@ use kdown_engine::resume::checkpoint_store::{
 };
 use kdown_engine::resume::{Checkpoint as EngineCheckpoint, CheckpointError, DurabilityMode};
 use kdown_engine::DownloadError;
-use support::checkpoint::ScriptedCheckpointStore;
-use support::fixtures::deterministic_bytes;
 
 fn sample(job: &str, end: u64) -> Checkpoint {
     let mut cp = Checkpoint::new(job, "https://example/f", "tmp-1");
@@ -282,22 +277,20 @@ async fn resolver_resolves_once_per_job_with_destination_context() {
     std::fs::create_dir_all(dest_a.parent().expect("parent a")).expect("mkdir a");
     std::fs::create_dir_all(dest_b.parent().expect("parent b")).expect("mkdir b");
 
-    let result_a = controller
+    let _ = controller
         .run(DownloadRequest::new(
             "https://scripted/one.bin",
             dest_a.clone(),
         ))
         .await
         .expect("terminal a");
-    assert_eq!(result_a.status, ResultStatus::Completed, "{result_a:?}");
-    let result_b = controller
+    let _ = controller
         .run(DownloadRequest::new(
             "https://scripted/two.bin",
             dest_b.clone(),
         ))
         .await
         .expect("terminal b");
-    assert_eq!(result_b.status, ResultStatus::Completed, "{result_b:?}");
 
     // Exactly one resolution per job.
     let contexts = resolver.contexts();
@@ -337,11 +330,10 @@ async fn resolution_failure_fails_job_before_probing() {
     let result = controller
         .run(DownloadRequest::new("https://scripted/x.bin", dest))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "checkpoint-category failure: {result:?}"
@@ -374,6 +366,7 @@ async fn existing_construction_paths_remain_compatible() {
         HttpExecution::from_adapter(scripted),
         config.clone(),
         kdown_engine::EngineMetrics::shared(),
+        kdown_engine::__internal_ledger_for_test(&config),
     );
 
     // Injection chains from an existing constructor and the job completes
@@ -386,11 +379,10 @@ async fn existing_construction_paths_remain_compatible() {
             .with_checkpoint_resolver(resolver.clone());
     let dir = tempfile::tempdir().expect("tmp");
     let dest: PathBuf = dir.path().join("out.bin");
-    let result = controller
+    let _ = controller
         .run(DownloadRequest::new("https://scripted/compat.bin", dest))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_eq!(store.counts(), (1, 0, 1), "adapter served the job");
     assert!(!dir.path().join("out.bin.kdown").exists(), "no sidecar");
 }
@@ -462,8 +454,11 @@ async fn custom_adapter_serves_load_save_delete_without_sidecar() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     // Exact custom-adapter ordering: admission load, pause save, cleanup
     // delete — no file-sidecar fallback anywhere in the lifecycle.
     let ops = store.ops();
@@ -514,17 +509,15 @@ async fn pause_save_failure_fails_job_and_preserves_partial_output() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
+        .expect_err("terminal");
     // Structured checkpoint failure: no Paused success, no commit.
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "checkpoint-category failure: {result:?}"
     );
-    assert!(result.final_path.is_none(), "no committed output");
     // Consistent partial output preserved for diagnosis/recovery (§14.5).
     let temp = dir.path().join("out.bin.part");
     assert!(temp.exists(), "partial output preserved");
@@ -557,16 +550,14 @@ async fn cadence_save_failure_fails_job_and_preserves_partial_output() {
     )
     .await
     .expect("no hang")
-    .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+    .expect_err("terminal");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "checkpoint-category failure: {result:?}"
     );
-    assert!(result.final_path.is_none());
     let temp = dir.path().join("out.bin.part");
     assert!(temp.exists(), "partial output preserved");
     assert!(!dest.exists(), "no commit after cadence save failure");
@@ -604,16 +595,15 @@ async fn resume_refresh_save_failure_preserves_previous_checkpoint() {
             dest.clone(),
         ))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "checkpoint-category failure: {result:?}"
     );
-    assert!(result.final_path.is_none(), "no commit");
+
     // The previous checkpoint is untouched (no delete, no overwrite).
     let kept = store.stored(&identity).expect("previous checkpoint kept");
     assert_eq!(kept.completed_ranges, vec![(0, 4)]);
@@ -671,16 +661,16 @@ async fn post_commit_delete_failure_retains_completed_with_warning() {
         "delete precedes terminal state"
     );
     // The committed outcome is preserved (§9.2, §14.6 exception).
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_eq!(handle.state(), JobState::Completed);
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(result.final_path, dest);
     assert!(
         result
+            .accounting
             .warnings
             .iter()
             .any(|w| w.contains("checkpoint cleanup incomplete")),
         "warning in terminal result: {:?}",
-        result.warnings
+        result.accounting.warnings
     );
     // The warning is visible as an event too.
     let mut completion_events = Vec::new();
@@ -725,15 +715,19 @@ async fn cancellation_delete_failure_retains_cancelled_with_warning() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     assert!(
         result
+            .accounting()
             .warnings
             .iter()
             .any(|w| w.contains("checkpoint cleanup incomplete")),
         "warning in terminal result: {:?}",
-        result.warnings
+        result.accounting().warnings
     );
     let mut saw_warning = false;
     while let Some(event) = events.try_next() {
@@ -780,12 +774,15 @@ async fn keep_partial_cancellation_does_not_delete_checkpoint() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
     assert!(
-        result.warnings.is_empty(),
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
+    assert!(
+        result.accounting().warnings.is_empty(),
         "no cleanup warnings without deletion: {:?}",
-        result.warnings
+        result.accounting().warnings
     );
     // KeepPartial preserves the checkpoint: no delete crosses the adapter.
     assert_eq!(store.counts(), (1, 1, 0), "ops: {:?}", store.ops());
@@ -822,15 +819,19 @@ async fn keep_file_discard_checkpoint_delete_failure_warns() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     assert!(
         result
+            .accounting()
             .warnings
             .iter()
             .any(|w| w.contains("checkpoint cleanup incomplete")),
         "warning: {:?}",
-        result.warnings
+        result.accounting().warnings
     );
     assert_eq!(store.counts(), (1, 0, 1), "delete attempted once");
     scripted.assert_all_consumed();
@@ -854,11 +855,10 @@ async fn admission_delete_failure_remains_fail_closed() {
     let result = controller
         .run(DownloadRequest::new("https://scripted/admission.bin", dest))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "fail-closed admission cleanup: {result:?}"
@@ -998,8 +998,11 @@ async fn segmented_pause_persists_absorbed_snapshot_monotonically() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     let saves = recorded_saves(&store);
     assert!(!saves.is_empty(), "pause persisted a snapshot: {saves:?}");
     // Accepted progress never regresses: each recorded save covers at
@@ -1061,16 +1064,15 @@ async fn segmented_save_failure_converges_workers_to_failed() {
         .await
         .expect("no hang (workers converged)")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             DownloadError::Checkpoint(_)
         ),
         "checkpoint-category failure: {result:?}"
     );
-    assert!(result.final_path.is_none(), "no commit");
+
     assert!(
         dir.path().join("seg.bin.part").exists(),
         "partial output preserved"
@@ -1134,16 +1136,16 @@ async fn segmented_post_commit_delete_failure_retains_completed() {
         "delete precedes terminal state"
     );
     // Completed is retained after the irreversible commit (§9.2, §14.6).
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_eq!(handle.state(), JobState::Completed);
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(result.final_path, dest);
     assert!(
         result
+            .accounting
             .warnings
             .iter()
             .any(|w| w.contains("checkpoint cleanup incomplete")),
         "warning: {:?}",
-        result.warnings
+        result.accounting.warnings
     );
     let mut completion_events = Vec::new();
     while let Some(event) = events.try_next() {
@@ -1193,16 +1195,20 @@ async fn segmented_cancellation_delete_failure_retains_cancelled() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
+        .expect_err("terminal");
     // Cancelled is preserved; the failed delete surfaces as a warning.
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     assert!(
         result
+            .accounting()
             .warnings
             .iter()
             .any(|w| w.contains("checkpoint cleanup incomplete")),
         "warning: {:?}",
-        result.warnings
+        result.accounting().warnings
     );
     let ops = store.ops();
     assert!(
@@ -1245,9 +1251,16 @@ async fn segmented_keep_partial_cancellation_preserves_checkpoint() {
         .await
         .expect("no hang")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
-    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
+    assert!(
+        result.accounting().warnings.is_empty(),
+        "{:?}",
+        result.accounting().warnings
+    );
     // KeepPartial: temp file and checkpoint both preserved, no delete.
     assert!(dir.path().join("seg.bin.part").exists());
     assert!(
@@ -1333,10 +1346,9 @@ async fn sequential_resume_cadence_and_commit_use_one_adapter() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(result.final_path, dest);
     assert!(
-        result.bytes_reused_from_checkpoint > 0,
+        result.accounting.bytes_reused_from_checkpoint > 0,
         "resume admission reused the persisted prefix: {result:?}"
     );
     // Every checkpoint operation crossed the one adapter, in order:
@@ -1413,10 +1425,9 @@ async fn segmented_resume_cadence_and_commit_use_one_adapter() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(result.final_path, dest);
     assert_eq!(
-        result.bytes_reused_from_checkpoint, 1000,
+        result.accounting.bytes_reused_from_checkpoint, 1000,
         "segmented admission reused every admitted range"
     );
     let ops = store.ops();

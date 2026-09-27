@@ -263,6 +263,223 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Minimum feasible checkpoint allowance: the serialized state of a
+/// minimal checkpoint (identity, URL, validators, empty ranges) must fit.
+pub(crate) const MIN_CHECKPOINT_BYTES: u64 = 256;
+
+/// End-to-end transfer-pipeline memory budget (design D3, task 3.1).
+///
+/// Per-job and engine-wide aggregate caps over every memory stage the
+/// engine accounts: network/client ingress, held/queued frames, writer-held
+/// bytes, and checkpoint state — across concurrent jobs, with each `Bytes`
+/// payload charged exactly once as ownership moves through the pipeline.
+///
+/// This bounds the ACCOUNTED pipeline memory. It is distinct from total
+/// process RSS and from operating-system socket/kernel memory, which stay
+/// outside the guarantee (see `docs/benchmark-profiling.md`).
+///
+/// Invalid budgets fail [`EngineConfig::validate`] before any network
+/// activity. The existing [`WriteBudgetConfig`] and
+/// [`WriteExecutorConfig`] caps become subordinate to these limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferMemoryConfig {
+    /// Engine-wide aggregate cap: every accounted component of every
+    /// concurrent job sums into this ceiling.
+    pub aggregate_max_bytes: u64,
+    /// Per-job cap across all components of one download.
+    pub job_max_bytes: u64,
+    /// Network/client ingress: HTTP client read buffers, header metadata,
+    /// and flow-control windows the engine admits before frame ownership.
+    pub network_ingress_max_bytes: u64,
+    /// Held/queued frames: owned payload chunks moving from ingress
+    /// toward the writer.
+    pub frames_max_bytes: u64,
+    /// Writer-held bytes: queued and in-flight writes (subsumes the
+    /// legacy `write_budget` caps).
+    pub writer_max_bytes: u64,
+    /// Checkpoint state: in-memory range metadata plus the serialized
+    /// checkpoint a save may hold. Must admit at least one minimal
+    /// checkpoint (`MIN_CHECKPOINT_BYTES`).
+    pub checkpoint_max_bytes: u64,
+}
+
+impl Default for TransferMemoryConfig {
+    fn default() -> Self {
+        Self {
+            aggregate_max_bytes: 64 * 1024 * 1024,
+            job_max_bytes: 8 * 1024 * 1024,
+            network_ingress_max_bytes: 1024 * 1024,
+            frames_max_bytes: 2 * 1024 * 1024,
+            writer_max_bytes: 2 * 1024 * 1024,
+            checkpoint_max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl TransferMemoryConfig {
+    /// Worst-case buffered-ingress footprint of ONE transport connection
+    /// (design D3, task 3.3): the bounded ingress window (or HTTP/1 read
+    /// buffer, the smaller bound here) plus the response-header metadata
+    /// allowance. `read_buffer_size` in bytes.
+    ///
+    /// The engine reserves `max_connections_total` of these out of the
+    /// aggregate cap at ledger construction — the maximum connection
+    /// footprint is known and accounted BEFORE any connection exists.
+    #[must_use]
+    pub fn connection_ingress_footprint(&self, read_buffer_size: u32) -> u64 {
+        const INGRESS_WINDOW_CAP: u64 = 128 * 1024;
+        const MAX_HEADER_LIST_BYTES: u64 = 64 * 1024;
+        let frame = u64::from(read_buffer_size);
+        let window = INGRESS_WINDOW_CAP.min(self.network_ingress_max_bytes);
+        let buffer = frame.min(self.network_ingress_max_bytes);
+        let header = MAX_HEADER_LIST_BYTES.min(self.network_ingress_max_bytes);
+        (window.max(buffer)) + header
+    }
+
+    /// The engine-wide connection-ingress carve-out (task 3.8):
+    /// `max_connections_total` worst-case connection footprints, taken
+    /// from the aggregate cap at ledger construction so the pipeline can
+    /// never be starved by long-lived connections.
+    #[must_use]
+    pub fn connection_ingress_reserve(
+        &self,
+        read_buffer_size: u32,
+        max_connections_total: u32,
+    ) -> u64 {
+        self.connection_ingress_footprint(read_buffer_size)
+            .saturating_mul(u64::from(max_connections_total))
+    }
+
+    /// Validate the budget set (design D3): no zero caps, no contradictory
+    /// nesting, minimum feasible frame/checkpoint sizes, subordination of
+    /// the legacy write budgets, and headroom against accounting overflow.
+    ///
+    /// # Errors
+    /// Returns a [`ConfigurationError`] naming the first violated field.
+    pub(crate) fn validate(&self, engine: &EngineConfig) -> Result<(), ConfigurationError> {
+        for (field, value) in [
+            (
+                "transfer_memory.aggregate_max_bytes",
+                self.aggregate_max_bytes,
+            ),
+            ("transfer_memory.job_max_bytes", self.job_max_bytes),
+            (
+                "transfer_memory.network_ingress_max_bytes",
+                self.network_ingress_max_bytes,
+            ),
+            ("transfer_memory.frames_max_bytes", self.frames_max_bytes),
+            ("transfer_memory.writer_max_bytes", self.writer_max_bytes),
+            (
+                "transfer_memory.checkpoint_max_bytes",
+                self.checkpoint_max_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(invalid(field, "must be greater than zero"));
+            }
+        }
+        // Contradictory nesting: every component fits its job, the job
+        // fits the aggregate.
+        for (field, value) in [
+            (
+                "transfer_memory.network_ingress_max_bytes",
+                self.network_ingress_max_bytes,
+            ),
+            ("transfer_memory.frames_max_bytes", self.frames_max_bytes),
+            ("transfer_memory.writer_max_bytes", self.writer_max_bytes),
+            (
+                "transfer_memory.checkpoint_max_bytes",
+                self.checkpoint_max_bytes,
+            ),
+        ] {
+            if value > self.job_max_bytes {
+                return Err(invalid(field, "must be <= transfer_memory.job_max_bytes"));
+            }
+        }
+        if self.job_max_bytes > self.aggregate_max_bytes {
+            return Err(invalid(
+                "transfer_memory.job_max_bytes",
+                "must be <= transfer_memory.aggregate_max_bytes",
+            ));
+        }
+        // Minimum feasible sizes: at least one frame quantum of ingress
+        // and one owned frame; at least one minimal checkpoint.
+        let frame = u64::from(engine.read_buffer_size);
+        if frame > self.network_ingress_max_bytes {
+            return Err(invalid(
+                "transfer_memory.network_ingress_max_bytes",
+                "must be >= read_buffer_size (one ingress frame)",
+            ));
+        }
+        if frame > self.frames_max_bytes {
+            return Err(invalid(
+                "transfer_memory.frames_max_bytes",
+                "must be >= read_buffer_size (one owned frame)",
+            ));
+        }
+        if self.checkpoint_max_bytes < MIN_CHECKPOINT_BYTES {
+            return Err(invalid(
+                "transfer_memory.checkpoint_max_bytes",
+                "must admit one minimal serialized checkpoint",
+            ));
+        }
+        // Overflow headroom: the ledger sums outstanding bytes across
+        // components and jobs with saturating arithmetic; a cap of
+        // `u64::MAX` would make the total indistinguishable from overflow.
+        if self.aggregate_max_bytes == u64::MAX {
+            return Err(invalid(
+                "transfer_memory.aggregate_max_bytes",
+                "must leave headroom below u64::MAX for accounting",
+            ));
+        }
+        // Connection-ingress carve-out (task 3.8): the maximum total
+        // connection footprint plus at least one full job cap must fit
+        // the aggregate — otherwise long-lived connections could starve
+        // the pipeline (a contradictory limit).
+        let footprint = self.connection_ingress_footprint(engine.read_buffer_size);
+        let reserved = u64::from(engine.max_connections_total)
+            .checked_mul(footprint)
+            .and_then(|reserved| reserved.checked_add(self.job_max_bytes));
+        let Some(reserved) = reserved else {
+            return Err(invalid(
+                "transfer_memory.aggregate_max_bytes",
+                "connection footprint reservation overflows",
+            ));
+        };
+        if reserved > self.aggregate_max_bytes {
+            return Err(invalid(
+                "transfer_memory.aggregate_max_bytes",
+                "must fit max_connections_total connection footprints plus one full job cap",
+            ));
+        }
+        // Legacy write budgets become subordinate to the single ledger.
+        if engine.write_budget.job_max_bytes > self.job_max_bytes {
+            return Err(invalid(
+                "write_budget.job_max_bytes",
+                "must be <= transfer_memory.job_max_bytes",
+            ));
+        }
+        if engine.write_budget.global_max_bytes > self.aggregate_max_bytes {
+            return Err(invalid(
+                "write_budget.global_max_bytes",
+                "must be <= transfer_memory.aggregate_max_bytes",
+            ));
+        }
+        if engine.write_budget.worker_read_ahead_bytes > self.writer_max_bytes {
+            return Err(invalid(
+                "write_budget.worker_read_ahead_bytes",
+                "must be <= transfer_memory.writer_max_bytes",
+            ));
+        }
+        if engine.write_executor.max_queued_bytes > self.aggregate_max_bytes {
+            return Err(invalid(
+                "write_executor.max_queued_bytes",
+                "must be <= transfer_memory.aggregate_max_bytes",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Connection pooling shape (§27).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolConfig {
@@ -443,6 +660,10 @@ pub struct EngineConfig {
     /// Outstanding-write byte budgets : engine-global,
     /// per-job and per-worker read-ahead caps on unacknowledged payload.
     pub write_budget: WriteBudgetConfig,
+    /// End-to-end transfer-pipeline memory budget (design D3): per-job and
+    /// engine-wide caps with per-component maxima, validated before any
+    /// network activity.
+    pub transfer_memory: TransferMemoryConfig,
     /// Shared blocking write-executor policy : the
     /// small bounded blocking pool serving positional writes for all jobs.
     pub write_executor: WriteExecutorConfig,
@@ -499,6 +720,7 @@ impl Default for EngineConfig {
             network: NetworkPolicy::default(),
             write_budget: WriteBudgetConfig::default(),
             write_executor: WriteExecutorConfig::default(),
+            transfer_memory: TransferMemoryConfig::default(),
             global_rate_limit: None,
         }
     }
@@ -515,6 +737,7 @@ impl std::fmt::Debug for EngineConfig {
             )
             .field("read_buffer_size", &self.read_buffer_size)
             .field("buffer_pool_max_bytes", &self.buffer_pool_max_bytes)
+            .field("transfer_memory", &self.transfer_memory)
             .field("checkpoint_flush_interval", &self.checkpoint_flush_interval)
             .field("metrics_interval", &self.metrics_interval)
             .field("prefer_http2", &self.prefer_http2)
@@ -724,6 +947,7 @@ impl EngineConfig {
                 "must be >= read_buffer_size (one frame quantum)",
             ));
         }
+        self.transfer_memory.validate(self)?;
         if self.checkpoint_flush_interval.is_zero() || self.metrics_interval.is_zero() {
             return Err(invalid(
                 "checkpoint_flush_interval/metrics_interval",
@@ -918,5 +1142,198 @@ mod tests {
             p.validate().expect_err("must reject").field,
             "integrity.expected_hashes"
         );
+    }
+
+    // ---- Transfer-memory budget validation (task 3.1) ----
+
+    #[test]
+    fn default_transfer_memory_is_valid() {
+        EngineConfig::default()
+            .transfer_memory
+            .validate(&EngineConfig::default())
+            .expect("default budget valid");
+    }
+
+    #[test]
+    fn zero_transfer_memory_components_rejected() {
+        let zero_fields = [
+            ("aggregate_max_bytes", "transfer_memory.aggregate_max_bytes"),
+            ("job_max_bytes", "transfer_memory.job_max_bytes"),
+            (
+                "network_ingress_max_bytes",
+                "transfer_memory.network_ingress_max_bytes",
+            ),
+            ("frames_max_bytes", "transfer_memory.frames_max_bytes"),
+            ("writer_max_bytes", "transfer_memory.writer_max_bytes"),
+            (
+                "checkpoint_max_bytes",
+                "transfer_memory.checkpoint_max_bytes",
+            ),
+        ];
+        for (name, field) in zero_fields {
+            let mut c = EngineConfig::default();
+            match name {
+                "aggregate_max_bytes" => c.transfer_memory.aggregate_max_bytes = 0,
+                "job_max_bytes" => c.transfer_memory.job_max_bytes = 0,
+                "network_ingress_max_bytes" => c.transfer_memory.network_ingress_max_bytes = 0,
+                "frames_max_bytes" => c.transfer_memory.frames_max_bytes = 0,
+                "writer_max_bytes" => c.transfer_memory.writer_max_bytes = 0,
+                "checkpoint_max_bytes" => c.transfer_memory.checkpoint_max_bytes = 0,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                c.validate().expect_err("zero budget must reject").field,
+                field,
+                "{name} = 0 must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_budget_nesting_rejected() {
+        // A component cap above its job cap.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.frames_max_bytes = c.transfer_memory.job_max_bytes + 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.frames_max_bytes"
+        );
+        // A job cap above the aggregate cap.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.job_max_bytes = c.transfer_memory.aggregate_max_bytes + 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.job_max_bytes"
+        );
+    }
+
+    #[test]
+    fn minimum_feasible_sizes_enforced() {
+        // Ingress must admit at least one frame quantum.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.network_ingress_max_bytes = u64::from(c.read_buffer_size) - 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.network_ingress_max_bytes"
+        );
+        // Frames must admit at least one owned frame.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.frames_max_bytes = u64::from(c.read_buffer_size) - 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.frames_max_bytes"
+        );
+        // Checkpoint allowance must admit one minimal checkpoint.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.checkpoint_max_bytes = MIN_CHECKPOINT_BYTES - 1;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.checkpoint_max_bytes"
+        );
+    }
+
+    #[test]
+    fn overflow_headroom_rejected() {
+        let mut c = EngineConfig::default();
+        c.transfer_memory.aggregate_max_bytes = u64::MAX;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "transfer_memory.aggregate_max_bytes"
+        );
+    }
+
+    #[test]
+    fn legacy_budgets_must_stay_subordinate() {
+        const FRAME: u64 = 128 * 1024;
+
+        // write_budget.job_max_bytes above the transfer-memory job cap.
+        let mut c = EngineConfig::default();
+        // Components must stay within the job cap while it shrinks.
+        c.transfer_memory.network_ingress_max_bytes = FRAME;
+        c.transfer_memory.frames_max_bytes = FRAME;
+        c.transfer_memory.writer_max_bytes = FRAME;
+        c.transfer_memory.checkpoint_max_bytes = FRAME;
+        c.transfer_memory.job_max_bytes = 512 * 1024;
+        c.write_budget.job_max_bytes = 1024 * 1024;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.job_max_bytes"
+        );
+        // write_budget.global_max_bytes above the aggregate cap.
+        let mut c = EngineConfig::default();
+        // Everything nests: components >= frame, job >= components,
+        // aggregate >= job; only the legacy global cap contradicts.
+        c.transfer_memory.network_ingress_max_bytes = FRAME;
+        c.transfer_memory.frames_max_bytes = FRAME;
+        c.transfer_memory.writer_max_bytes = FRAME;
+        c.transfer_memory.checkpoint_max_bytes = FRAME;
+        c.transfer_memory.job_max_bytes = 2 * FRAME;
+        c.transfer_memory.aggregate_max_bytes = 2 * 1024 * 1024;
+        // The connection carve-out must fit the aggregate first.
+        c.max_connections_total = 2;
+        c.max_connections_per_origin = 2;
+        c.pool.max_total = 2;
+        c.pool.max_per_origin = 2;
+        c.write_budget.job_max_bytes = 2 * FRAME;
+        c.write_budget.worker_read_ahead_bytes = FRAME;
+        // The legacy global cap exceeds the (valid) aggregate: only this
+        // subordination rule contradicts.
+        c.write_budget.global_max_bytes = 4 * 1024 * 1024;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.global_max_bytes"
+        );
+        // worker read-ahead above the writer component cap.
+        let mut c = EngineConfig::default();
+        c.transfer_memory.writer_max_bytes = 256 * 1024;
+        c.write_budget.worker_read_ahead_bytes = 512 * 1024;
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_budget.worker_read_ahead_bytes"
+        );
+        // write executor queue above the aggregate cap.
+        let c = EngineConfig {
+            // The whole budget set shrinks coherently first; only the
+            // executor queue contradicts.
+            transfer_memory: TransferMemoryConfig {
+                network_ingress_max_bytes: FRAME,
+                frames_max_bytes: FRAME,
+                writer_max_bytes: FRAME,
+                checkpoint_max_bytes: FRAME,
+                job_max_bytes: FRAME,
+                aggregate_max_bytes: 2 * 1024 * 1024,
+            },
+            max_connections_total: 2,
+            max_connections_per_origin: 2,
+            pool: PoolConfig {
+                max_total: 2,
+                max_per_origin: 2,
+                ..PoolConfig::default()
+            },
+            write_budget: WriteBudgetConfig {
+                job_max_bytes: FRAME,
+                worker_read_ahead_bytes: FRAME,
+                global_max_bytes: 2 * 1024 * 1024,
+            },
+            write_executor: WriteExecutorConfig {
+                max_queued_bytes: 4 * 1024 * 1024,
+                ..WriteExecutorConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            c.validate().expect_err("must reject").field,
+            "write_executor.max_queued_bytes"
+        );
+    }
+
+    #[test]
+    fn invalid_budget_fails_before_any_network() {
+        // Transport construction is the earliest network-adjacent step:
+        // an invalid budget must fail it before any connection could exist.
+        // (validate() is a pure function: no sockets, no threads.)
+        let mut c = EngineConfig::default();
+        c.transfer_memory.frames_max_bytes = 0;
+        assert!(c.validate().is_err(), "invalid budget must fail validation");
     }
 }

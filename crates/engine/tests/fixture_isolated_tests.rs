@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 
 mod support;
 use support::fixtures;
@@ -75,10 +75,7 @@ fn spawn_server(args: &[&str]) -> IsolatedServer {
 async fn download(
     url: &str,
     configure: impl FnOnce(&mut EngineConfig),
-) -> (
-    kdown_engine::job::controller::DownloadResult,
-    tempfile::TempDir,
-) {
+) -> (kdown_engine::error::CompletedDownload, tempfile::TempDir) {
     let mut cfg = EngineConfig::default();
     cfg.network.response_header_timeout = Duration::from_secs(30);
     cfg.network.read_idle_timeout = Duration::from_secs(30);
@@ -122,9 +119,8 @@ async fn isolated_server_matches_in_process_fixture() {
     // reproduces the same digest.
     let url = format!("http://{}/f.bin", server.addr);
     let (result, _dir) = download(&url, |_| {}).await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    assert_eq!(result.bytes_reused_from_checkpoint, 0);
-    let path = result.final_path.clone().expect("published");
+    assert_eq!(result.accounting.bytes_reused_from_checkpoint, 0);
+    let path = result.final_path.clone();
     assert_eq!(
         fixtures::file_sha256(&path),
         server.sha256,
@@ -146,8 +142,7 @@ async fn isolated_server_segmented_download_matches() {
         cfg.transfer.max_segment_size = 256 * 1024;
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -173,16 +168,15 @@ async fn isolated_transient_failures_recover_via_retry() {
         cfg.retry.base_delay = Duration::from_millis(10);
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     // The probe's validating bytes=0-0 GET may consume one injected failure;
     // at least one worker-visible retry must have happened and the job must
     // recover with the exact file.
     assert!(
-        result.retries >= 1,
+        result.accounting.retries >= 1,
         "expected injected failures to be retried, retries={}",
-        result.retries
+        result.accounting.retries
     );
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -207,8 +201,7 @@ async fn isolated_mid_transfer_reset_recovers() {
         cfg.retry.base_delay = Duration::from_millis(10);
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -242,14 +235,13 @@ async fn isolated_throttle_paces_body() {
     let started = Instant::now();
     let url = format!("http://{}/f.bin", server.addr);
     let (result, _dir) = download(&url, |_| {}).await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     // 1 MiB at 1 MiB/s must take at least ~0.9 s of body time.
     assert!(
         started.elapsed() >= Duration::from_millis(900),
         "throttled 1 MiB finished too fast: {:?}",
         started.elapsed()
     );
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -297,9 +289,8 @@ async fn isolated_client_fail_if_exists_unchanged() {
             dest.clone(),
         ))
         .await
-        .expect("run result");
-    assert_eq!(result.status, ResultStatus::Failed);
-    assert!(result.bytes_downloaded_from_network == 0);
+        .expect_err("run result");
+    assert!(result.accounting().bytes_downloaded_from_network == 0);
     assert_eq!(std::fs::read(&dest).expect("read"), b"existing");
 }
 
@@ -344,14 +335,13 @@ async fn read_tls_stats(cfg: &EngineConfig, server: &IsolatedServer) -> (u64, u6
     let dir = tempfile::tempdir().expect("stats tmpdir");
     let transport = HttpTransport::from_config(cfg).expect("transport");
     let controller = DownloadController::new(transport, cfg.clone());
-    let result = controller
+    let _ = controller
         .run(DownloadRequest::new(
             tls_url(server, "/__stats"),
             dir.path().join("stats.txt"),
         ))
         .await
         .expect("stats download");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     let text = std::fs::read_to_string(dir.path().join("stats.txt")).expect("stats text");
     let parse = |key: &str| {
         text.lines()
@@ -389,10 +379,9 @@ async fn isolated_tls_h2_segmented_parity() {
         ))
         .await
         .expect("download");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256, "H2 TLS parity");
-    assert_eq!(result.bytes_reused_from_checkpoint, 0);
+    assert_eq!(result.accounting.bytes_reused_from_checkpoint, 0);
 
     let (emitted, _conns, requests) = read_tls_stats(&cfg, &server).await;
     assert!(
@@ -425,8 +414,7 @@ async fn isolated_tls_single_stream_parity() {
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
         .await
         .expect("download");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -450,8 +438,7 @@ async fn isolated_tls_ignore_ranges_falls_back() {
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
         .await
         .expect("download");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 
     // Fallback proof: at most one full transfer plus the aborted validating
@@ -495,13 +482,12 @@ async fn isolated_tls_mid_transfer_reset_recovers() {
         .run(DownloadRequest::new(url, dir.path().join("out.bin")))
         .await
         .expect("download");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert!(
-        result.retries >= 1,
+        result.accounting.retries >= 1,
         "expected reset retries: {}",
-        result.retries
+        result.accounting.retries
     );
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -522,8 +508,7 @@ async fn isolated_rtt_shapes_per_request_latency() {
         cfg.transfer.max_segment_size = 32 * 1024;
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
     // 96 KiB / 32 KiB = 3 segments (+probe) — at least 3 full RTTs.
     assert!(
@@ -548,13 +533,12 @@ async fn isolated_connection_loss_recovers_via_retry() {
         cfg.retry.base_delay = Duration::from_millis(10);
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert!(
-        result.retries >= 1,
+        result.accounting.retries >= 1,
         "expected loss retries: {}",
-        result.retries
+        result.accounting.retries
     );
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -594,8 +578,7 @@ async fn isolated_transient_fail_carries_configured_retry_after() {
         cfg.retry.base_delay = Duration::from_millis(10);
     })
     .await;
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 }
 
@@ -658,8 +641,7 @@ async fn h1_connection_and_request_counters_reconcile_with_server() {
         .expect("download");
     let (_, conns_after, reqs_after) = raw_server_stats(&server.addr);
 
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256);
 
     // The after-read itself contributes exactly one connection and one
@@ -725,8 +707,7 @@ async fn h2_stream_counters_reconcile_with_server_side_requests() {
         .expect("download");
     let (_, conns_after, reqs_after) = read_tls_stats(&cfg, &server).await;
 
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
-    let path = result.final_path.clone().expect("published");
+    let path = result.final_path.clone();
     assert_eq!(fixtures::file_sha256(&path), server.sha256, "H2 parity");
 
     // Each stats read is one HEAD probe plus one GET on a tiny resource:

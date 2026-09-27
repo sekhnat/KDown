@@ -1,18 +1,21 @@
 //! Segment scheduling: interval planning, leases, and assignment (§12).
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use crate::resume::checkpoint::ByteRange;
 
-pub mod core;
-pub mod interval_set;
-pub mod lease;
+pub(crate) mod core;
+pub(crate) mod interval_set;
+pub(crate) mod lease;
 
-pub use core::{SchedulerPolicy, SegmentScheduler};
-pub use interval_set::IntervalSet;
-pub use lease::{LeaseId, SegmentLease};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use lease::LeaseId;
 
 /// Default oversubscription factor (§12.2): 2-4 so faster workers can
 /// consume additional work instead of waiting on one slow long-lived
 /// segment.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const OVERSUBSCRIPTION_FACTOR: u64 = 3;
 
 /// Initial segmentation (§12.2): the segment size and per-worker slice
@@ -30,6 +33,8 @@ pub const OVERSUBSCRIPTION_FACTOR: u64 = 3;
 /// inclusive segments of `segment_size` (the last one short). Empty files
 /// yield no ranges.
 #[must_use]
+// Scheduler-level helpers beyond the worker paths are exercised by
+// relocated property tests.
 pub fn plan_segments(
     total_size: u64,
     target_workers: u32,
@@ -53,6 +58,7 @@ pub fn plan_segments(
 
 /// Tile `[0, total)` into inclusive ranges of `chunk` bytes.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tile_ranges(total_size: u64, chunk: u64) -> Vec<ByteRange> {
     let chunk = chunk.max(1);
     let mut out = Vec::new();

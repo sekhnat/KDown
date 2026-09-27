@@ -146,7 +146,7 @@ mod tests {
     use crate::http::probe::ProbeMetadata;
     use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
     use crate::http::HttpExecution;
-    use crate::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+    use crate::job::controller::{DownloadController, DownloadRequest};
 
     fn write_temp(directory: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = directory.join(name);
@@ -379,12 +379,8 @@ mod tests {
             .await
             .expect("job reaches a terminal outcome")
             .expect("job task")
-            .expect("structured terminal result");
-        assert_eq!(result.status, ResultStatus::Failed);
-        assert_eq!(
-            result.error.as_ref().map(|error| error.category()),
-            Some(ErrorCategory::DestinationConflict)
-        );
+            .expect_err("structured terminal failure");
+        assert_eq!(result.category(), ErrorCategory::DestinationConflict);
         assert_eq!(
             std::fs::read(&destination).expect("read competing destination"),
             b"concurrent writer"
@@ -441,12 +437,8 @@ mod tests {
             .await
             .expect("job reaches a terminal outcome")
             .expect("job task")
-            .expect("structured terminal result");
-        assert_eq!(result.status, ResultStatus::Failed);
-        assert_eq!(
-            result.error.as_ref().map(|error| error.category()),
-            Some(ErrorCategory::Commit)
-        );
+            .expect_err("structured terminal failure");
+        assert_eq!(result.category(), ErrorCategory::Commit);
         assert_eq!(
             std::fs::read(&destination).expect("read previous destination"),
             b"old destination"

@@ -24,6 +24,8 @@ pub enum CheckpointError {
     Corrupt(String),
     #[error("checkpoint inconsistent: {0}")]
     Inconsistent(String),
+    #[error("checkpoint size {size} exceeds the configured budget {cap}")]
+    TooLarge { size: u64, cap: u64 },
 }
 
 impl From<CheckpointError> for DownloadError {
@@ -87,6 +89,44 @@ impl Checkpoint {
     /// Serialization failure (should not happen for this plain model).
     pub fn to_json(&self) -> Result<String, CheckpointError> {
         serde_json::to_string(self).map_err(|e| CheckpointError::Corrupt(e.to_string()))
+    }
+
+    /// Cheap UPPER-BOUND estimate of the serialized size in bytes, computed
+    /// WITHOUT allocating the serialization (task 3.6): fixed fields plus
+    /// actual string lengths plus a conservative per-entry allowance for
+    /// ranges and hashes. The estimate doubles as the range-count policy:
+    /// a fragmented checkpoint is bounded by `cap / RANGE_ENTRY_COST`
+    /// ranges.
+    #[must_use]
+    pub fn serialized_size_estimate(&self) -> u64 {
+        const FIXED_OVERHEAD: u64 = 512; // keys, version, timestamps, nesting
+        const RANGE_ENTRY_COST: u64 = 64; // quoted numbers, comma, worst case
+        const DIGEST_ENTRY_COST: u64 = 128; // algorithm + hex + keys
+        FIXED_OVERHEAD
+            + (self.job_id.len() as u64
+                + self.original_url.len() as u64
+                + self.final_url.len() as u64
+                + self.temp_path_identity.len() as u64
+                + self.created_at.len() as u64
+                + self.updated_at.len() as u64)
+            + u64::try_from(self.completed_ranges.len()).unwrap_or(u64::MAX) * RANGE_ENTRY_COST
+            + u64::try_from(self.expected_hashes.len()).unwrap_or(u64::MAX) * DIGEST_ENTRY_COST
+    }
+
+    /// The bounded serialized-size policy (task 3.6): refuse a checkpoint
+    /// whose estimated serialization exceeds `cap` BEFORE any allocation.
+    ///
+    /// # Errors
+    /// [`CheckpointError::TooLarge`] when the estimate exceeds the budget.
+    pub fn check_serialized_within(&self, cap: u64) -> Result<u64, CheckpointError> {
+        let estimate = self.serialized_size_estimate();
+        if estimate > cap {
+            return Err(CheckpointError::TooLarge {
+                size: estimate,
+                cap,
+            });
+        }
+        Ok(estimate)
     }
 
     /// Parse and validate from JSON (§15.5 step 1).

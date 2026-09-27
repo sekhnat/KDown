@@ -1,15 +1,20 @@
 //! Resumable state: versioned checkpoint model, atomic sidecar store,
 //! durable-interval tracking, and resume orchestration (§15, D3, D4).
 
-pub mod checkpoint;
-pub mod checkpoint_store;
+pub(crate) mod checkpoint;
+pub(crate) mod checkpoint_store;
 pub(crate) mod coordinated_store;
-pub mod durable_ranges;
-pub mod flow;
+pub(crate) mod durable_ranges;
+pub(crate) mod flow;
 
-pub use checkpoint::{ByteRange, Checkpoint, CheckpointError, CHECKPOINT_FORMAT_VERSION};
-pub use checkpoint_store::{
+// Mod-level re-exports consumed by relocated internal tests; the
+// supported surface re-exports the same items at the crate root.
+#[allow(unused_imports)]
+pub(crate) use checkpoint::{ByteRange, Checkpoint, CheckpointError, CHECKPOINT_FORMAT_VERSION};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use checkpoint_store::{
     CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver, DurabilityMode,
     FileCheckpointStore, SidecarCheckpointResolver,
 };
-pub use flow::{job_identity, GenerationChangePolicy};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use flow::job_identity;

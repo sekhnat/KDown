@@ -28,6 +28,7 @@ use crate::http::execution::{
 use crate::http::range::{validate_range_response, ResponseHead};
 use crate::http::redirect::{RedirectAction, RedirectPolicy, RedirectTracker};
 use crate::http::validators::{if_range_value, ContentRange, ResourceValidators};
+use crate::io::transfer_ledger::TransferLedger;
 
 /// HTTP-private final response (§32): the raw Hyper response plus the
 /// redirect-resolved final URL and HTTP version. Raw values never leave
@@ -51,6 +52,9 @@ impl FinalResponse {
 /// Metadata + streaming body returned before any body byte is accepted.
 /// HTTP-private production-adapter detail (§32): the semantic seam maps
 /// this onto `TransferResponse`; job code never sees it.
+// The production adapter maps this onto `TransferResponse`; some
+// accessors exist for adapter diagnostics only.
+#[allow(dead_code)]
 pub(crate) struct RangeResponse {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
@@ -140,6 +144,63 @@ impl std::fmt::Debug for RequestSpec {
     }
 }
 
+/// Bounded HTTP/1 and HTTP/2 ingress shape (design D3, task 3.3): every
+/// client-internal buffer a remote peer can fill is configured to a known
+/// ceiling derived from `transfer_memory.network_ingress_max_bytes`, and
+/// each connection's worst-case buffered footprint is reserved from the
+/// transfer ledger BEFORE the connection is established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IngressProfile {
+    /// HTTP/1: exact read-buffer size. Disables auto-growth, so response
+    /// heads larger than one frame quantum fail the connection explicitly
+    /// instead of growing the buffer.
+    pub http1_read_buf_exact: usize,
+    /// HTTP/1: buffer growth cap (equal to the exact size here).
+    pub http1_max_buf: usize,
+    /// HTTP/2: connection-level receive window (bounds the data one
+    /// connection buffers across all its streams).
+    pub http2_connection_window: u32,
+    /// HTTP/2: per-stream receive window.
+    pub http2_stream_window: u32,
+    /// HTTP/2: response header list ceiling (metadata bound).
+    pub http2_max_header_list: u32,
+    /// Worst-case per-connection buffered-ingress footprint: the ledger
+    /// reservation made before dialing.
+    pub connection_footprint: u64,
+}
+
+impl IngressProfile {
+    /// Derive the bounded ingress shape from engine configuration.
+    ///
+    /// Derivation (documented constants, design D3): flow-control windows
+    /// are capped at `INGRESS_WINDOW_CAP`; response header metadata at
+    /// `MAX_HEADER_LIST_BYTES`. The connection footprint is the worst case
+    /// over the two protocol stacks: window (or H1 buffer) plus the header
+    /// allowance, so the reservation covers whatever ALPN negotiates.
+    #[must_use]
+    pub(crate) fn from_config(cfg: &EngineConfig) -> Self {
+        const INGRESS_WINDOW_CAP: u64 = 128 * 1024;
+        const MAX_HEADER_LIST_BYTES: u64 = 64 * 1024;
+        let ingress_max = cfg.transfer_memory.network_ingress_max_bytes;
+        let frame = u64::from(cfg.read_buffer_size);
+        let window = INGRESS_WINDOW_CAP.min(ingress_max);
+        let h1_buf = frame.min(ingress_max);
+        let http2_connection_window = window;
+        let http2_stream_window = window.min(frame);
+        let http2_max_header_list = MAX_HEADER_LIST_BYTES.min(ingress_max);
+        let http1_footprint = h1_buf + http2_max_header_list;
+        let http2_footprint = http2_connection_window + http2_max_header_list;
+        Self {
+            http1_read_buf_exact: usize::try_from(h1_buf).unwrap_or(usize::MAX),
+            http1_max_buf: usize::try_from(h1_buf).unwrap_or(usize::MAX),
+            http2_connection_window: u32::try_from(http2_connection_window).unwrap_or(u32::MAX),
+            http2_stream_window: u32::try_from(http2_stream_window).unwrap_or(u32::MAX),
+            http2_max_header_list: u32::try_from(http2_max_header_list).unwrap_or(u32::MAX),
+            connection_footprint: http1_footprint.max(http2_footprint),
+        }
+    }
+}
+
 /// Hyper-based HTTP transport (D2, §24, §27, §28).
 #[derive(Clone)]
 pub struct HttpTransport {
@@ -159,6 +220,14 @@ pub struct HttpTransport {
     redirect: RedirectPolicy,
     user_agent: String,
     proxy: ProxyConfig,
+    /// The engine-wide transfer-memory ledger this transport accounts
+    /// connection ingress against (design D3): shared with the controller
+    /// so jobs and connections draw from one budget.
+    ledger: Arc<TransferLedger>,
+    /// Bounded ingress shape applied to every client slot (task 3.3).
+    /// Read by tests via [`ingress_profile`](Self::ingress_profile).
+    #[cfg_attr(not(test), allow(dead_code))]
+    ingress: IngressProfile,
 }
 
 impl std::fmt::Debug for HttpTransport {
@@ -188,7 +257,16 @@ impl HttpTransport {
     /// # Errors
     /// TLS trust-set load failure (fails closed; no plaintext fallback).
     pub fn from_config(cfg: &EngineConfig) -> Result<Self, DownloadError> {
-        let connector = EngineConnector::new(cfg)?;
+        // Validation precedes any network activity (task 3.1): an invalid
+        // transfer-memory budget fails transport construction itself.
+        cfg.validate()?;
+        let ledger = Arc::new(TransferLedger::new(
+            &cfg.transfer_memory,
+            cfg.transfer_memory
+                .connection_ingress_reserve(cfg.read_buffer_size, cfg.max_connections_total),
+        ));
+        let ingress = IngressProfile::from_config(cfg);
+        let connector = EngineConnector::new_with_ledger(cfg, Arc::clone(&ledger), ingress)?;
         let slots = match &cfg.h2_policy {
             crate::config::H2ConnectionPolicy::Single => 1,
             crate::config::H2ConnectionPolicy::Additional { max_connections } => {
@@ -197,7 +275,7 @@ impl HttpTransport {
         };
         let mut clients = Vec::with_capacity(slots);
         for _ in 0..slots {
-            clients.push(Arc::new(Self::build_client(&connector, cfg)));
+            clients.push(Arc::new(Self::build_client(&connector, cfg, &ingress)));
         }
         let stats = connector.protocol_stats().clone();
         Ok(Self {
@@ -213,12 +291,30 @@ impl HttpTransport {
             network: cfg.network.clone(),
             user_agent: "kdown-engine/0.1".to_string(),
             proxy: cfg.proxy.clone(),
+            ledger,
+            ingress,
         })
+    }
+
+    /// The engine-wide transfer-memory ledger this transport accounts
+    /// connection ingress against; the controller adopts the same ledger
+    /// so jobs and connections draw from one budget (design D3).
+    #[must_use]
+    pub(crate) fn ledger(&self) -> Arc<TransferLedger> {
+        Arc::clone(&self.ledger)
+    }
+
+    /// The bounded ingress shape applied to every client slot (task 3.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn ingress_profile(&self) -> &IngressProfile {
+        &self.ingress
     }
 
     fn build_client(
         connector: &EngineConnector,
         cfg: &EngineConfig,
+        ingress: &IngressProfile,
     ) -> Client<EngineConnector, Full<bytes::Bytes>> {
         Client::builder(TokioExecutor::new())
             .pool_idle_timeout(cfg.pool.idle_timeout)
@@ -228,6 +324,16 @@ impl HttpTransport {
             .retry_canceled_requests(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
+            // Bounded ingress (task 3.3): the H1 read buffer is exact, so
+            // oversized response heads fail the connection explicitly
+            // instead of growing an unbounded buffer; H2 flow-control
+            // windows bound how much data one connection buffers, and the
+            // advertised header-list ceiling bounds response metadata.
+            .http1_read_buf_exact_size(ingress.http1_read_buf_exact)
+            .http1_max_buf_size(ingress.http1_max_buf)
+            .http2_initial_connection_window_size(Some(ingress.http2_connection_window))
+            .http2_initial_stream_window_size(Some(ingress.http2_stream_window))
+            .http2_max_header_list_size(ingress.http2_max_header_list)
             .timer(hyper_util::rt::TokioTimer::new())
             .build(connector.clone())
     }

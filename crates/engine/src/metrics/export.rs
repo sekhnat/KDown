@@ -12,8 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::error::{DownloadError, ErrorCategory};
-use crate::job::controller::{DownloadResult, ResultStatus};
+use crate::error::{CompletedDownload, DownloadError, DownloadRunError, ErrorCategory};
 
 /// Engine-wide metric registry; clone the `Arc` and share it across jobs.
 #[derive(Debug, Default)]
@@ -33,6 +32,11 @@ pub struct EngineMetrics {
     latency_count: AtomicU64,
     latency_sum_micros: AtomicU64,
     latency_max_micros: AtomicU64,
+    /// Last transfer-memory sample (task 3.7): recorded at every job
+    /// terminal and replaceable by a live sampler.
+    transfer_memory: std::sync::Mutex<Option<crate::io::transfer_ledger::TransferMemorySnapshot>>,
+    /// Max high-water of any single job's accounted pipeline memory.
+    job_memory_high_water_max: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -57,36 +61,48 @@ impl EngineMetrics {
         *map.entry(format!("{category:?}")).or_default() += 1;
     }
 
-    /// Record one terminal [`DownloadResult`]. This is called after the
+    /// Record one verified, published completion. Called once after the
     /// job task settles, outside scheduler/sink locks.
-    pub fn record_result(&self, result: &DownloadResult) {
+    pub fn record_completed(&self, result: &CompletedDownload) {
         self.active_jobs.fetch_sub(1, Ordering::Relaxed);
-        match result.status {
-            ResultStatus::Completed => {
-                self.jobs_completed.fetch_add(1, Ordering::Relaxed);
-            }
-            ResultStatus::Failed => {
+        self.jobs_completed.fetch_add(1, Ordering::Relaxed);
+        self.network_bytes.fetch_add(
+            result.accounting.bytes_downloaded_from_network,
+            Ordering::Relaxed,
+        );
+        self.reused_bytes.fetch_add(
+            result.accounting.bytes_reused_from_checkpoint,
+            Ordering::Relaxed,
+        );
+        self.record_latency(result.accounting.elapsed);
+    }
+
+    /// Record one non-success terminal outcome (transfer failure,
+    /// infrastructure failure, or cancellation). Called once after the job
+    /// task settles; every terminal branch reaches exactly one of
+    /// [`EngineMetrics::record_completed`] /
+    /// [`EngineMetrics::record_run_error`].
+    pub fn record_run_error(&self, error: &DownloadRunError) {
+        self.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        match error {
+            DownloadRunError::Transfer(_) | DownloadRunError::Infrastructure(_) => {
                 self.jobs_failed.fetch_add(1, Ordering::Relaxed);
+                if let Some(e) = error.as_engine_error() {
+                    self.record_error(e);
+                }
             }
-            ResultStatus::Cancelled => {
+            DownloadRunError::Cancelled(_) => {
                 self.jobs_cancelled.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Partial accounting from failed/cancelled jobs still crossed the
+        // wire: it belongs in the engine totals.
+        let accounting = error.accounting();
         self.network_bytes
-            .fetch_add(result.bytes_downloaded_from_network, Ordering::Relaxed);
+            .fetch_add(accounting.bytes_downloaded_from_network, Ordering::Relaxed);
         self.reused_bytes
-            .fetch_add(result.bytes_reused_from_checkpoint, Ordering::Relaxed);
-        self.record_latency(result.elapsed);
-        if let Some(error) = &result.error {
-            self.record_error(error);
-        }
-    }
-
-    /// Record a task error before it produced a DownloadResult.
-    pub fn record_task_error(&self, error: &DownloadError) {
-        self.active_jobs.fetch_sub(1, Ordering::Relaxed);
-        self.jobs_failed.fetch_add(1, Ordering::Relaxed);
-        self.record_error(error);
+            .fetch_add(accounting.bytes_reused_from_checkpoint, Ordering::Relaxed);
+        self.record_latency(accounting.elapsed);
     }
 
     pub fn record_error(&self, error: &DownloadError) {
@@ -115,7 +131,24 @@ impl EngineMetrics {
         self.latency_max_micros.fetch_max(micros, Ordering::Relaxed);
     }
 
-    #[must_use]
+    /// Record a transfer-memory sample (task 3.7): the engine ledger's
+    /// live view (current + high-water per component/aggregate, caps
+    /// included). Callers sample at job terminal (failure cleanup visible)
+    /// or from a periodic live sampler.
+    pub fn record_transfer_memory(
+        &self,
+        snapshot: crate::io::transfer_ledger::TransferMemorySnapshot,
+    ) {
+        *self.transfer_memory.lock().expect("memory metrics") = Some(snapshot);
+    }
+
+    /// Record one job's accounted-pipeline high-water (task 3.7): the
+    /// engine keeps the maximum across jobs.
+    pub fn record_job_memory_high_water(&self, high_water: u64) {
+        self.job_memory_high_water_max
+            .fetch_max(high_water, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let count = self.latency_count.load(Ordering::Relaxed);
         let sum = self.latency_sum_micros.load(Ordering::Relaxed);
@@ -136,6 +169,8 @@ impl EngineMetrics {
             latency_sum_micros: sum,
             latency_max_micros: self.latency_max_micros.load(Ordering::Relaxed),
             latency_avg_micros: sum.checked_div(count).unwrap_or(0),
+            transfer_memory: self.transfer_memory.lock().expect("memory metrics").clone(),
+            job_memory_high_water_max: self.job_memory_high_water_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -159,33 +194,36 @@ pub struct MetricsSnapshot {
     pub latency_sum_micros: u64,
     pub latency_max_micros: u64,
     pub latency_avg_micros: u64,
+    /// Last transfer-memory sample (task 3.7); `None` before the first
+    /// sample. The snapshot's own `scope` field documents what is and is
+    /// not accounted (no unknown-buffer-as-zero reporting).
+    pub transfer_memory: Option<crate::io::transfer_ledger::TransferMemorySnapshot>,
+    /// Max high-water of any single job's accounted pipeline memory.
+    pub job_memory_high_water_max: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::error::{ArtifactDisposition, TransferAccounting, TransferFailure};
     #[test]
     fn snapshot_exports_outcomes_categories_status_and_latency() {
         let m = EngineMetrics::new();
         m.job_started();
         m.retry(ErrorCategory::Connection);
-        m.record_result(&DownloadResult {
-            segment_requests: 0,
-            live_splits: 0,
-            status: ResultStatus::Failed,
-            final_path: None,
-            bytes_downloaded_from_network: 42,
-            bytes_reused_from_checkpoint: 3,
-            completed_bytes: 42,
-            wasted_bytes: 0,
-            retries: 0,
-            total_size: Some(42),
-            elapsed: Duration::from_millis(7),
-            validators: Default::default(),
-            warnings: vec![],
-            error: Some(DownloadError::NotFound { status: 404 }),
-        });
+        m.record_run_error(&DownloadRunError::Transfer(Box::new(TransferFailure {
+            error: DownloadError::NotFound { status: 404 },
+            partial: TransferAccounting {
+                bytes_downloaded_from_network: 42,
+                bytes_reused_from_checkpoint: 3,
+                completed_bytes: 42,
+                total_size: Some(42),
+                elapsed: Duration::from_millis(7),
+                ..TransferAccounting::default()
+            },
+            artifacts: ArtifactDisposition::default(),
+        })));
         let s = m.snapshot();
         assert_eq!(s.jobs_started, 1);
         assert_eq!(s.jobs_failed, 1);

@@ -1,8 +1,9 @@
 //! Job lifecycle management (§9).
 
-pub mod controller;
-pub mod segmented;
-pub mod state;
+pub(crate) mod controller;
+pub(crate) mod segmented;
+pub(crate) mod state;
 
-pub use controller::{DownloadHandle, DownloadRequest, DownloadResult, ResultStatus};
-pub use state::{InvalidTransition, JobState, StateMachine};
+// Relocated internal tests address JobState through this module path.
+#[allow(unused_imports)]
+pub(crate) use state::JobState;

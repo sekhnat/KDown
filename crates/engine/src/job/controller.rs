@@ -19,7 +19,10 @@ use crate::config::{EngineConfig, HashAlgorithm, IntegrityPolicy, OverwritePolic
 use crate::control::origin::{normalized_origin, OriginRegistry};
 use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
-use crate::error::DownloadError;
+use crate::error::{
+    ArtifactDisposition, CancellationSummary, CompletedDownload, DownloadError, DownloadRunError,
+    EngineFailure, FailureDomain, TransferAccounting, TransferFailure,
+};
 use crate::http::probe::ProbeMetadata;
 use crate::http::transport::{HttpTransport, RequestSpec};
 use crate::http::validators::ResourceValidators;
@@ -110,75 +113,15 @@ impl DownloadRequest {
     }
 }
 
-/// Terminal outcome (§7.4).
-#[derive(Debug)]
-pub struct DownloadResult {
-    pub status: ResultStatus,
-    pub final_path: Option<PathBuf>,
-    pub bytes_downloaded_from_network: u64,
-    pub bytes_reused_from_checkpoint: u64,
-    /// Unique newly completed file bytes: excludes reused checkpoint
-    /// bytes and retransmitted duplicates. This is the useful-goodput
-    /// numerator for benchmarks.
-    pub completed_bytes: u64,
-    /// Wasted/retransmitted network bytes (real counter): payload received
-    /// but not uniquely completed. Never derived from warning counts.
-    pub wasted_bytes: u64,
-    /// Retry attempts charged by the transfer paths (real counter).
-    pub retries: u64,
-    /// Range requests issued by the segmented transfer (additive
-    /// diagnostic); `0` for single-stream transfers.
-    pub segment_requests: u64,
-    /// Live-tail splits performed by the segmented scheduler (additive
-    /// diagnostic); `0` for single-stream transfers.
-    pub live_splits: u64,
-    pub total_size: Option<u64>,
-    pub elapsed: Duration,
-    pub validators: ResourceValidators,
-    pub warnings: Vec<String>,
-    pub error: Option<DownloadError>,
-}
-
-impl DownloadResult {
-    /// Wire amplification: total received payload
-    /// divided by uniquely completed bytes. Received payload is the network
-    /// counter plus re-received waste (this engine counts each wire byte
-    /// once in `bytes_downloaded_from_network` and charges duplicates to
-    /// `wasted_bytes`, so their sum is what crossed the wire).
-    /// `None` when the denominator is zero (nothing uniquely completed) —
-    /// the metric is undefined there, never fabricated.
-    #[must_use]
-    pub fn wire_amplification(&self) -> Option<f64> {
-        if self.completed_bytes == 0 {
-            None
-        } else {
-            let received = self.bytes_downloaded_from_network + self.wasted_bytes;
-            Some(received as f64 / self.completed_bytes as f64)
-        }
-    }
-}
-
+/// Internal terminal classification of the segmented transfer phase before
+/// verification/commit (§7.4). Crate plumbing only: the public terminal
+/// API is [`crate::error::CompletedDownload`] and
+/// [`crate::error::DownloadRunError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ResultStatus {
+pub(crate) enum ResultStatus {
     Completed,
     Cancelled,
     Failed,
-}
-
-#[derive(Debug)]
-struct CompletionSummary {
-    network_bytes: u64,
-    reused_bytes: u64,
-    completed_bytes: u64,
-    wasted_bytes: u64,
-    retries: u64,
-    segment_requests: u64,
-    live_splits: u64,
-    total_size: Option<u64>,
-    elapsed: Duration,
-    validators: ResourceValidators,
-    warnings: Vec<String>,
 }
 
 /// Handle for observing/controlling one running job (§7.3).
@@ -204,6 +147,14 @@ impl CancelMode {
             _ => CancelMode::DeletePartial,
         }
     }
+}
+
+/// Warnings and the resulting artifact disposition produced by
+/// [`DownloadController::cleanup_cancelled`] (§9.4).
+#[derive(Debug)]
+pub(crate) struct CancelCleanup {
+    pub warnings: Vec<String>,
+    pub artifacts: ArtifactDisposition,
 }
 
 // hub/total_size are consumed by event-wiring refinements.
@@ -377,6 +328,11 @@ pub struct DownloadController {
     origin_registry: Arc<OriginRegistry>,
     next_id: std::sync::atomic::AtomicU64,
     metrics: Arc<EngineMetrics>,
+    /// Engine-wide transfer-memory ledger (design D3): shared with the
+    /// transport so jobs and connections draw from one budget. The
+    /// production construction adopts the transport's ledger; the scripted
+    /// test path builds one from configuration.
+    transfer_ledger: Arc<crate::io::transfer_ledger::TransferLedger>,
     /// Engine-global payload rate bucket (§18): shared by every job of this
     /// controller, above the per-job bucket. Created from
     /// `config.global_rate_limit`; replaceable for tests via
@@ -399,35 +355,56 @@ impl DownloadController {
     /// compatible construction — existing callers compile unchanged).
     #[must_use]
     pub fn new(transport: HttpTransport, config: EngineConfig) -> Self {
-        Self::with_execution(HttpExecution::from_adapter(transport), config)
+        let ledger = transport.ledger();
+        Self::with_execution_and_metrics(
+            HttpExecution::from_adapter(transport),
+            config,
+            EngineMetrics::shared(),
+            ledger,
+        )
     }
 
     /// Inject an explicit HTTP execution handle (§32): scripted or alternate
     /// adapters substitute here without adapter-specific branches.
+    /// Crate-internal: the external injection seam is retired (task 2.3);
+    /// consumers construct the production transport with [`new`](Self::new).
+    #[allow(dead_code)] // used by relocated internal tests only
     #[must_use]
-    pub fn with_execution(execution: HttpExecution, config: EngineConfig) -> Self {
-        Self::with_execution_and_metrics(execution, config, EngineMetrics::shared())
+    pub(crate) fn with_execution(execution: HttpExecution, config: EngineConfig) -> Self {
+        let ledger = Arc::new(crate::io::transfer_ledger::TransferLedger::new(
+            &config.transfer_memory,
+            config
+                .transfer_memory
+                .connection_ingress_reserve(config.read_buffer_size, config.max_connections_total),
+        ));
+        Self::with_execution_and_metrics(execution, config, EngineMetrics::shared(), ledger)
     }
 
     /// Execution injection with a shared metrics registry (§19.5).
     #[must_use]
-    pub fn with_execution_and_metrics(
+    pub(crate) fn with_execution_and_metrics(
         execution: HttpExecution,
         config: EngineConfig,
         metrics: Arc<EngineMetrics>,
+        transfer_ledger: Arc<crate::io::transfer_ledger::TransferLedger>,
     ) -> Self {
         let classifier = RetryClassifier::new(config.retry.clone());
         let global_rate_bucket = Arc::new(crate::control::rate_limit::TokenBucket::new(
             config.global_rate_limit.unwrap_or(0),
         ));
+        let checkpoint_resolver = Arc::new(
+            SidecarCheckpointResolver::default()
+                .with_checkpoint_budget(config.transfer_memory.checkpoint_max_bytes),
+        );
         Self {
             execution,
             config,
             classifier,
-            checkpoint_resolver: Arc::new(SidecarCheckpointResolver),
+            checkpoint_resolver,
             origin_registry: OriginRegistry::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
             metrics,
+            transfer_ledger,
             global_rate_bucket,
         }
     }
@@ -485,7 +462,23 @@ impl DownloadController {
         config: EngineConfig,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
-        Self::with_execution_and_metrics(HttpExecution::from_adapter(transport), config, metrics)
+        let ledger = transport.ledger();
+        Self::with_execution_and_metrics(
+            HttpExecution::from_adapter(transport),
+            config,
+            metrics,
+            ledger,
+        )
+    }
+
+    /// The engine-wide transfer-memory ledger this controller accounts job
+    /// pipeline memory against (design D3): the same ledger the transport
+    /// charges connection ingress to. Consumed by the pipeline wiring of
+    /// task 3.4 and by relocated internal tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn transfer_ledger(&self) -> Arc<crate::io::transfer_ledger::TransferLedger> {
+        Arc::clone(&self.transfer_ledger)
     }
 
     /// Admit one request to `origin`: waits out the origin's
@@ -539,9 +532,15 @@ impl DownloadController {
     /// use case).
     ///
     /// # Errors
-    /// Terminal errors surface in [`DownloadResult::error`]; the function
-    /// itself returns `Ok` for all three terminal statuses.
-    pub async fn run(&self, request: DownloadRequest) -> Result<DownloadResult, DownloadError> {
+    /// # Errors
+    /// Returns [`DownloadRunError`] for every non-success terminal outcome:
+    /// a typed transfer failure, an engine/infrastructure failure, or
+    /// cancellation. `Ok` is produced only for a verified, published
+    /// completion.
+    pub async fn run(
+        &self,
+        request: DownloadRequest,
+    ) -> Result<CompletedDownload, DownloadRunError> {
         self.run_with_handle(request).await.map(|(r, _)| r)
     }
 
@@ -553,7 +552,7 @@ impl DownloadController {
         request: DownloadRequest,
     ) -> (
         DownloadHandle,
-        tokio::task::JoinHandle<Result<DownloadResult, DownloadError>>,
+        tokio::task::JoinHandle<Result<CompletedDownload, DownloadRunError>>,
     ) {
         let id = self
             .next_id
@@ -606,12 +605,16 @@ impl DownloadController {
         let checkpoint_resolver = self.checkpoint_resolver.clone();
         let classifier = RetryClassifier::new(self.config.retry.clone());
         let origin_registry = self.origin_registry.clone();
+        let transfer_ledger = self.transfer_ledger.clone();
+        let job_memory_high_water = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let job_memory_cell = Arc::clone(&job_memory_high_water);
         let join = tokio::spawn(async move {
             let this = Self {
                 execution,
                 config,
                 classifier,
                 checkpoint_resolver,
+                transfer_ledger,
                 origin_registry,
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 metrics: metrics_for_run.clone(),
@@ -628,12 +631,21 @@ impl DownloadController {
                     handle_cell.clone(),
                     rate_bucket_for_run,
                     global_bucket_for_run,
+                    job_memory_cell,
                 )
                 .await;
             match &terminal {
-                Ok(result) => metrics_for_run.record_result(result),
-                Err(error) => metrics_for_run.record_task_error(error),
+                Ok(result) => metrics_for_run.record_completed(result),
+                Err(error) => metrics_for_run.record_run_error(error),
             }
+            // Transfer-memory metrics at terminal (task 3.7): the engine
+            // ledger's live sample (failure cleanup visible: residual
+            // charges are connection footprints only) plus this job's
+            // accounted-pipeline peak.
+            metrics_for_run.record_transfer_memory(this.transfer_ledger.snapshot());
+            metrics_for_run.record_job_memory_high_water(
+                job_memory_high_water.load(std::sync::atomic::Ordering::SeqCst),
+            );
             terminal
         });
         (handle, join)
@@ -646,12 +658,20 @@ impl DownloadController {
     pub async fn run_with_handle(
         &self,
         request: DownloadRequest,
-    ) -> Result<(DownloadResult, DownloadHandle), DownloadError> {
+    ) -> Result<(CompletedDownload, DownloadHandle), DownloadRunError> {
         let (handle, join) = self.start(request);
-        let result = join
-            .await
-            .map_err(|e| DownloadError::Protocol(format!("job task panicked: {e}")))??;
-        Ok((result, handle))
+        // A task-join failure (the spawned job panicked or was aborted)
+        // stays distinct from the job's own terminal outcome: it maps to
+        // the engine infrastructure domain and never masks a transfer
+        // error reported through the join result.
+        let terminal = join.await.map_err(|e| {
+            DownloadRunError::Infrastructure(Box::new(EngineFailure {
+                error: DownloadError::Protocol(format!("job task panicked: {e}")),
+                partial: TransferAccounting::default(),
+                artifacts: ArtifactDisposition::default(),
+            }))
+        })??;
+        Ok((terminal, handle))
     }
 
     /// Body of the job pipeline, shared by both entry points.
@@ -667,31 +687,39 @@ impl DownloadController {
         segmented_cell: Arc<std::sync::OnceLock<Arc<crate::job::segmented::SegmentedJob>>>,
         rate_bucket_shared: Arc<crate::control::rate_limit::TokenBucket>,
         global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
-    ) -> Result<DownloadResult, DownloadError> {
+        job_memory_high_water: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<CompletedDownload, DownloadRunError> {
+        // The job's transfer-memory ledger (design D3): one instance per
+        // run, sharing the controller/engine aggregate pool. Every frame
+        // the pipeline holds is admitted through it (task 3.4). The guard
+        // publishes the job's accounted-pipeline peak on EVERY exit path.
+        let job_ledger =
+            std::sync::Arc::new(self.transfer_ledger.job(&self.config.transfer_memory));
+        let _memory_guard = MemoryHighWaterGuard {
+            ledger: Arc::clone(&job_ledger),
+            cell: job_memory_high_water,
+        };
         // Overwrite policy pre-check (§14.6): FailIfExists rejects before
         // any network activity.
         if request.overwrite == OverwritePolicy::FailIfExists && request.destination.exists() {
-            let _ = state.transition(JobState::Failing);
-            let _ = state.transition(JobState::Failed);
-            return Ok(DownloadResult {
-                status: ResultStatus::Failed,
-                final_path: None,
-                bytes_downloaded_from_network: 0,
-                bytes_reused_from_checkpoint: 0,
-                completed_bytes: 0,
-                wasted_bytes: 0,
-                retries: 0,
-                segment_requests: 0,
-                live_splits: 0,
-                total_size: None,
-                elapsed: Duration::ZERO,
-                validators: ResourceValidators::default(),
-                warnings: vec![],
-                error: Some(DownloadError::DestinationConflict(format!(
-                    "destination exists: {}",
-                    request.destination.display()
-                ))),
-            });
+            let error = DownloadError::DestinationConflict(format!(
+                "destination exists: {}",
+                request.destination.display()
+            ));
+            return Err(self.terminal_error(
+                &state,
+                &request,
+                error,
+                Self::sequential_accounting(
+                    &counters,
+                    None,
+                    Duration::ZERO,
+                    ResourceValidators::default(),
+                    vec![],
+                ),
+                ArtifactDisposition::default(),
+                CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+            ));
         }
 
         // Hold destination ownership before any checkpoint resolution/admission
@@ -700,15 +728,20 @@ impl DownloadController {
         let _destination_lease = match DestinationLease::acquire(&request.destination) {
             Ok(lease) => lease,
             Err(error) => {
-                return self.terminal_failed(
+                return Err(self.terminal_error(
                     &state,
-                    request,
-                    counters,
-                    Duration::ZERO,
+                    &request,
                     error,
-                    ResourceValidators::default(),
-                    vec![],
-                );
+                    Self::sequential_accounting(
+                        &counters,
+                        None,
+                        Duration::ZERO,
+                        ResourceValidators::default(),
+                        vec![],
+                    ),
+                    ArtifactDisposition::default(),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                ));
             }
         };
 
@@ -730,14 +763,19 @@ impl DownloadController {
         let selected = match self.checkpoint_resolver.resolve(&resolve_context) {
             Ok(store) => store,
             Err(e) => {
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                return Ok(self.failed_result(
-                    request,
-                    counters,
-                    Duration::ZERO,
+                return Err(self.terminal_error(
+                    &state,
+                    &request,
                     DownloadError::Checkpoint(e.to_string()),
-                    ResourceValidators::default(),
+                    Self::sequential_accounting(
+                        &counters,
+                        None,
+                        Duration::ZERO,
+                        ResourceValidators::default(),
+                        vec![],
+                    ),
+                    ArtifactDisposition::default(),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                 ));
             }
         };
@@ -754,14 +792,19 @@ impl DownloadController {
             Ok(pending) => pending,
             Err(failure) => {
                 Self::emit_resume_notices(&hub, &failure.notices).await;
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                return Ok(self.failed_result(
-                    request,
-                    counters,
-                    Duration::ZERO,
+                return Err(self.terminal_error(
+                    &state,
+                    &request,
                     failure.error,
-                    ResourceValidators::default(),
+                    Self::sequential_accounting(
+                        &counters,
+                        None,
+                        Duration::ZERO,
+                        ResourceValidators::default(),
+                        vec![],
+                    ),
+                    ArtifactDisposition::default(),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                 ));
             }
         };
@@ -800,9 +843,17 @@ impl DownloadController {
                 verify_range_support: self.config.transfer.verify_range_support,
             };
             if cancel.is_cancelled() {
-                return self
-                    .terminal_cancelled(&state, request, counters, Duration::ZERO, &hub, vec![])
-                    .await;
+                return Err(self
+                    .terminal_cancelled(
+                        &state,
+                        counters,
+                        Duration::ZERO,
+                        &hub,
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                        vec![],
+                        ArtifactDisposition::default(),
+                    )
+                    .await);
             }
             // Shared-origin admission: one fair request slot for
             // the probe's dispatch, keyed by the request URL's origin — the
@@ -812,35 +863,34 @@ impl DownloadController {
                 Ok(permit) => permit,
                 Err(e) => {
                     if matches!(e, DownloadError::Cancelled) || cancel.is_cancelled() {
-                        return self
+                        return Err(self
                             .terminal_cancelled(
                                 &state,
-                                request,
                                 counters,
                                 Duration::ZERO,
                                 &hub,
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
                                 vec![],
+                                ArtifactDisposition::default(),
                             )
-                            .await;
+                            .await);
                     }
-                    let _ = state.transition(JobState::Failing);
-                    let _ = state.transition(JobState::Failed);
-                    return Ok(DownloadResult {
-                        status: ResultStatus::Failed,
-                        final_path: None,
-                        bytes_downloaded_from_network: 0,
-                        bytes_reused_from_checkpoint: 0,
-                        completed_bytes: 0,
-                        wasted_bytes: 0,
-                        retries: 0,
-                        segment_requests: 0,
-                        live_splits: 0,
-                        total_size: None,
-                        elapsed: Duration::ZERO,
-                        validators: ResourceValidators::default(),
-                        warnings: vec![],
-                        error: Some(e),
-                    });
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        e,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            ResourceValidators::default(),
+                            vec![],
+                        ),
+                        ArtifactDisposition::default(),
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
                 }
             };
             // Semantic probe (§32): the HTTP layer owns HEAD interpretation
@@ -901,24 +951,22 @@ impl DownloadController {
                             tokio::time::sleep(delay).await;
                         }
                         RetryDecision::GiveUp => {
-                            let _ = state.transition(JobState::Failing);
-                            let _ = state.transition(JobState::Failed);
-                            return Ok(DownloadResult {
-                                status: ResultStatus::Failed,
-                                final_path: None,
-                                bytes_downloaded_from_network: 0,
-                                bytes_reused_from_checkpoint: 0,
-                                completed_bytes: 0,
-                                wasted_bytes: 0,
-                                retries: 0,
-                                segment_requests: 0,
-                                live_splits: 0,
-                                total_size: None,
-                                elapsed: Duration::ZERO,
-                                validators: ResourceValidators::default(),
-                                warnings: vec![],
-                                error: Some(e),
-                            });
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                e,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
                         }
                     }
                 }
@@ -946,14 +994,19 @@ impl DownloadController {
             crate::resume::flow::AdmissionDecision::Proceed(plan) => *plan,
             crate::resume::flow::AdmissionDecision::Reject(failure) => {
                 Self::emit_resume_notices(&hub, &failure.notices).await;
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                return Ok(self.failed_result(
-                    request,
-                    counters,
-                    Duration::ZERO,
+                return Err(self.terminal_error(
+                    &state,
+                    &request,
                     failure.error,
-                    meta.validators.clone(),
+                    Self::sequential_accounting(
+                        &counters,
+                        None,
+                        Duration::ZERO,
+                        meta.validators.clone(),
+                        vec![],
+                    ),
+                    ArtifactDisposition::default(),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                 ));
             }
         };
@@ -964,16 +1017,21 @@ impl DownloadController {
         // Size expectation check (§4.1): caller-provided size must match.
         if let (Some(expected), Some(actual)) = (request.expected_size, meta.total_size) {
             if expected != actual {
-                let _ = state.transition(JobState::Failing);
-                let _ = state.transition(JobState::Failed);
-                return Ok(self.failed_result(
-                    request,
-                    counters,
-                    Duration::ZERO,
+                return Err(self.terminal_error(
+                    &state,
+                    &request,
                     DownloadError::Protocol(format!(
                         "expected size {expected} but server reports {actual}"
                     )),
-                    meta.validators.clone(),
+                    Self::sequential_accounting(
+                        &counters,
+                        None,
+                        Duration::ZERO,
+                        meta.validators.clone(),
+                        vec![],
+                    ),
+                    ArtifactDisposition::default(),
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
                 ));
             }
         }
@@ -990,20 +1048,62 @@ impl DownloadController {
         // ---- Prepare (§9.1 Preparing, §14) ----
         let _ = state.transition(JobState::Preparing);
         let resuming = plan.is_resuming();
+        // Artifact tracking for terminal diagnostics (§9.4): whether a
+        // resumable checkpoint is on disk and whether the temporary output
+        // will survive this session at terminal time.
+        let mut checkpoint_retained = plan.checkpoint().is_some();
         let mut sink = if resuming {
             // Reuse the admitted temp file without truncating it; the session
             // preserves these bytes unless the caller explicitly aborts.
-            OutputSession::reopen(&request.destination, &TempFileSpec::default())
-                .map_err(|error| error.0)?
+            match OutputSession::reopen(&request.destination, &TempFileSpec::default()) {
+                Ok(sink) => sink,
+                Err(error) => {
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        error.0,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            ResourceValidators::default(),
+                            vec![],
+                        ),
+                        // A failed reopen leaves the resumed temp file in place.
+                        ArtifactDisposition {
+                            temp_retained: resuming,
+                            checkpoint_retained,
+                        },
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
+                }
+            }
         } else {
-            OutputSession::create(
+            match OutputSession::create(
                 &request.destination,
                 &TempFileSpec::default(),
                 self.config.transfer.preallocate_output,
                 self.config.transfer.preallocate_physical,
                 meta.total_size,
-            )
-            .map_err(|error| error.0)?
+            ) {
+                Ok(sink) => sink,
+                Err(error) => {
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        error.0,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            ResourceValidators::default(),
+                            vec![],
+                        ),
+                        ArtifactDisposition::default(),
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
+                }
+            }
         };
         // ---- Segmented mode dispatch (§12) ----
         if eligible {
@@ -1044,10 +1144,12 @@ impl DownloadController {
                 cancel_mode.clone(),
                 resumed.ranges.to_vec(),
                 started,
+                checkpoint_retained,
                 Some(segmented_cell.clone()),
                 initial_bucket,
                 self.origin_registry.clone(),
                 global_rate_bucket,
+                job_ledger,
             )
             .await;
             return self
@@ -1061,6 +1163,7 @@ impl DownloadController {
                     outcome,
                     sink,
                     warnings,
+                    checkpoint_retained,
                 )
                 .await;
         }
@@ -1100,19 +1203,23 @@ impl DownloadController {
             if let Some(cp) = plan.checkpoint() {
                 let mut fresh = cp.clone();
                 fresh.final_url = meta.final_url.clone();
-                if let Err(e) = store.save_atomic(&fresh) {
+                if let Err(e) = self
+                    .save_checkpoint_bounded(&job_ledger, &store, &fresh)
+                    .await
+                {
                     // A failed refresh cannot promise resumability: stop
                     // with the previous checkpoint untouched (§15.4).
-                    return self.checkpoint_save_failed(
+                    return Err(self.checkpoint_save_failed(
                         &state,
-                        request,
+                        &request,
                         counters,
                         started.elapsed(),
                         &mut sink,
                         validators.clone(),
                         warnings,
                         e,
-                    );
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
                 }
             }
         }
@@ -1130,15 +1237,20 @@ impl DownloadController {
         'download: loop {
             if cancel.is_cancelled() {
                 let elapsed = started.elapsed();
-                let cleanup_warnings = Self::cleanup_cancelled(
-                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-                    &mut sink,
-                    store.as_ref(),
-                    &identity,
-                );
-                return self
-                    .terminal_cancelled(&state, request, counters, elapsed, &hub, cleanup_warnings)
-                    .await;
+                let mode =
+                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst));
+                let cleanup = Self::cleanup_cancelled(mode, &mut sink, store.as_ref(), &identity);
+                return Err(self
+                    .terminal_cancelled(
+                        &state,
+                        counters,
+                        elapsed,
+                        &hub,
+                        mode,
+                        cleanup.warnings,
+                        cleanup.artifacts,
+                    )
+                    .await);
             }
             // Fast path: nothing left to fetch (resume covered everything).
             if meta.total_size.is_some_and(|t| offset >= t) {
@@ -1206,40 +1318,41 @@ impl DownloadController {
                 Err(e) => {
                     if matches!(e, DownloadError::Cancelled) || cancel.is_cancelled() {
                         let elapsed = started.elapsed();
-                        let cleanup_warnings = Self::cleanup_cancelled(
-                            CancelMode::from_u8(
-                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                            ),
-                            &mut sink,
-                            store.as_ref(),
-                            &identity,
+                        let mode = CancelMode::from_u8(
+                            cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                         );
-                        return self
+                        let cleanup =
+                            Self::cleanup_cancelled(mode, &mut sink, store.as_ref(), &identity);
+                        return Err(self
                             .terminal_cancelled(
                                 &state,
-                                request,
                                 counters,
                                 elapsed,
                                 &hub,
-                                cleanup_warnings,
+                                mode,
+                                cleanup.warnings,
+                                cleanup.artifacts,
                             )
-                            .await;
+                            .await);
                     }
-                    let _ = sink.abort();
-                    return self
-                        .terminal_failed(
-                            &state,
-                            request,
-                            counters,
+                    let temp_retained = sink.abort().is_err();
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        e,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
                             started.elapsed(),
-                            e,
                             validators,
                             warnings,
-                        )
-                        .map(|mut r| {
-                            r.final_path = None;
-                            r
-                        });
+                        ),
+                        ArtifactDisposition {
+                            temp_retained,
+                            checkpoint_retained,
+                        },
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
                 }
             };
             // Semantic transfer (§32): failures carry classified errors,
@@ -1265,21 +1378,26 @@ impl DownloadController {
                     // MAX_AUTH_STAGES times; never loop authentication.
                     if let (Some(ch), Some(provider)) = (&challenge, &request.credential_provider) {
                         if !auth_guard.can_provide() {
-                            let _ = sink.abort();
-                            return self
-                                .terminal_failed(
-                                    &state,
-                                    request,
-                                    counters,
+                            let temp_retained = sink.abort().is_err();
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                DownloadError::AuthenticationRequired,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
                                     started.elapsed(),
-                                    DownloadError::AuthenticationRequired,
                                     validators,
                                     warnings,
-                                )
-                                .map(|mut r| {
-                                    r.final_path = None;
-                                    r
-                                });
+                                ),
+                                ArtifactDisposition {
+                                    temp_retained,
+                                    checkpoint_retained,
+                                },
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
                         }
                         auth_guard.record();
                         match provider.request(ch) {
@@ -1290,21 +1408,26 @@ impl DownloadController {
                                 }
                             }
                             _ => {
-                                let _ = sink.abort();
-                                return self
-                                    .terminal_failed(
-                                        &state,
-                                        request,
-                                        counters,
+                                let temp_retained = sink.abort().is_err();
+                                return Err(self.terminal_error(
+                                    &state,
+                                    &request,
+                                    DownloadError::AuthenticationRequired,
+                                    Self::sequential_accounting(
+                                        &counters,
+                                        None,
                                         started.elapsed(),
-                                        DownloadError::AuthenticationRequired,
                                         validators,
                                         warnings,
-                                    )
-                                    .map(|mut r| {
-                                        r.final_path = None;
-                                        r
-                                    });
+                                    ),
+                                    ArtifactDisposition {
+                                        temp_retained,
+                                        checkpoint_retained,
+                                    },
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
                             }
                         }
                         continue 'download; // re-issue with provider headers
@@ -1326,7 +1449,7 @@ impl DownloadController {
                     // Retry classification (§17.1-§17.2) with server-provided
                     // retry timing; single-stream status/transport failures
                     // restart from zero (no committed prefix yet, §41).
-                    let _ = sink.abort();
+                    let temp_retained = sink.abort().is_err();
                     match self.classifier.decide(&e, attempt, retry_after) {
                         RetryDecision::Retry {
                             attempt: next,
@@ -1335,14 +1458,36 @@ impl DownloadController {
                             counters.worker(0).expect("w").add_retries(1);
                             attempt = next;
                             offset = 0;
-                            sink = OutputSession::create(
+                            sink = match OutputSession::create(
                                 &request.destination,
                                 &TempFileSpec::default(),
                                 self.config.transfer.preallocate_output,
                                 self.config.transfer.preallocate_physical,
                                 meta.total_size,
-                            )
-                            .map_err(|error| error.0)?;
+                            ) {
+                                Ok(sink) => sink,
+                                Err(error) => {
+                                    return Err(self.terminal_error(
+                                        &state,
+                                        &request,
+                                        error.0,
+                                        Self::sequential_accounting(
+                                            &counters,
+                                            None,
+                                            started.elapsed(),
+                                            validators,
+                                            warnings,
+                                        ),
+                                        ArtifactDisposition {
+                                            temp_retained,
+                                            checkpoint_retained,
+                                        },
+                                        CancelMode::from_u8(
+                                            cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                        ),
+                                    ));
+                                }
+                            };
                             if let Some(status) = e.http_status() {
                                 hub.emit(Event::Warning {
                                     detail: format!("status {status} retrying from zero ({e})"),
@@ -1365,20 +1510,26 @@ impl DownloadController {
                             } else {
                                 e
                             };
-                            return self
-                                .terminal_failed(
-                                    &state,
-                                    request,
-                                    counters,
+                            let temp_retained = sink.abort().is_err();
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                err,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
                                     started.elapsed(),
-                                    err,
                                     validators,
                                     warnings,
-                                )
-                                .map(|mut r| {
-                                    r.final_path = None;
-                                    r
-                                });
+                                ),
+                                ArtifactDisposition {
+                                    temp_retained,
+                                    checkpoint_retained,
+                                },
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
                         }
                     }
                 }
@@ -1396,22 +1547,21 @@ impl DownloadController {
                 // Chunk read with cancellation checks (§9.2 invariant 8).
                 if cancel.is_cancelled() {
                     let elapsed = started.elapsed();
-                    let cleanup_warnings = Self::cleanup_cancelled(
-                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-                        &mut sink,
-                        store.as_ref(),
-                        &identity,
-                    );
-                    return self
+                    let mode =
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst));
+                    let cleanup =
+                        Self::cleanup_cancelled(mode, &mut sink, store.as_ref(), &identity);
+                    return Err(self
                         .terminal_cancelled(
                             &state,
-                            request,
                             counters,
                             elapsed,
                             &hub,
-                            cleanup_warnings,
+                            mode,
+                            cleanup.warnings,
+                            cleanup.artifacts,
                         )
-                        .await;
+                        .await);
                 }
                 match body.next_chunk(&cancel).await {
                     Ok(BodyEvent::Data(data)) => {
@@ -1419,20 +1569,78 @@ impl DownloadController {
                         if let Some(max) = request.expected_size {
                             if offset + len > max {
                                 // Overshoot is a protocol violation (§11.2).
-                                let _ = sink.abort();
-                                return self.terminal_failed(
+                                let temp_retained = sink.abort().is_err();
+                                return Err(self.terminal_error(
                                     &state,
-                                    request,
-                                    counters,
-                                    started.elapsed(),
+                                    &request,
                                     DownloadError::Protocol(format!(
                                         "body exceeds expected size {max}"
                                     )),
-                                    validators,
-                                    warnings,
-                                );
+                                    Self::sequential_accounting(
+                                        &counters,
+                                        None,
+                                        started.elapsed(),
+                                        validators,
+                                        warnings,
+                                    ),
+                                    ArtifactDisposition {
+                                        temp_retained,
+                                        checkpoint_retained,
+                                    },
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
                             }
                         }
+
+                        // Transfer-memory admission (design D3, task 3.4):
+                        // the owned chunk is charged to the job ledger from
+                        // receipt until its write acknowledges; the RAII
+                        // reservation releases on every error/cancel path.
+                        // An atomic chunk larger than a cap can never fit:
+                        // typed refusal, no wait.
+                        let mut reservation = match job_ledger
+                            .reserve(crate::io::transfer_ledger::Component::Frames, len)
+                            .await
+                        {
+                            Ok(reservation) => reservation,
+                            Err(crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                                crate::io::transfer_ledger::OversizeRefusal {
+                                    component,
+                                    requested,
+                                    cap,
+                                },
+                            )) => {
+                                let temp_retained = sink.abort().is_err();
+                                return Err(self.terminal_error(
+                                    &state,
+                                    &request,
+                                    DownloadError::MemoryCapExceeded {
+                                        component: component.name(),
+                                        requested,
+                                        cap,
+                                    },
+                                    Self::sequential_accounting(
+                                        &counters,
+                                        None,
+                                        started.elapsed(),
+                                        validators,
+                                        warnings,
+                                    ),
+                                    ArtifactDisposition {
+                                        temp_retained,
+                                        checkpoint_retained,
+                                    },
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
+                            }
+                            Err(crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_)) => {
+                                unreachable!("reserve waits fairly for capacity")
+                            }
+                        };
 
                         // Rate tokens first: payload bytes only (§18.2).
                         // The hierarchical limiter aggregates job and
@@ -1455,16 +1663,106 @@ impl DownloadController {
                         }
 
                         // Backpressure: single in-flight chunk; write then
-                        // read (§13.1).
-                        sink.write_at(offset, &data).map_err(|se| {
-                            let _ = sink.abort();
-                            se.0
-                        })?;
+                        // read (§13.1). The chunk retags Frames -> Writer
+                        // for the write (single charge; the writer
+                        // component cap bounds it).
+                        if let Err(refusal) = reservation
+                            .retag(crate::io::transfer_ledger::Component::Writer)
+                            .await
+                        {
+                            let (component, requested, cap) = match refusal {
+                                crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                                    crate::io::transfer_ledger::OversizeRefusal {
+                                        component,
+                                        requested,
+                                        cap,
+                                    },
+                                ) => (component, requested, cap),
+                                crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_) => {
+                                    unreachable!("retag waits fairly for capacity")
+                                }
+                            };
+                            let temp_retained = sink.abort().is_err();
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                DownloadError::MemoryCapExceeded {
+                                    component: component.name(),
+                                    requested,
+                                    cap,
+                                },
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    started.elapsed(),
+                                    validators,
+                                    warnings,
+                                ),
+                                ArtifactDisposition {
+                                    temp_retained,
+                                    checkpoint_retained,
+                                },
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                        if let Err(se) = sink.write_at(offset, &data) {
+                            let error = se.0;
+                            // A failed write is terminal: route it through
+                            // the typed terminal path instead of an unchecked
+                            // `?` escape (§13.1, task 1.3).
+                            if matches!(error, DownloadError::Cancelled) || cancel.is_cancelled() {
+                                let mode = CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                );
+                                let cleanup = Self::cleanup_cancelled(
+                                    mode,
+                                    &mut sink,
+                                    store.as_ref(),
+                                    &identity,
+                                );
+                                return Err(self
+                                    .terminal_cancelled(
+                                        &state,
+                                        counters,
+                                        started.elapsed(),
+                                        &hub,
+                                        mode,
+                                        cleanup.warnings,
+                                        cleanup.artifacts,
+                                    )
+                                    .await);
+                            }
+                            let temp_retained = sink.abort().is_err();
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    started.elapsed(),
+                                    validators,
+                                    warnings,
+                                ),
+                                ArtifactDisposition {
+                                    temp_retained,
+                                    checkpoint_retained,
+                                },
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
                         counters.worker(0).expect("w").add_network(len);
                         counters.worker(0).expect("w").add_completed(len);
                         offset += len;
                         durable.page_cache_ack(offset);
                         written_this_stream += len;
+                        // The write acknowledged: the chunk is no longer
+                        // held (design D3 single charge, released on ack).
+                        drop(reservation);
 
                         // Checkpoint cadence (§8.1): record progress on the
                         // configured interval (§15.4 performance mode).
@@ -1483,21 +1781,27 @@ impl DownloadController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                            if let Err(e) = store.save_atomic(&cp) {
+                            if let Err(e) =
+                                self.save_checkpoint_bounded(&job_ledger, &store, &cp).await
+                            {
                                 // A failed cadence save must stop the job:
                                 // transfer continues would claim resumable
                                 // state that was never persisted (§15.4).
-                                return self.checkpoint_save_failed(
+                                return Err(self.checkpoint_save_failed(
                                     &state,
-                                    request,
+                                    &request,
                                     counters,
                                     started.elapsed(),
                                     &mut sink,
                                     validators.clone(),
                                     warnings,
                                     e,
-                                );
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
                             }
+                            checkpoint_retained = true;
                             sink.preserve_partial();
                         }
                     }
@@ -1521,21 +1825,27 @@ impl DownloadController {
                             cp.validators = validators.clone();
                             cp.final_url = meta.final_url.clone();
                             cp.completed_ranges = vec![(0, offset.saturating_sub(1))];
-                            if let Err(e) = store.save_atomic(&cp) {
+                            if let Err(e) =
+                                self.save_checkpoint_bounded(&job_ledger, &store, &cp).await
+                            {
                                 // Pause must not claim a resumable state
                                 // that failed to persist: stop with the
                                 // partial output preserved (§9.3, §15.4).
-                                return self.checkpoint_save_failed(
+                                return Err(self.checkpoint_save_failed(
                                     &state,
-                                    request,
+                                    &request,
                                     counters,
                                     started.elapsed(),
                                     &mut sink,
                                     validators.clone(),
                                     warnings,
                                     e,
-                                );
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
                             }
+                            checkpoint_retained = true;
                             sink.preserve_partial();
                         }
                         // Wait while paused, then continue or cancel.
@@ -1543,48 +1853,44 @@ impl DownloadController {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                         if cancel.is_cancelled() {
-                            let cleanup_warnings = Self::cleanup_cancelled(
-                                CancelMode::from_u8(
-                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                                ),
-                                &mut sink,
-                                store.as_ref(),
-                                &identity,
+                            let mode = CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                             );
-                            return self
+                            let cleanup =
+                                Self::cleanup_cancelled(mode, &mut sink, store.as_ref(), &identity);
+                            return Err(self
                                 .terminal_cancelled(
                                     &state,
-                                    request,
                                     counters,
                                     started.elapsed(),
                                     &hub,
-                                    cleanup_warnings,
+                                    mode,
+                                    cleanup.warnings,
+                                    cleanup.artifacts,
                                 )
-                                .await;
+                                .await);
                         }
                     }
                     Err(DownloadError::Cancelled) => {
                         // Cancellation interrupts a pending read (§32): same
                         // terminal path as an observed cancel.
                         let elapsed = started.elapsed();
-                        let cleanup_warnings = Self::cleanup_cancelled(
-                            CancelMode::from_u8(
-                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
-                            ),
-                            &mut sink,
-                            store.as_ref(),
-                            &identity,
+                        let mode = CancelMode::from_u8(
+                            cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
                         );
-                        return self
+                        let cleanup =
+                            Self::cleanup_cancelled(mode, &mut sink, store.as_ref(), &identity);
+                        return Err(self
                             .terminal_cancelled(
                                 &state,
-                                request,
                                 counters,
                                 elapsed,
                                 &hub,
-                                cleanup_warnings,
+                                mode,
+                                cleanup.warnings,
+                                cleanup.artifacts,
                             )
-                            .await;
+                            .await);
                     }
                     Err(err) => {
                         // Body fault or read-idle timeout, already classified
@@ -1614,22 +1920,68 @@ impl DownloadController {
                                     // deleting the temp file we are
                                     // preserving.
                                     sink.preserve_partial();
-                                    sink = OutputSession::reopen(
+                                    sink = match OutputSession::reopen(
                                         &request.destination,
                                         &TempFileSpec::default(),
-                                    )
-                                    .map_err(|error| error.0)?;
+                                    ) {
+                                        Ok(sink) => sink,
+                                        Err(error) => {
+                                            return Err(self.terminal_error(
+                                                &state,
+                                                &request,
+                                                error.0,
+                                                Self::sequential_accounting(
+                                                    &counters,
+                                                    None,
+                                                    started.elapsed(),
+                                                    validators,
+                                                    warnings,
+                                                ),
+                                                ArtifactDisposition {
+                                                    temp_retained: true,
+                                                    checkpoint_retained,
+                                                },
+                                                CancelMode::from_u8(
+                                                    cancel_mode
+                                                        .load(std::sync::atomic::Ordering::SeqCst),
+                                                ),
+                                            ));
+                                        }
+                                    };
                                 } else {
                                     offset = 0;
-                                    let _ = sink.abort();
-                                    sink = OutputSession::create(
+                                    let temp_retained = sink.abort().is_err();
+                                    sink = match OutputSession::create(
                                         &request.destination,
                                         &TempFileSpec::default(),
                                         self.config.transfer.preallocate_output,
                                         self.config.transfer.preallocate_physical,
                                         meta.total_size,
-                                    )
-                                    .map_err(|error| error.0)?;
+                                    ) {
+                                        Ok(sink) => sink,
+                                        Err(error) => {
+                                            return Err(self.terminal_error(
+                                                &state,
+                                                &request,
+                                                error.0,
+                                                Self::sequential_accounting(
+                                                    &counters,
+                                                    None,
+                                                    started.elapsed(),
+                                                    validators,
+                                                    warnings,
+                                                ),
+                                                ArtifactDisposition {
+                                                    temp_retained,
+                                                    checkpoint_retained,
+                                                },
+                                                CancelMode::from_u8(
+                                                    cancel_mode
+                                                        .load(std::sync::atomic::Ordering::SeqCst),
+                                                ),
+                                            ));
+                                        }
+                                    };
                                 }
                                 hub.emit(Event::Warning {
                                     detail: format!(
@@ -1641,7 +1993,7 @@ impl DownloadController {
                                 continue 'download;
                             }
                             RetryDecision::GiveUp => {
-                                let _ = sink.abort();
+                                let temp_retained = sink.abort().is_err();
                                 // Same exhaustion shaping as the transfer path
                                 // (§32 parity): retryable failures that exhausted
                                 // the budget report RetryExhausted.
@@ -1652,15 +2004,25 @@ impl DownloadController {
                                 } else {
                                     err
                                 };
-                                return self.terminal_failed(
+                                return Err(self.terminal_error(
                                     &state,
-                                    request,
-                                    counters,
-                                    started.elapsed(),
+                                    &request,
                                     err,
-                                    validators,
-                                    warnings,
-                                );
+                                    Self::sequential_accounting(
+                                        &counters,
+                                        None,
+                                        started.elapsed(),
+                                        validators,
+                                        warnings,
+                                    ),
+                                    ArtifactDisposition {
+                                        temp_retained,
+                                        checkpoint_retained,
+                                    },
+                                    CancelMode::from_u8(
+                                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -1674,68 +2036,73 @@ impl DownloadController {
         }
 
         let total_size = meta.total_size.or(request.expected_size);
-        let snapshot = counters.fold();
-        let summary = CompletionSummary {
-            network_bytes: snapshot.network_bytes,
-            reused_bytes: snapshot.reused_bytes,
-            completed_bytes: snapshot.completed_bytes,
-            wasted_bytes: snapshot.wasted_bytes,
-            retries: snapshot.retries,
-            segment_requests: 0,
-            live_splits: 0,
+        let accounting = Self::sequential_accounting(
+            &counters,
             total_size,
-            elapsed: started.elapsed(),
+            started.elapsed(),
             validators,
             warnings,
-        };
-        Ok(self
-            .complete_verified_output(
-                &request,
-                &state,
-                &hub,
-                store.as_ref(),
-                &identity,
-                sink,
-                summary,
-            )
-            .await)
+        );
+        self.complete_verified_output(
+            &request,
+            &state,
+            &hub,
+            store.as_ref(),
+            &identity,
+            sink,
+            accounting,
+            checkpoint_retained,
+        )
+        .await
     }
 
     /// Cleanup for a cancelled job per [`CancelMode`] (§9.4):
     /// DeletePartial removes temp+checkpoint; KeepPartial keeps both;
     /// KeepFileDiscardCheckpoint removes only the checkpoint.
     ///
-    /// Returns checkpoint-cleanup warnings: deletion happens after the
-    /// cancellation outcome is already determined, so a delete failure is
-    /// surfaced as an actionable warning instead of rewriting the result
-    /// (§9.2: `Cancelled` is defined by the caller's request).
+    /// Returns the cleanup warnings and the resulting artifact
+    /// disposition: deletion happens after the cancellation outcome is
+    /// already determined, so a delete failure is surfaced as an
+    /// actionable warning (and a retained artifact) instead of rewriting
+    /// the result (§9.2: `Cancelled` is defined by the caller's request).
     pub(crate) fn cleanup_cancelled<S: Sink + PartialArtifactOwner>(
         mode: CancelMode,
         sink: &mut S,
         store: &dyn CheckpointStore,
         identity: &str,
-    ) -> Vec<String> {
+    ) -> CancelCleanup {
         let mut warnings = Vec::new();
+        let mut artifacts = ArtifactDisposition::default();
         match mode {
             CancelMode::DeletePartial => {
-                let _ = sink.abort();
+                artifacts.temp_retained = sink.abort().is_err();
                 if let Err(e) = store.delete(identity) {
+                    artifacts.checkpoint_retained = true;
                     warnings.push(Self::checkpoint_cleanup_warning(e));
                 }
             }
             CancelMode::KeepPartial => {
                 let _ = sink.flush(FlushLevel::PageCache);
                 sink.preserve_partial();
+                artifacts = ArtifactDisposition {
+                    temp_retained: true,
+                    checkpoint_retained: true,
+                };
             }
             CancelMode::KeepFileDiscardCheckpoint => {
                 let _ = sink.flush(FlushLevel::PageCache);
                 sink.preserve_partial();
+                artifacts.temp_retained = true;
                 if let Err(e) = store.delete(identity) {
+                    artifacts.checkpoint_retained = true;
                     warnings.push(Self::checkpoint_cleanup_warning(e));
                 }
             }
         }
-        warnings
+        CancelCleanup {
+            warnings,
+            artifacts,
+        }
     }
 
     /// The actionable warning for incomplete checkpoint cleanup after an
@@ -1774,67 +2141,47 @@ impl DownloadController {
         outcome: crate::job::segmented::SegmentedOutcome,
         sink: OutputSession,
         mut warnings: Vec<String>,
-    ) -> Result<DownloadResult, DownloadError> {
+        checkpoint_retained: bool,
+    ) -> Result<CompletedDownload, DownloadRunError> {
         if outcome.status == ResultStatus::Cancelled {
             let _ = state.transition(JobState::Cancelling);
             let _ = state.transition(JobState::Cancelled);
             // Segmented cleanup warnings (delete failures) join the
             // admission warnings; the outcome remains Cancelled (§9.2).
-            warnings.extend(outcome.warnings);
-            return Ok(DownloadResult {
-                status: ResultStatus::Cancelled,
-                final_path: None,
-                bytes_downloaded_from_network: outcome.network_bytes,
-                bytes_reused_from_checkpoint: outcome.reused_bytes,
-                completed_bytes: outcome.completed_bytes,
-                wasted_bytes: outcome.wasted_bytes,
-                retries: outcome.retries,
-                segment_requests: outcome.segment_requests,
-                live_splits: outcome.live_splits,
-                total_size: None,
-                elapsed: outcome.elapsed,
-                validators: outcome.validators,
-                warnings,
-                error: outcome.error,
-            });
+            warnings.extend(outcome.warnings.clone());
+            return Err(DownloadRunError::Cancelled(Box::new(CancellationSummary {
+                mode: outcome.cancel_mode,
+                partial: Self::segmented_accounting(&outcome, warnings),
+                artifacts: outcome.artifacts,
+            })));
         }
+        warnings.extend(outcome.warnings.clone());
         if outcome.status == ResultStatus::Failed {
-            let _ = state.transition(JobState::Failing);
-            let _ = state.transition(JobState::Failed);
-            return Ok(DownloadResult {
-                status: ResultStatus::Failed,
-                final_path: None,
-                bytes_downloaded_from_network: outcome.network_bytes,
-                bytes_reused_from_checkpoint: outcome.reused_bytes,
-                completed_bytes: outcome.completed_bytes,
-                wasted_bytes: outcome.wasted_bytes,
-                retries: outcome.retries,
-                segment_requests: outcome.segment_requests,
-                live_splits: outcome.live_splits,
-                total_size: outcome.total_size.into(),
-                elapsed: outcome.elapsed,
-                validators: outcome.validators,
-                warnings,
-                error: outcome.error,
-            });
+            let accounting = Self::segmented_accounting(&outcome, warnings);
+            let error = outcome
+                .error
+                .expect("failed segmented outcome carries its error");
+            return Err(self.terminal_error(
+                &state,
+                request,
+                error,
+                accounting,
+                outcome.artifacts,
+                outcome.cancel_mode,
+            ));
         }
-        warnings.extend(outcome.warnings);
-        let summary = CompletionSummary {
-            network_bytes: outcome.network_bytes,
-            reused_bytes: outcome.reused_bytes,
-            completed_bytes: outcome.completed_bytes,
-            wasted_bytes: outcome.wasted_bytes,
-            retries: outcome.retries,
-            segment_requests: outcome.segment_requests,
-            live_splits: outcome.live_splits,
-            total_size: Some(outcome.total_size),
-            elapsed: outcome.elapsed,
-            validators: outcome.validators,
-            warnings,
-        };
-        Ok(self
-            .complete_verified_output(request, &state, &hub, store, identity, sink, summary)
-            .await)
+        let accounting = Self::segmented_accounting(&outcome, warnings);
+        self.complete_verified_output(
+            request,
+            &state,
+            &hub,
+            store,
+            identity,
+            sink,
+            accounting,
+            checkpoint_retained,
+        )
+        .await
     }
 
     /// Sequence verification, durable finalization, publication, checkpoint
@@ -1848,8 +2195,18 @@ impl DownloadController {
         store: &dyn CheckpointStore,
         identity: &str,
         mut sink: OutputSession,
-        mut summary: CompletionSummary,
-    ) -> DownloadResult {
+        mut accounting: TransferAccounting,
+        checkpoint_retained: bool,
+    ) -> Result<CompletedDownload, DownloadRunError> {
+        // On a verification/commit failure the temp file survives exactly
+        // when the session preserves it on drop (segmented runs preserve
+        // the assembled file for diagnosis); the checkpoint state is
+        // unchanged because deletion happens only after a successful
+        // commit.
+        let artifacts_on_failure = ArtifactDisposition {
+            temp_retained: sink.preserves_partial_on_drop(),
+            checkpoint_retained,
+        };
         let _ = state.transition(JobState::Verifying);
         hub.emit(Event::IntegrityCheckStarted).await;
         let sink_size = match sink.size() {
@@ -1860,10 +2217,17 @@ impl DownloadController {
                     detail: error.to_string(),
                 })
                 .await;
-                return Self::completion_failed(state, request, summary, error);
+                return Err(self.terminal_error(
+                    state,
+                    request,
+                    error,
+                    accounting,
+                    artifacts_on_failure,
+                    CancelMode::DeletePartial,
+                ));
             }
         };
-        if let Some(expected) = summary.total_size {
+        if let Some(expected) = accounting.total_size {
             if sink_size != expected {
                 let error = DownloadError::IntegrityMismatch(format!(
                     "size mismatch: got {sink_size}, expected {expected}"
@@ -1872,7 +2236,14 @@ impl DownloadController {
                     detail: error.to_string(),
                 })
                 .await;
-                return Self::completion_failed(state, request, summary, error);
+                return Err(self.terminal_error(
+                    state,
+                    request,
+                    error,
+                    accounting,
+                    artifacts_on_failure,
+                    CancelMode::DeletePartial,
+                ));
             }
         }
         if !request.integrity.expected_hashes.is_empty() {
@@ -1881,7 +2252,14 @@ impl DownloadController {
                     detail: error.to_string(),
                 })
                 .await;
-                return Self::completion_failed(state, request, summary, error);
+                return Err(self.terminal_error(
+                    state,
+                    request,
+                    error,
+                    accounting,
+                    artifacts_on_failure,
+                    CancelMode::DeletePartial,
+                ));
             }
             match verify_hashes(&request.integrity, sink.temp_path()) {
                 Ok(()) => hub.emit(Event::IntegrityCheckPassed).await,
@@ -1890,19 +2268,40 @@ impl DownloadController {
                         detail: error.to_string(),
                     })
                     .await;
-                    return Self::completion_failed(state, request, summary, error);
+                    return Err(self.terminal_error(
+                        state,
+                        request,
+                        error,
+                        accounting,
+                        artifacts_on_failure,
+                        CancelMode::DeletePartial,
+                    ));
                 }
             }
         }
         let _ = state.transition(JobState::Committing);
         if let Err(error) = sink.finalize() {
-            return Self::completion_failed(state, request, summary, error.0);
+            return Err(self.terminal_error(
+                state,
+                request,
+                error.0,
+                accounting,
+                artifacts_on_failure,
+                CancelMode::DeletePartial,
+            ));
         }
         let (final_path, publication_warning) =
             match sink.commit_with_policy(publication_mode(request.overwrite)) {
                 Ok(result) => result,
                 Err(error) => {
-                    return Self::completion_failed(state, request, summary, error.0);
+                    return Err(self.terminal_error(
+                        state,
+                        request,
+                        error.0,
+                        accounting,
+                        artifacts_on_failure,
+                        CancelMode::DeletePartial,
+                    ));
                 }
             };
         if let Some(warning) = publication_warning {
@@ -1910,7 +2309,7 @@ impl DownloadController {
                 detail: warning.clone(),
             })
             .await;
-            summary.warnings.push(warning);
+            accounting.warnings.push(warning);
         }
         let cleanup_warnings = match store.delete(identity) {
             Ok(()) => Vec::new(),
@@ -1922,72 +2321,28 @@ impl DownloadController {
             })
             .await;
         }
-        summary.warnings.extend(cleanup_warnings);
+        accounting.warnings.extend(cleanup_warnings);
         let _ = state.transition(JobState::Completed);
         hub.emit(Event::Committed {
             path: final_path.display().to_string(),
         })
         .await;
-        DownloadResult {
-            status: ResultStatus::Completed,
-            final_path: Some(final_path),
-            bytes_downloaded_from_network: summary.network_bytes,
-            bytes_reused_from_checkpoint: summary.reused_bytes,
-            completed_bytes: summary.completed_bytes,
-            wasted_bytes: summary.wasted_bytes,
-            retries: summary.retries,
-            segment_requests: summary.segment_requests,
-            live_splits: summary.live_splits,
-            total_size: summary.total_size,
-            elapsed: summary.elapsed,
-            validators: summary.validators,
-            warnings: summary.warnings,
-            error: None,
-        }
+        Ok(CompletedDownload {
+            final_path,
+            accounting,
+        })
     }
 
-    fn completion_failed(
-        state: &Arc<StateMachine>,
-        request: &DownloadRequest,
-        summary: CompletionSummary,
-        error: DownloadError,
-    ) -> DownloadResult {
-        let _ = state.transition(JobState::Failing);
-        let _ = state.transition(JobState::Failed);
-        crate::observability::log_terminal_error(
-            &crate::observability::Correlation::new().origin(request.url.clone()),
-            &error,
-        );
-        DownloadResult {
-            status: ResultStatus::Failed,
-            final_path: None,
-            bytes_downloaded_from_network: summary.network_bytes,
-            bytes_reused_from_checkpoint: summary.reused_bytes,
-            completed_bytes: summary.completed_bytes,
-            wasted_bytes: summary.wasted_bytes,
-            retries: summary.retries,
-            segment_requests: 0,
-            live_splits: 0,
-            total_size: summary.total_size,
-            elapsed: summary.elapsed,
-            validators: summary.validators,
-            warnings: summary.warnings,
-            error: Some(error),
-        }
-    }
-
-    fn failed_result(
-        &self,
-        _request: DownloadRequest,
-        counters: Arc<JobCounters>,
+    /// Fold job counters into transfer accounting for a single-stream run.
+    fn sequential_accounting(
+        counters: &JobCounters,
+        total_size: Option<u64>,
         elapsed: Duration,
-        error: DownloadError,
         validators: ResourceValidators,
-    ) -> DownloadResult {
+        warnings: Vec<String>,
+    ) -> TransferAccounting {
         let snap = counters.fold();
-        DownloadResult {
-            status: ResultStatus::Failed,
-            final_path: None,
+        TransferAccounting {
             bytes_downloaded_from_network: snap.network_bytes,
             bytes_reused_from_checkpoint: snap.reused_bytes,
             completed_bytes: snap.completed_bytes,
@@ -1995,11 +2350,109 @@ impl DownloadController {
             retries: snap.retries,
             segment_requests: 0,
             live_splits: 0,
-            total_size: None,
+            total_size,
             elapsed,
             validators,
-            warnings: vec![],
-            error: Some(error),
+            warnings,
+        }
+    }
+
+    /// Fold a segmented outcome into transfer accounting.
+    fn segmented_accounting(
+        outcome: &crate::job::segmented::SegmentedOutcome,
+        warnings: Vec<String>,
+    ) -> TransferAccounting {
+        TransferAccounting {
+            bytes_downloaded_from_network: outcome.network_bytes,
+            bytes_reused_from_checkpoint: outcome.reused_bytes,
+            completed_bytes: outcome.completed_bytes,
+            wasted_bytes: outcome.wasted_bytes,
+            retries: outcome.retries,
+            segment_requests: outcome.segment_requests,
+            live_splits: outcome.live_splits,
+            total_size: Some(outcome.total_size),
+            elapsed: outcome.elapsed,
+            validators: outcome.validators.clone(),
+            warnings,
+        }
+    }
+
+    /// Persist one checkpoint under transfer-memory admission (task 3.6):
+    /// the checkpoint's estimated serialized size is charged to the
+    /// Checkpoint component BEFORE the store allocates; a refusal (an
+    /// oversized/fragmented checkpoint) is a typed failure through the
+    /// same safe path as any save failure — never an overclaim.
+    async fn save_checkpoint_bounded(
+        &self,
+        job_ledger: &crate::io::transfer_ledger::JobLedger,
+        store: &Arc<dyn CheckpointStore>,
+        checkpoint: &crate::resume::checkpoint::Checkpoint,
+    ) -> Result<(), crate::resume::checkpoint::CheckpointError> {
+        let estimate = checkpoint.serialized_size_estimate();
+        let reservation = job_ledger
+            .reserve(crate::io::transfer_ledger::Component::Checkpoint, estimate)
+            .await
+            .map_err(|refusal| match refusal {
+                crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                    crate::io::transfer_ledger::OversizeRefusal {
+                        requested: size,
+                        cap,
+                        ..
+                    },
+                ) => crate::resume::checkpoint::CheckpointError::TooLarge { size, cap },
+                crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_) => {
+                    unreachable!("reserve waits fairly for capacity")
+                }
+            })?;
+        let result = store.save_atomic(checkpoint);
+        drop(reservation);
+        result
+    }
+
+    /// Route one terminal engine error through the once-only terminal
+    /// transition (Failing -> Failed), terminal logging, and typed
+    /// failure classification (§20, design D1). Every non-success,
+    /// non-cancellation terminal branch funnels here exactly once; the
+    /// failure domain of the classified error selects the typed variant.
+    #[allow(clippy::too_many_arguments)]
+    fn terminal_error(
+        &self,
+        state: &Arc<StateMachine>,
+        request: &DownloadRequest,
+        error: DownloadError,
+        accounting: TransferAccounting,
+        artifacts: ArtifactDisposition,
+        cancel_mode: CancelMode,
+    ) -> DownloadRunError {
+        let _ = state.transition(JobState::Failing);
+        let _ = state.transition(JobState::Failed);
+        crate::observability::log_terminal_error(
+            &crate::observability::Correlation::new().origin(request.url.clone()),
+            &error,
+        );
+        match error.domain() {
+            FailureDomain::Transfer => DownloadRunError::Transfer(Box::new(TransferFailure {
+                error,
+                partial: accounting,
+                artifacts,
+            })),
+            FailureDomain::Infrastructure => {
+                DownloadRunError::Infrastructure(Box::new(EngineFailure {
+                    error,
+                    partial: accounting,
+                    artifacts,
+                }))
+            }
+            // Defensive: a cancellation-classified error that reached a
+            // failure path is still a caller cancellation — report the
+            // typed cancellation summary rather than a failure.
+            FailureDomain::Cancelled => {
+                DownloadRunError::Cancelled(Box::new(CancellationSummary {
+                    mode: cancel_mode,
+                    partial: accounting,
+                    artifacts,
+                }))
+            }
         }
     }
 
@@ -2012,58 +2465,44 @@ impl DownloadController {
     fn checkpoint_save_failed(
         &self,
         state: &Arc<StateMachine>,
-        request: DownloadRequest,
+        request: &DownloadRequest,
         counters: Arc<JobCounters>,
         elapsed: Duration,
         sink: &mut (impl Sink + PartialArtifactOwner),
         validators: ResourceValidators,
         warnings: Vec<String>,
         error: crate::resume::CheckpointError,
-    ) -> Result<DownloadResult, DownloadError> {
+        cancel_mode: CancelMode,
+    ) -> DownloadRunError {
         // Preserve the partial output beyond the last good checkpoint.
         let _ = sink.flush(FlushLevel::PageCache);
         sink.preserve_partial();
-        self.terminal_failed(
+        self.terminal_error(
             state,
             request,
-            counters,
-            elapsed,
             DownloadError::Checkpoint(error.to_string()),
-            validators,
-            warnings,
+            Self::sequential_accounting(&counters, None, elapsed, validators, warnings),
+            // The preserved output and the last complete checkpoint state
+            // both remain available.
+            ArtifactDisposition {
+                temp_retained: true,
+                checkpoint_retained: true,
+            },
+            cancel_mode,
         )
     }
-    #[allow(clippy::too_many_arguments)]
-    fn terminal_failed(
-        &self,
-        state: &Arc<StateMachine>,
-        request: DownloadRequest,
-        counters: Arc<JobCounters>,
-        elapsed: Duration,
-        error: DownloadError,
-        validators: ResourceValidators,
-        warnings: Vec<String>,
-    ) -> Result<DownloadResult, DownloadError> {
-        let _ = state.transition(JobState::Failing);
-        let _ = state.transition(JobState::Failed);
-        crate::observability::log_terminal_error(
-            &crate::observability::Correlation::new().origin(request.url.clone()),
-            &error,
-        );
-        let mut r = self.failed_result(request, counters, elapsed, error, validators);
-        r.warnings = warnings;
-        Ok(r)
-    }
 
+    #[allow(clippy::too_many_arguments)]
     async fn terminal_cancelled(
         &self,
         state: &Arc<StateMachine>,
-        _request: DownloadRequest,
         counters: Arc<JobCounters>,
         elapsed: Duration,
         hub: &SharedHub,
+        mode: CancelMode,
         warnings: Vec<String>,
-    ) -> Result<DownloadResult, DownloadError> {
+        artifacts: ArtifactDisposition,
+    ) -> DownloadRunError {
         // Cleanup warnings are published before the terminal transition:
         // the outcome stays Cancelled, the observation is not hidden.
         for warning in &warnings {
@@ -2074,23 +2513,18 @@ impl DownloadController {
         }
         let _ = state.transition(JobState::Cancelling);
         let _ = state.transition(JobState::Cancelled);
-        let snap = counters.fold();
-        Ok(DownloadResult {
-            status: ResultStatus::Cancelled,
-            final_path: None,
-            bytes_downloaded_from_network: snap.network_bytes,
-            bytes_reused_from_checkpoint: snap.reused_bytes,
-            completed_bytes: snap.completed_bytes,
-            wasted_bytes: snap.wasted_bytes,
-            retries: snap.retries,
-            segment_requests: 0,
-            live_splits: 0,
-            total_size: None,
+        let accounting = Self::sequential_accounting(
+            &counters,
+            None,
             elapsed,
-            validators: ResourceValidators::default(),
+            ResourceValidators::default(),
             warnings,
-            error: Some(DownloadError::Cancelled),
-        })
+        );
+        DownloadRunError::Cancelled(Box::new(CancellationSummary {
+            mode,
+            partial: accounting,
+            artifacts,
+        }))
     }
 }
 
@@ -2125,6 +2559,23 @@ fn verify_hashes(integrity: &IntegrityPolicy, path: &Path) -> Result<(), Downloa
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Publishes the job's accounted-pipeline high-water into the run's metrics
+/// cell on every exit path (task 3.7): drop runs on success, failure,
+/// cancellation and panic alike.
+struct MemoryHighWaterGuard {
+    ledger: std::sync::Arc<crate::io::transfer_ledger::JobLedger>,
+    cell: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Drop for MemoryHighWaterGuard {
+    fn drop(&mut self) {
+        self.cell.store(
+            self.ledger.job_high_water(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2181,9 +2632,9 @@ mod completion_tests {
                 &store,
                 "test-identity",
                 sink,
-                CompletionSummary {
-                    network_bytes: 3,
-                    reused_bytes: 0,
+                TransferAccounting {
+                    bytes_downloaded_from_network: 3,
+                    bytes_reused_from_checkpoint: 0,
                     completed_bytes: 3,
                     wasted_bytes: 0,
                     retries: 0,
@@ -2194,14 +2645,12 @@ mod completion_tests {
                     validators: ResourceValidators::default(),
                     warnings: Vec::new(),
                 },
+                false,
             )
             .await;
 
-        assert_eq!(result.status, ResultStatus::Failed);
-        assert_eq!(
-            result.error.as_ref().map(DownloadError::category),
-            Some(crate::error::ErrorCategory::SinkWrite)
-        );
+        let error = result.expect_err("finalize failure is terminal");
+        assert_eq!(error.category(), crate::error::ErrorCategory::SinkWrite);
         assert_eq!(state.get(), JobState::Failed);
         assert_eq!(
             std::fs::read(&destination).expect("old destination remains"),
@@ -2220,7 +2669,7 @@ mod completion_tests {
     const FAULT_TOTAL: u64 = 4000;
 
     struct FaultObservation {
-        status: Option<ResultStatus>,
+        completed: bool,
         category: Option<ErrorCategory>,
         operations: Vec<OutputOperation>,
         committed: bool,
@@ -2340,18 +2789,15 @@ mod completion_tests {
             (None, None)
         };
         let terminal = task.await.expect("job task");
-        let (status, category) = match terminal {
-            Ok(result) => (
-                Some(result.status),
-                result.error.as_ref().map(DownloadError::category),
-            ),
-            Err(error) => (None, Some(error.category())),
+        let (completed, category) = match terminal {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(error.category())),
         };
         let committed = std::iter::from_fn(|| events.try_next())
             .any(|event| matches!(event, Event::Committed { .. }));
         let part = TempFileSpec::default().temp_path_for(&destination);
         FaultObservation {
-            status,
+            completed,
             category,
             operations: registration.script().operations(),
             committed,
@@ -2380,7 +2826,7 @@ mod completion_tests {
                     Some(injected_error(operation).category()),
                     "{operation:?}, segmented={segmented}: structured category"
                 );
-                assert_ne!(observed.status, Some(ResultStatus::Completed));
+                assert!(!observed.completed);
                 assert!(!observed.committed, "{operation:?}: no false commit");
                 assert_eq!(observed.destination, b"previous destination");
                 assert_eq!(observed.operations.first(), Some(&OutputOperation::Open));
@@ -2404,7 +2850,7 @@ mod completion_tests {
                     observed.operations
                 );
                 if operation == OutputOperation::Open {
-                    assert_eq!(observed.status, None);
+                    assert!(!observed.completed);
                     assert_eq!(observed.operations, [OutputOperation::Open]);
                 }
                 if operation == OutputOperation::Publish {
@@ -2495,7 +2941,7 @@ mod completion_tests {
             ))
             .await
             .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        assert!(result.final_path.exists(), "{result:?}");
 
         let flushes = registration
             .script()

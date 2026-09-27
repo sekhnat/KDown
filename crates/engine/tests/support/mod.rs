@@ -6,4 +6,5 @@
 
 pub mod checkpoint;
 pub mod fixtures;
+pub mod terminal;
 pub mod test_server;

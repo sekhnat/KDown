@@ -4,7 +4,6 @@
 //! hand-rolled HTTP client, proving the server itself before the engine
 //! is built on top of it.
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::time::Duration;

@@ -1,0 +1,13 @@
+error[E0603]: module `scripted` is private
+ --> tests/ui/retired_seam/scripted_http_is_internal.rs:3:25
+  |
+3 | use kdown_engine::http::scripted::ScriptedHttp;
+  |                         ^^^^^^^^  ------------ struct `ScriptedHttp` is not publicly re-exported
+  |                         |
+  |                         private module
+  |
+note: the module `scripted` is defined here
+ --> src/http/mod.rs
+  |
+  | pub(crate) mod scripted;
+  | ^^^^^^^^^^^^^^^^^^^^^^^

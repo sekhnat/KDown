@@ -3,6 +3,9 @@
 //! Valid transitions only; terminal states latch; the public state is
 //! monotonic except `Paused -> Running`.
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -97,6 +100,7 @@ pub struct StateMachine {
     state: AtomicU8,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl StateMachine {
     #[must_use]
     pub fn new() -> Arc<Self> {

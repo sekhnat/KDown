@@ -62,9 +62,10 @@ cargo run --release --example download -- \
 ## Live metrics and runtime controls
 
 While a job runs, `DownloadHandle::snapshot()` returns a coherent
-`ProgressSnapshot`; after it finishes, `DownloadResult` reports the final
-accounting. Retransferred bytes (`wasted_bytes`) are measured at retry
-boundaries — never derived from warning counts.
+`ProgressSnapshot`; after it finishes, a verified, published download
+reports its final accounting through `CompletedDownload.accounting`.
+Retransferred bytes (`wasted_bytes`) are measured at retry boundaries —
+never derived from warning counts.
 
 ```rust,no_run
 let snapshot = handle.snapshot();
@@ -92,9 +93,14 @@ level governs, burst is bounded (~250 ms of the rate), configured limits
 seed the live buckets, and rate waits stop promptly on cancellation.
 Unlimited jobs keep a lock-free fast path.
 
-`DownloadResult` carries `completed_bytes` (unique, scheduler-accepted
-coverage), `bytes_reused_from_checkpoint`, `wasted_bytes`, and `retries`,
-so callers can distinguish useful progress from retransferred overhead.
+`CompletedDownload.accounting` carries `completed_bytes` (unique,
+scheduler-accepted coverage), `bytes_reused_from_checkpoint`,
+`wasted_bytes`, and `retries`, so callers can distinguish useful progress
+from retransferred overhead. Every non-success terminal outcome is a typed
+`DownloadRunError`: `Transfer` (remote transfer failure), `Infrastructure`
+(engine or local-environment failure), or `Cancelled` — each carrying the
+partial accounting and retained-artifact disposition, so a failed transfer
+is never a successful `Result`.
 
 Beyond per-job counters, the transport exposes protocol-level
 instrumentation shared by every job it serves:
@@ -137,6 +143,15 @@ pipelined writer's reservation quantum, not Hyper's socket read size.
 remain the production path; enable it to try the shared bounded executor.
 The public `buffer_pool_max_bytes` budget (128 MiB default) bounds the
 standalone `BufferPool` only; the transfer path does not use that pool.
+Transfer-pipeline memory is bounded end-to-end by `transfer_memory`
+(design D3): per-job and engine-wide aggregate caps with per-component
+maxima — network ingress (HTTP/1 read buffers and HTTP/2 flow-control
+windows are configured to the cap, and every connection's worst-case
+footprint is carved out of the aggregate up front), held/queued frames,
+writer-held bytes, and checkpoint serialization — all admitted through one
+fair, cancellation-aware ledger with typed over-budget refusal. Kernel
+socket buffers, allocator arenas, and runtime stacks stay outside the
+accounted guarantee (documented in the metrics `scope` field).
 
 ## Safety and durability
 

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
 use kdown_engine::metrics::EngineMetrics;
+use kdown_engine::{DownloadController, DownloadRequest};
 
 mod support;
 use support::test_server::{ScriptedResponse, TestServer};
@@ -32,7 +32,7 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
         ))
         .await
         .expect("ok result");
-    assert_eq!(ok.status, ResultStatus::Completed);
+    drop(ok);
 
     let missing = controller
         .run(DownloadRequest::new(
@@ -40,16 +40,16 @@ async fn metrics_export_jobs_bytes_status_and_integrity() {
             dir.path().join("missing.bin"),
         ))
         .await
-        .expect("missing result");
-    assert_eq!(missing.status, ResultStatus::Failed);
+        .expect_err("missing result");
+    drop(missing);
 
     let mut bad_hash = DownloadRequest::new(server.url("/ok.bin"), dir.path().join("bad-hash.bin"));
     bad_hash.integrity.expected_hashes = vec![ExpectedHash {
         algorithm: HashAlgorithm::Sha256,
         hex: "00".repeat(32),
     }];
-    let mismatch = controller.run(bad_hash).await.expect("hash result");
-    assert_eq!(mismatch.status, ResultStatus::Failed);
+    let mismatch = controller.run(bad_hash).await.expect_err("hash failure");
+    drop(mismatch);
 
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.jobs_started, 3);

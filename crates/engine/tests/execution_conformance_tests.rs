@@ -10,11 +10,10 @@
 //! outcome (scripted harness) without calling into the production
 //! mapping code.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::time::Duration;
 
+use super::support::fixtures::deterministic_bytes;
+use super::support::test_server::TestServer;
 use kdown_engine::config::NetworkPolicy;
 use kdown_engine::control::CancellationToken;
 use kdown_engine::error::ErrorCategory;
@@ -25,8 +24,6 @@ use kdown_engine::http::{
     TransferIntent, TransferRequest,
 };
 use kdown_engine::DownloadError;
-use support::fixtures::deterministic_bytes;
-use support::test_server::TestServer;
 
 const CONTENT_SEED: u64 = 3311;
 const CONTENT_LEN: u64 = 4096;
@@ -108,7 +105,7 @@ async fn status_mapping_conformance() {
         // Production harness: a real server answering the raw status.
         let server = TestServer::new()
             .serve_handler("/status", move |_| {
-                support::test_server::ScriptedResponse::new(*status)
+                super::support::test_server::ScriptedResponse::new(*status)
             })
             .start()
             .await
@@ -164,7 +161,7 @@ async fn rate_limited_retry_timing_conformance() {
     // Wire behavior: 429 with `Retry-After: 5` (§17.2).
     let server = TestServer::new()
         .serve_handler("/limited", |_| {
-            support::test_server::ScriptedResponse::new(429).with_header("retry-after", "5")
+            super::support::test_server::ScriptedResponse::new(429).with_header("retry-after", "5")
         })
         .start()
         .await
@@ -199,7 +196,11 @@ async fn lying_200_range_rejection_conformance() {
     // Wire behavior: advertised ranges answered with 200 + full body
     // (§36.2 Full200). Rejection happens before any body byte.
     let server = TestServer::new()
-        .serve_ranges("/liar", content(), support::test_server::RangeMode::Full200)
+        .serve_ranges(
+            "/liar",
+            content(),
+            super::support::test_server::RangeMode::Full200,
+        )
         .start()
         .await
         .expect("start");
@@ -248,7 +249,7 @@ async fn mismatched_content_range_conformance() {
         .serve_ranges(
             "/malformed",
             content(),
-            support::test_server::RangeMode::MalformedContentRange,
+            super::support::test_server::RangeMode::MalformedContentRange,
         )
         .start()
         .await
@@ -292,11 +293,11 @@ async fn total_conflict_conformance() {
             let owned = content.clone();
             let total = owned.len() as u64;
             if let Some((s, e)) = req.range {
-                support::test_server::ScriptedResponse::new(206)
+                super::support::test_server::ScriptedResponse::new(206)
                     .with_body(owned[s as usize..=(e as usize).min(owned.len() - 1)].to_vec())
                     .with_header("content-range", &format!("bytes {s}-{e}/{total}"))
             } else {
-                support::test_server::ScriptedResponse::ok(owned)
+                super::support::test_server::ScriptedResponse::ok(owned)
                     .with_header("accept-ranges", "bytes")
             }
         })
@@ -340,7 +341,7 @@ async fn generation_change_conformance() {
     // established generation (§26) — via ETag comparison.
     let server = TestServer::new()
         .serve_handler("/gen", |_| {
-            support::test_server::ScriptedResponse::new(206)
+            super::support::test_server::ScriptedResponse::new(206)
                 .with_body(vec![1u8; 100])
                 .with_header("etag", "\"generation-2\"")
                 .with_header("content-range", "bytes 0-99/1000")
@@ -398,7 +399,7 @@ async fn if_range_ignored_full_response_conformance() {
         .serve_ranges(
             "/full200",
             content(),
-            support::test_server::RangeMode::Full200,
+            super::support::test_server::RangeMode::Full200,
         )
         .start()
         .await
@@ -506,7 +507,8 @@ async fn body_fault_after_prefix_conformance() {
     // inspection in job orchestration.
     let server = TestServer::new()
         .serve_handler("/reset-mid", |_| {
-            support::test_server::ScriptedResponse::ok(content()[..8].to_vec()).reset_after(2)
+            super::support::test_server::ScriptedResponse::ok(content()[..8].to_vec())
+                .reset_after(2)
         })
         .start()
         .await

@@ -9,6 +9,9 @@
 //! refuses to admit ranges beyond the acknowledged frontier, and the
 //! controller consults `admissible()` before calling the store.
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use crate::config::DurabilityMode as ConfigDurability;
 use crate::resume::checkpoint::ByteRange;
 use crate::resume::checkpoint_store::DurabilityMode;
@@ -41,6 +44,7 @@ impl DurableRangeTracker {
     }
 
     /// Report an fsync of the whole prefix (§15.4 durable mode).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fsync_through(&mut self, through: u64) {
         // fsync acknowledges everything written before it.
         self.page_cache_ack(through);

@@ -4,6 +4,9 @@
 //! operations preserve the invariants: non-overlapping, sorted, no
 //! adjacent-unmerged ranges.
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use crate::resume::checkpoint::ByteRange;
 use std::collections::BTreeMap;
 
@@ -133,6 +136,7 @@ impl IntervalSet {
 
     /// The greatest covered end, if any.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn max_end(&self) -> Option<u64> {
         self.map.values().max().copied()
     }

@@ -26,10 +26,9 @@ use criterion::{black_box, Criterion, Throughput};
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, ProxyConfig, TlsConfig};
 use kdown_engine::control::origin::OriginRegistry;
+use kdown_engine::error::CompletedDownload;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{
-    DownloadController, DownloadRequest, DownloadResult, ResultStatus,
-};
+use kdown_engine::{DownloadController, DownloadRequest};
 
 /// Fixture size per benchmark iteration: big enough that per-request setup
 /// is amortized, small enough that one iteration stays sub-second on a
@@ -534,14 +533,12 @@ fn clock_ticks_per_sec() -> f64 {
 /// Verify a completed download's size, hash and publication against the
 /// fixture (task 1.2).
 fn verify_output(
-    result: &DownloadResult,
+    result: &CompletedDownload,
     expected_size: u64,
     expected_hash: &str,
 ) -> (bool, bool, bool) {
-    let published = result.status == ResultStatus::Completed && result.final_path.is_some();
-    let Some(path) = result.final_path.as_ref() else {
-        return (published, false, false);
-    };
+    let published = true;
+    let path = &result.final_path;
     let size_ok = std::fs::metadata(path)
         .map(|m| m.len() == expected_size)
         .unwrap_or(false);
@@ -559,7 +556,7 @@ async fn measure_download(
     expected_size: u64,
     expected_hash: &str,
     conn_probe: Option<&Arc<AtomicUsize>>,
-) -> (DownloadResult, ResourceRecord) {
+) -> (CompletedDownload, ResourceRecord) {
     let transport = HttpTransport::from_config(cfg).expect("transport");
     let controller = DownloadController::new(transport, cfg.clone());
     let dest = dest_dir.join(format!("{name}.bin"));
@@ -579,11 +576,11 @@ async fn measure_download(
         wall,
         // Real counters (task 1.1): unique completed, wire network, reused,
         // wasted/retransferred bytes and retries. Never warnings.len().
-        completed_bytes: result.completed_bytes,
-        network_bytes: result.bytes_downloaded_from_network,
-        reused_bytes: result.bytes_reused_from_checkpoint,
-        retransferred_bytes: result.wasted_bytes,
-        retries: result.retries,
+        completed_bytes: result.accounting.completed_bytes,
+        network_bytes: result.accounting.bytes_downloaded_from_network,
+        reused_bytes: result.accounting.bytes_reused_from_checkpoint,
+        retransferred_bytes: result.accounting.wasted_bytes,
+        retries: result.accounting.retries,
         cpu_percent: if wall.as_secs_f64() > 0.0 {
             (cpu.as_secs_f64() / wall.as_secs_f64()) * 100.0
         } else {
@@ -662,7 +659,7 @@ fn record_scenario(
     conn_probe: Option<&Arc<AtomicUsize>>,
 ) -> ResourceRecord {
     let dir = tempfile::tempdir().expect("tmpdir");
-    let (result, record) = rt.block_on(async {
+    let (_, record) = rt.block_on(async {
         measure_download(
             name,
             cfg,
@@ -674,7 +671,6 @@ fn record_scenario(
         )
         .await
     });
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     record
 }
 // ---------------------------------------------------------------------------
@@ -856,8 +852,7 @@ fn bench_prealloc(c: &mut Criterion) {
     emit_report("prealloc", &records);
 }
 
-fn assert_completed(r: &DownloadResult) -> &DownloadResult {
-    assert_eq!(r.status, ResultStatus::Completed, "{:?}", r.error);
+fn assert_completed(r: &CompletedDownload) -> &CompletedDownload {
     r
 }
 
@@ -990,7 +985,7 @@ fn run_matrix(mode: MatrixMode) {
                         Some(dir),
                     )
                 };
-                let (result, record) = measure_download(
+                let (_, record) = measure_download(
                     "matrix",
                     &cfg,
                     url,
@@ -1001,12 +996,7 @@ fn run_matrix(mode: MatrixMode) {
                     None,
                 )
                 .await;
-                assert_eq!(
-                    result.status,
-                    ResultStatus::Completed,
-                    "{label}: {:?}",
-                    result.error
-                );
+
                 assert!(
                     record.published && record.size_ok && record.hash_ok,
                     "{label}: verification failed: {}",
@@ -1237,7 +1227,7 @@ fn run_isolated_client(
             Some(d) => d,
             None => tempfile::tempdir().expect("scratch tmpdir"),
         };
-        let (result, mut record) = measure_download(
+        let (_, mut record) = measure_download(
             "isolated",
             &cfg,
             format!("{scheme}://{addr}/f.bin"),
@@ -1247,7 +1237,6 @@ fn run_isolated_client(
             None,
         )
         .await;
-        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
             "isolated client verification failed: {}",
@@ -1362,11 +1351,8 @@ fn run_jobs_matrix(pipeline: bool) {
                 let mut all_ok = true;
                 while let Some(joined) = set.join_next().await {
                     let (result, record) = joined.expect("job join");
-                    all_ok &= result.status == ResultStatus::Completed
-                        && record.published
-                        && record.size_ok
-                        && record.hash_ok;
-                    total_bytes += result.completed_bytes;
+                    all_ok &= record.published && record.size_ok && record.hash_ok;
+                    total_bytes += result.accounting.completed_bytes;
                     per_job.push(record);
                 }
                 let wall = started.elapsed();
@@ -1401,16 +1387,14 @@ async fn fetch_isolated_stats(cfg: &EngineConfig, base: &str) -> Option<(u64, u6
     let dir = tempfile::tempdir().ok()?;
     let transport = HttpTransport::from_config(cfg).ok()?;
     let controller = DownloadController::new(transport, cfg.clone());
-    let result = controller
+    let _ = controller
         .run(DownloadRequest::new(
             format!("{base}/__stats"),
             dir.path().join("stats.txt"),
         ))
         .await
         .ok()?;
-    if result.status != ResultStatus::Completed {
-        return None;
-    }
+
     let text = std::fs::read_to_string(dir.path().join("stats.txt")).ok()?;
     let parse = |key: &str| {
         text.lines()
@@ -1779,17 +1763,12 @@ async fn origin_compare_cell(
             .expect("job task");
         let result = outcome.expect("join").expect("terminal");
         let (published, size_ok, hash_ok) = verify_output(&result, size, &expected_hash);
-        let error_note = result
-            .error
-            .as_ref()
-            .map(|e| format!(" error={e}"))
-            .unwrap_or_default();
         verify.push(format!(
-            "published={published} size_ok={size_ok} hash_ok={hash_ok}{error_note}"
+            "published={published} size_ok={size_ok} hash_ok={hash_ok}"
         ));
         job_wall.push(wall.as_secs_f64());
         job_goodput.push(
-            result.completed_bytes as f64
+            result.accounting.completed_bytes as f64
                 / wall.as_secs_f64().max(f64::EPSILON)
                 / (1024.0 * 1024.0),
         );
@@ -2062,21 +2041,21 @@ async fn protocol_compare_cell(
         let result = outcome.expect("join").expect("terminal result");
         let (published, size_ok, hash_ok) = verify_output(&result, size, expected_hash);
         let verify = format!("published={published} size_ok={size_ok} hash_ok={hash_ok}");
-        let fallback = if result.warnings.is_empty() {
+        let fallback = if result.accounting.warnings.is_empty() {
             "none".to_string()
         } else {
-            result.warnings.join("; ")
+            result.accounting.warnings.join("; ")
         };
         jobs.push(ProtocolJobRecord {
             label: format!("{label}/job{j}"),
-            goodput_mib_s: result.completed_bytes as f64
+            goodput_mib_s: result.accounting.completed_bytes as f64
                 / wall.as_secs_f64().max(f64::EPSILON)
                 / (1024.0 * 1024.0),
             wall_secs: wall.as_secs_f64(),
-            completed_bytes: result.completed_bytes,
-            network_bytes: result.bytes_downloaded_from_network,
-            retries: result.retries,
-            segment_requests: result.segment_requests,
+            completed_bytes: result.accounting.completed_bytes,
+            network_bytes: result.accounting.bytes_downloaded_from_network,
+            retries: result.accounting.retries,
+            segment_requests: result.accounting.segment_requests,
             verify,
             max_desired: max_desired[j],
             max_active: max_active[j],
@@ -2207,13 +2186,13 @@ async fn buffer_sweep_cell(
     BufferSweepRow {
         label: label.to_string(),
         read_buffer_kib: read_buffer_size / 1024,
-        goodput_mib_s: result.completed_bytes as f64
+        goodput_mib_s: result.accounting.completed_bytes as f64
             / wall.as_secs_f64().max(f64::EPSILON)
             / (1024.0 * 1024.0),
         wall_secs: wall.as_secs_f64(),
-        completed_bytes: result.completed_bytes,
-        retries: result.retries,
-        segment_requests: result.segment_requests,
+        completed_bytes: result.accounting.completed_bytes,
+        retries: result.accounting.retries,
+        segment_requests: result.accounting.segment_requests,
         cpu_percent: if wall.as_secs_f64() > 0.0 {
             (cpu_time().saturating_sub(cpu0).as_secs_f64() / wall.as_secs_f64()) * 100.0
         } else {
@@ -2345,7 +2324,7 @@ async fn alloc_compare_cell(
     // reservation cost lands before the first byte). A 2 ms poll overshoots
     // by < 2 ms — far below the effects being measured.
     let mut first_byte: Option<Duration> = None;
-    let mut result: Option<DownloadResult> = None;
+    let mut result: Option<CompletedDownload> = None;
     loop {
         if first_byte.is_none() && handle.snapshot().completed_bytes > 0 {
             first_byte = Some(started.elapsed());
@@ -2367,7 +2346,7 @@ async fn alloc_compare_cell(
         label: label.to_string(),
         physical,
         first_byte_ms: first_byte.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX),
-        goodput_mib_s: result.completed_bytes as f64
+        goodput_mib_s: result.accounting.completed_bytes as f64
             / wall.as_secs_f64().max(f64::EPSILON)
             / (1024.0 * 1024.0),
         wall_secs: wall.as_secs_f64(),
@@ -2654,9 +2633,8 @@ fn compare_run(
             (None, Some(temp)) => temp.path().to_path_buf(),
             (None, None) => unreachable!("tempdir or root"),
         };
-        let (result, record) =
+        let (_, record) =
             measure_download("compare", &cfg, url, &dir_path, size, &expected_hash, None).await;
-        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
             "compare verification failed: {}",
@@ -2829,9 +2807,8 @@ fn sweep_run(
             )
         };
         let dir = tempfile::tempdir().expect("dest tmpdir");
-        let (result, record) =
+        let (_, record) =
             measure_download("sweep", &cfg, url, dir.path(), size, &expected_hash, None).await;
-        assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
         assert!(
             record.published && record.size_ok && record.hash_ok,
             "sweep verification failed: {}",

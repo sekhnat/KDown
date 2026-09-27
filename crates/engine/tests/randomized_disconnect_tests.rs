@@ -2,14 +2,13 @@
 //! downloads must produce byte-exact final output via restart-from-zero
 //! retries.
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, RetryPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::TestServer;
 
@@ -115,18 +114,13 @@ async fn randomized_disconnects_produce_exact_output() {
         let dir = tempfile::tempdir().expect("tmp");
         let dest = dir.path().join("out.bin");
         let c = controller();
-        let result = tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_secs(60),
             c.run(DownloadRequest::new(server.url("/flaky.bin"), dest.clone())),
         )
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(
-            result.status,
-            ResultStatus::Completed,
-            "seed {seed}: {result:?}"
-        );
         let got = std::fs::read(&dest).expect("final output");
         assert_bytes_exact(&got, &content);
         assert_eq!(
@@ -159,16 +153,15 @@ async fn exhausted_retries_fail_structured() {
     )
     .await
     .expect("no hang")
-    .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+    .expect_err("terminal");
     assert!(
         matches!(
-            result.error,
+            result.as_engine_error(),
             Some(kdown_engine::DownloadError::RetryExhausted { .. })
                 | Some(kdown_engine::DownloadError::Connection(_))
         ),
         "structured retry-exhaustion error, got {:?}",
-        result.error
+        result.as_engine_error()
     );
     assert!(!dir.path().join("x.part").exists());
 }

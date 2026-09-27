@@ -1,7 +1,6 @@
 //! Runtime control tests (task 5.8): concurrency reduction and rate-limit
 //! changes mid-transfer converge without data loss (§7.3, §18.2).
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::sync::Arc;
@@ -9,9 +8,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{
-    DownloadController, DownloadHandle, DownloadRequest, ResultStatus,
-};
+use kdown_engine::job::controller::{DownloadController, DownloadHandle, DownloadRequest};
 use kdown_engine::metrics::Event;
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
@@ -157,12 +154,11 @@ async fn adaptive_manual_override_converges_desired_and_active_workers() {
     handle.pause();
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.resume_now();
-    let result = tokio::time::timeout(Duration::from_secs(180), join)
+    let _ = tokio::time::timeout(Duration::from_secs(180), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -239,9 +235,15 @@ async fn adaptive_retry_pressure_keeps_bounds_without_losing_work() {
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert!(result.retries >= 1, "the resets must have been retried");
-    assert_eq!(result.completed_bytes, content.len() as u64, "{result:?}");
+    assert!(
+        result.accounting.retries >= 1,
+        "the resets must have been retried"
+    );
+    assert_eq!(
+        result.accounting.completed_bytes,
+        content.len() as u64,
+        "{result:?}"
+    );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -284,12 +286,11 @@ async fn concurrency_reduction_mid_transfer_no_data_loss() {
     // Give the workers time to fan out, then cut to one worker.
     tokio::time::sleep(Duration::from_millis(200)).await;
     handle.set_concurrency(1);
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("reduce.bin.part").exists());
 }
@@ -332,12 +333,11 @@ async fn rate_limit_change_mid_transfer_converges() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.set_rate_limit(4 * 1024 * 1024);
     assert_eq!(handle.rate_limit(), Some(4 * 1024 * 1024));
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("ratelimit.bin.part").exists());
 }
@@ -393,12 +393,11 @@ async fn rate_limit_slow_limit_throttles_throughput() {
     }
     handle.set_rate_limit(128 * 1024);
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Remaining ~1 MiB at 128 KiB/s minus burst: >= ~6 s; 1 s margin.
     assert!(
@@ -433,12 +432,11 @@ async fn rate_limit_update_before_job_is_honored() {
     tokio::time::sleep(Duration::from_millis(120)).await;
     handle.set_rate_limit(0);
     assert_eq!(handle.rate_limit(), None, "0 = unlimited");
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("prestart.bin.part").exists());
 }
@@ -484,21 +482,26 @@ async fn retried_ranges_count_wasted_bytes_with_exact_coverage() {
         .run(DownloadRequest::new(server.url("/waste"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     // Unique coverage across retries is EXACT (task 5.4): tail-only retry
     // requeues unwritten bytes as pending, so no byte is received twice —
     // wire bytes equal unique completed bytes equal the fixture.
     assert_eq!(
-        result.bytes_downloaded_from_network, result.completed_bytes,
+        result.accounting.bytes_downloaded_from_network, result.accounting.completed_bytes,
         "retried coverage must not duplicate delivery: {result:?}"
     );
-    assert_eq!(result.bytes_downloaded_from_network, content.len() as u64);
-    assert!(result.retries >= 1, "the resets must have been retried");
+    assert_eq!(
+        result.accounting.bytes_downloaded_from_network,
+        content.len() as u64
+    );
+    assert!(
+        result.accounting.retries >= 1,
+        "the resets must have been retried"
+    );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Wire amplification (task 0.4): segmented tail-only retry re-delivers
     // nothing, so the clean-transfer amplification is exactly 1.
     assert_eq!(
-        result.wire_amplification(),
+        result.accounting.wire_amplification(),
         Some(1.0),
         "clean segmented amplification: {result:?}"
     );
@@ -547,23 +550,25 @@ async fn single_stream_restart_counts_wasted_bytes() {
         .run(DownloadRequest::new(server.url("/waste2"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     // The discarded stream prefixes are charged as wasted bytes (task 5.4)
     // while unique delivered coverage stays exact.
     assert!(
-        result.wasted_bytes > 0,
+        result.accounting.wasted_bytes > 0,
         "the discarded stream prefix is wasted: {result:?}"
     );
-    assert!(result.retries >= 1, "{result:?}");
+    assert!(result.accounting.retries >= 1, "{result:?}");
     assert_eq!(
-        result.completed_bytes,
+        result.accounting.completed_bytes,
         content.len() as u64,
         "unique coverage is exact: {result:?}"
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Wire amplification (task 0.4): the restart's re-received prefix
     // inflates network payload above unique completion.
-    let amp = result.wire_amplification().expect("nonzero denominator");
+    let amp = result
+        .accounting
+        .wire_amplification()
+        .expect("nonzero denominator");
     assert!(amp > 1.0, "single-stream restart amplification {amp}");
 }
 
@@ -602,8 +607,11 @@ async fn concurrency_increase_decrease_increase_no_lost_work() {
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.completed_bytes, content.len() as u64, "{result:?}");
+    assert_eq!(
+        result.accounting.completed_bytes,
+        content.len() as u64,
+        "{result:?}"
+    );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("cycle.bin.part").exists());
 }
@@ -632,12 +640,11 @@ async fn manual_concurrency_clamps_to_configured_bounds() {
     handle.set_concurrency(99);
     assert_eq!(job.desired_workers(), 3, "clamped to max_workers");
     handle.set_concurrency(3);
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -682,12 +689,11 @@ async fn adaptive_concurrency_starts_at_min_and_stays_in_bounds() {
         observed.first() == Some(&2),
         "adaptive mode starts at min_workers: {observed:?}"
     );
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -709,12 +715,11 @@ async fn fixed_mode_starts_at_configured_max() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     let job = handle.segmented_job().expect("live segmented job").clone();
     assert_eq!(job.desired_workers(), 4, "fixed mode starts at max_workers");
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -777,12 +782,11 @@ async fn split_events_and_active_worker_gauge_are_reported() {
             );
         }
     }
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(splits >= 1, "live-tail splits must be counted: {splits}");
     assert!(
@@ -883,12 +887,11 @@ async fn adaptive_probe_activates_additional_workers() {
          observed max active={max_active} — provisioning is desired-only"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -966,7 +969,7 @@ async fn worker_gauges_distinguish_desired_provisioned_active() {
             match early {
                 Ok(Ok(Ok(result))) => panic!(
                     "fixed mode must provision all four workers; last={last_observed:?}                      early_result={:?} elapsed={:?}",
-                    result.status, result.elapsed
+                    result.final_path, result.accounting.elapsed
                 ),
                 other => panic!(
                     "fixed mode must provision all four workers; last={last_observed:?}                      early={other:?}"
@@ -987,12 +990,11 @@ async fn worker_gauges_distinguish_desired_provisioned_active() {
          gauges must not conflate this with growth"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -1083,12 +1085,11 @@ async fn writer_lanes_track_desired_concurrency() {
     }
     assert!(shrank, "decrease must release the extra writer lane");
 
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -1160,12 +1161,11 @@ async fn adaptive_pause_resume_with_parked_and_active_workers() {
     );
 
     handle.resume_now();
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang after resume (no stranded range, no lost wakeup)")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -1230,12 +1230,16 @@ async fn adaptive_cancel_keep_partial_with_parked_workers() {
         .await
         .expect("no hang on cancel with parked workers")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     // Acknowledged coverage survived (checkpoint + partial file), and the
     // accounting stays truthful.
     assert_eq!(
-        result.completed_bytes, result.bytes_downloaded_from_network,
+        result.accounting().completed_bytes,
+        result.accounting().bytes_downloaded_from_network,
         "no duplicated coverage on the cancelled path: {result:?}"
     );
 }
@@ -1288,12 +1292,11 @@ async fn h1_adaptive_growth_never_exceeds_connection_permits() {
         }
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 
     assert!(
@@ -1400,12 +1403,11 @@ async fn h1_adaptive_reverts_when_marginal_gain_disappears() {
         }
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(120), join)
+    let _ = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 
     assert!(
@@ -1501,12 +1503,11 @@ async fn concurrency_update_emits_concurrency_changed_only() {
         "a concurrency-only change must not emit a rate-limit event: {control:?}"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -1543,12 +1544,11 @@ async fn clamped_concurrency_update_reports_applied_count() {
         "event must carry the applied clamped count: {control:?}"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
 }
 
 /// Without a segmented job (sequential transfer), a concurrency request
@@ -1579,12 +1579,11 @@ async fn concurrency_update_without_segmented_job_is_silent() {
         "an unapplied concurrency request must emit nothing: {control:?}"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(30), join)
+    let _ = tokio::time::timeout(Duration::from_secs(30), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -1632,11 +1631,10 @@ async fn rate_limit_updates_emit_rate_limit_changed_only() {
         "a rate-only change must not emit a concurrency event: {control:?}"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(60), join)
+    let _ = tokio::time::timeout(Duration::from_secs(60), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }

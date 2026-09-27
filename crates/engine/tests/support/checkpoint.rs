@@ -9,8 +9,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use kdown_engine::resume::checkpoint::{ByteRange, Checkpoint, CheckpointError};
-use kdown_engine::resume::checkpoint_store::CheckpointStore;
+use kdown_engine::CheckpointStore;
+use kdown_engine::{ByteRange, Checkpoint, CheckpointError};
 
 /// One recorded adapter operation (entry recorded when the operation
 /// enters the adapter; `ok` is the outcome it will report).

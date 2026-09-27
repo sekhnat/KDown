@@ -43,58 +43,25 @@
 //! while let Some(event) = events.next().await {
 //!     println!("{event:?}");
 //! }
-//! let result = task.await??;
-//! assert!(result.error.is_none());
+//! // Success means the verified output was published; every other
+//! // outcome is a typed `DownloadRunError`.
+//! let completed = task.await??;
+//! println!("published at {}", completed.final_path.display());
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! ## HTTP execution seam
+//! ## HTTP layer boundary
 //!
 //! Job orchestration never touches concrete HTTP client, response-body, or
-//! framing types. Both sequential and segmented transfers issue semantic
-//! [`http::HttpExecutor::probe`] and
-//! [`http::HttpExecutor::transfer`] operations through a
-//! cloneable [`http::HttpExecution`] handle; statuses,
-//! `Retry-After` timing, authentication challenges, range validation,
-//! generation conflicts, body overruns, and read-idle timeouts are all
-//! classified inside the HTTP layer before any body chunk is delivered.
-//!
-//! ```no_run
-//! use std::path::PathBuf;
-//! use std::sync::Arc;
-//! use kdown_engine::config::EngineConfig;
-//! use kdown_engine::http::probe::ProbeMetadata;
-//! use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
-//! use kdown_engine::http::{HttpExecution, HttpBodySource as _};
-//! use kdown_engine::job::controller::{DownloadRequest, DownloadController};
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Compatible production construction (unchanged):
-//! let config = EngineConfig::default();
-//! let transport = kdown_engine::HttpTransport::from_config(&config)?;
-//! let controller = DownloadController::new(transport, config);
-//!
-//! // Scripted injection (tests and alternate adapters): the same
-//! // controller code runs against a deterministic adapter with no socket.
-//! let scripted = ScriptedHttp::new()
-//!     .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
-//!         status: 200,
-//!         total_size: Some(5),
-//!         ..ProbeMetadata::default()
-//!     }))
-//!     .expect_transfer(
-//!         TransferStep::new()
-//!             .ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
-//!     );
-//! let scripted_controller = DownloadController::with_execution(
-//!     HttpExecution::from_adapter(scripted),
-//!     EngineConfig::default(),
-//! );
-//! let _ = (controller, scripted_controller);
-//! # Ok(())
-//! # }
-//! ```
+//! framing types. Statuses, `Retry-After` timing, authentication
+//! challenges, range validation, generation conflicts, body overruns, and
+//! read-idle timeouts are all classified inside the HTTP layer before any
+//! body chunk is delivered. The transport is built by the embedding
+//! application with [`HttpTransport::from_config`]; alternate HTTP
+//! execution adapters and the deterministic scripted test adapters are
+//! crate-internal — the former 0.1 scripted-injection seam is retired (see
+//! `docs/migration-0.1.md`).
 //!
 //! ## Configuration reference
 //!
@@ -139,30 +106,79 @@
 //! See `KDownSpec.md` for the complete language-neutral architecture and
 //! `docs/acceptance-v1.md` for the §42 acceptance review.
 
+// Test builds alias the crate as its own external name so relocated
+// integration tests keep their `kdown_engine::` import paths while
+// compiling as crate-internal modules.
+#[cfg(test)]
+extern crate self as kdown_engine;
+
+// Consumer-facing modules.
 pub mod config;
 pub mod control;
 pub mod error;
-pub mod fuzz_targets;
 pub mod http;
-pub mod io;
-pub mod job;
 pub mod metrics;
-pub mod observability;
 pub mod redact;
-pub mod resume;
-pub mod scheduler;
+
+// Implementation modules: not part of the supported surface
+// (docs/api-surface.md).
+// Fuzz entry points compile publicly only for the fuzzing harness
+// (non-default `fuzz-entry` feature); never for consumers.
+// The fuzz entry points exist for the fuzzing harness and the corpus
+// smoke tests; the plain library build has no caller.
+#[cfg_attr(all(not(test), not(feature = "fuzz-entry")), allow(dead_code))]
+#[cfg(not(feature = "fuzz-entry"))]
+mod fuzz_targets;
+#[cfg(feature = "fuzz-entry")]
+#[doc(hidden)]
+pub mod fuzz_targets;
+mod io;
+mod job;
+mod observability;
+mod resume;
+mod scheduler;
 
 pub use config::{
     DurabilityMode, EngineConfig, ExpectedHash, H2ConnectionPolicy, HashAlgorithm, IntegrityPolicy,
     NetworkPolicy, OverwritePolicy, PoolConfig, ProxyConfig, ResumePolicy, TlsConfig,
-    TransferPolicy,
+    TransferMemoryConfig, TransferPolicy,
 };
-pub use error::{DownloadError, ErrorCategory, Retryability};
+pub use error::{
+    ArtifactDisposition, CancellationSummary, CompletedDownload, DownloadError, DownloadRunError,
+    EngineFailure, ErrorCategory, FailureDomain, Retryability, TransferAccounting, TransferFailure,
+};
 pub use http::HttpTransport;
 #[allow(deprecated)]
 pub use job::controller::SingleStreamController;
-pub use job::controller::{
-    CancelMode, DownloadController, DownloadHandle, DownloadRequest, DownloadResult, ResultStatus,
-};
+pub use job::controller::{CancelMode, DownloadController, DownloadHandle, DownloadRequest};
+pub use job::state::JobState;
 pub use metrics::{EngineMetrics, Event, EventHub, EventStream, MetricsSnapshot, ProgressSnapshot};
 pub use redact::Redactor;
+/// Checkpoint-store injection surface for resolver implementors (§34):
+/// the only `resume` items on the supported surface.
+pub use resume::{
+    checkpoint::{ByteRange, Checkpoint, CheckpointError},
+    checkpoint_store::DurabilityMode as StoreDurabilityMode,
+    checkpoint_store::{
+        CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver, FileCheckpointStore,
+        SidecarCheckpointResolver,
+    },
+};
+
+#[cfg(test)]
+mod internal_tests;
+
+/// Test-only: a standalone transfer ledger for the scripted-execution
+/// constructor path (`with_execution_and_metrics` is crate-internal and
+/// relocated internal tests reach it through this helper).
+#[cfg(test)]
+pub(crate) fn __internal_ledger_for_test(
+    config: &config::EngineConfig,
+) -> std::sync::Arc<io::transfer_ledger::TransferLedger> {
+    std::sync::Arc::new(io::transfer_ledger::TransferLedger::new(
+        &config.transfer_memory,
+        config
+            .transfer_memory
+            .connection_ingress_reserve(config.read_buffer_size, config.max_connections_total),
+    ))
+}

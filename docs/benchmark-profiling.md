@@ -105,7 +105,7 @@ covered by the in-process smoke scenarios.
   installed) for real switch visibility; recorded per-thread switch counts
   are therefore marked n/r where meaningless.
 - **Wire vs useful bytes** — engine `JobCounters` folded into
-  `DownloadResult` (`bytes_downloaded_from_network`, `completed_bytes`,
+  `CompletedDownload::accounting` (`bytes_downloaded_from_network`, `completed_bytes`,
   `wasted_bytes`, `retries`); goodput and wire throughput are reported
   separately per scenario.
 - **System-wide context-switch pressure** — `vmstat 1` in a second terminal
@@ -209,13 +209,19 @@ and records the comparison in `benches/results/comparison-milestone-2.md`.
   There is no staging queue, no pooled-buffer copy, and no per-worker full
   budget: retained payload = one frame per active worker (≤
   `read_buffer_size` each, typically 128 KiB × `max_workers`).
-- **`buffer_pool_max_bytes` bounds the pool, not Hyper**: the engine's
-  transfer path no longer constructs `BufferPool`s (removed, task 10.1);
-  the pool remains public for embedding callers and bounds ONLY its own
-  buffers. Hyper's internal ingress buffers and socket receive windows are
-  outside any explicit engine budget — peak RSS may transiently exceed
-  `read_buffer_size × workers` because of them (documented; no absolute
-  process-RSS cap is promised).
+- **`transfer_memory` bounds the accounted pipeline end-to-end**: per-job
+  and engine-wide aggregate caps with per-component maxima (network
+  ingress, held/queued frames, writer-held bytes, checkpoint
+  serialization) are enforced by a single fair, cancellation-aware ledger
+  with typed over-budget refusal. HTTP/1 read buffers are exact and HTTP/2
+  flow-control windows are configured to the ingress cap; the worst-case
+  per-connection footprint is carved out of the aggregate cap at
+  construction, so client-internal ingress is bounded by configuration and
+  accounted. `buffer_pool_max_bytes` still bounds only the standalone
+  pool. Kernel socket buffers, allocator arenas and runtime stacks remain
+  unaccounted (never reported as zero; see the metrics snapshot `scope`) —
+  no absolute process-RSS cap is promised, and adversarial profiles record
+  ledger peaks beside external RSS observations for evidence.
 - **RSS/worker scaling** (measured, h1/32 MiB matrix, this host):
   workers_1 → workers_8 peak RSS went 9.7 → 20.1 MiB after the per-worker
   pool removal (was 9.4 → 29 MiB before) — roughly +1.3 MiB per extra
@@ -243,6 +249,7 @@ any behavior change from this second optimization change. All comparisons for
 | `transfer.verify_range_support` | true |
 | `retry.max_attempts_per_segment` | 8 (base 250 ms, ×2, honor `Retry-After` capped 120 s) |
 | `buffer_pool_max_bytes` | bounds the pool only (see memory-path scope above) |
+| `transfer_memory.*` | per-job/aggregate pipeline caps with component maxima; the ledger's high-water is exported in metrics |
 
 ### Invariants this change must preserve (authoritative today)
 
@@ -306,7 +313,7 @@ approximation on both sides of an A/B), not absolute network truth.
 
 ### Engine-side gauges (task 0.4)
 
-- `DownloadResult::wire_amplification()` — received payload (network +
+- `TransferAccounting::wire_amplification()` — received payload (network +
   re-received waste) / unique completed bytes; `None` when nothing uniquely
   completed (undefined, never fabricated). This engine counts each wire byte
   once in `bytes_downloaded_from_network` and charges duplicates to

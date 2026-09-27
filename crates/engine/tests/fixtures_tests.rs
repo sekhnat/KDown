@@ -1,6 +1,5 @@
 //! Fixture generator round-trip tests (§36.6).
 
-#[path = "support/mod.rs"]
 mod support;
 
 use support::fixtures::{assert_bytes_exact, boundary_sizes, deterministic_bytes, sha256_hex};

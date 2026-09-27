@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use kdown_engine::config::{EngineConfig, ProxyConfig};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 
 mod support;
 use support::fixtures;
@@ -184,7 +184,6 @@ async fn https_through_connect_proxy_with_credentials() {
         dest.clone(),
     );
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(CONTENT)
@@ -214,7 +213,6 @@ async fn plain_http_through_proxy_uses_absolute_form() {
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(CONTENT)
@@ -241,9 +239,8 @@ async fn proxy_auth_failure_fails_structured() {
     let controller = DownloadController::new(transport, cfg);
     let dest = dir.path().join("out.bin");
     let req = DownloadRequest::new(format!("http://{origin_addr}/f.bin"), dest.clone());
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
-    let err = result.error.expect("structured error");
+    let result = controller.run(req).await.expect_err("run");
+    let err = result.as_engine_error().expect("structured error");
     assert_eq!(
         err.category(),
         kdown_engine::error::ErrorCategory::Proxy,
@@ -280,7 +277,6 @@ async fn credential_provider_satisfies_challenge_once() {
     );
     req.credential_provider = Some(Arc::from(provider));
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_eq!(
         fixtures::file_sha256(dir.path().join("out.bin").as_path()),
         fixtures::sha256_hex(CONTENT)
@@ -311,10 +307,9 @@ async fn bad_credentials_fail_without_loop() {
         dir.path().join("out.bin"),
     );
     req.credential_provider = Some(Arc::from(provider));
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
+    let result = controller.run(req).await.expect_err("run");
     assert_eq!(
-        result.error.expect("err").category(),
+        result.as_engine_error().expect("err").category(),
         kdown_engine::error::ErrorCategory::AuthenticationRequired
     );
 }

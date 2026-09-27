@@ -39,14 +39,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    let result = task.await??;
     eprintln!();
-    match result.final_path {
-        Some(path) => println!("completed: {}", path.display()),
-        None => println!("job ended as {:?}", result.status),
-    }
-    if let Some(error) = result.error {
-        eprintln!("error: {error}");
+    // A successful terminal result is always a verified, published
+    // download; every other outcome is a typed error.
+    match task.await? {
+        Ok(completed) => println!("completed: {}", completed.final_path.display()),
+        Err(error) => {
+            let accounting = error.accounting();
+            eprintln!(
+                "error: {error} (downloaded={} B, completed={} B, retries={})",
+                accounting.bytes_downloaded_from_network,
+                accounting.completed_bytes,
+                accounting.retries
+            );
+            std::process::exit(1);
+        }
     }
     Ok(())
 }

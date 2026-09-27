@@ -6,21 +6,18 @@
 //! controller state (the checkpoint + temp file persist on disk); a
 //! follow-up phase (7.6) extends this with real multi-process kills.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes};
+use super::support::test_server::{ScriptedResponse, TestServer};
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::io::sink::Sink as _;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::resume::checkpoint_store::CheckpointStore as _;
 use kdown_engine::resume::{job_identity, DurabilityMode, FileCheckpointStore};
-use support::fixtures::{assert_bytes_exact, deterministic_bytes};
-use support::test_server::{ScriptedResponse, TestServer};
 
 fn fast_config() -> EngineConfig {
     EngineConfig {
@@ -97,14 +94,13 @@ async fn kill_during_segment_write_then_resume() {
     let dest = dir.path().join("crash.bin");
     let expected_crash = content.clone();
     let c = controller();
-    let r1 = tokio::time::timeout(
+    let _ = tokio::time::timeout(
         Duration::from_secs(60),
         c.run(DownloadRequest::new(server.url("/crash.bin"), dest.clone())),
     )
     .await
     .expect("no hang")
     .expect("terminal");
-    assert_eq!(r1.status, ResultStatus::Completed, "{r1:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected_crash);
 }
 
@@ -173,9 +169,8 @@ async fn interrupt_during_pause_simulates_process_kill() {
         eprintln!("cp bytes: {:?}", store.load(&identity));
     }
     let result = result.expect("no hang").expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert!(
-        result.bytes_reused_from_checkpoint > 0,
+        result.accounting.bytes_reused_from_checkpoint > 0,
         "resume reused the persisted prefix: {:?}",
         result
     );
@@ -242,14 +237,13 @@ async fn randomized_multi_kill_suite() {
         let dir = tempfile::tempdir().expect("tmp");
         let dest = dir.path().join("multi.bin");
         let c = controller();
-        let result = tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_secs(90),
             c.run(DownloadRequest::new(server.url("/multi.bin"), dest.clone())),
         )
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "seed {seed}");
         assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
     }
 }
@@ -332,9 +326,8 @@ async fn durable_mode_pause_checkpoint_resumes_byte_exact() {
     .await
     .expect("no hang")
     .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert!(
-        result.bytes_reused_from_checkpoint > 0,
+        result.accounting.bytes_reused_from_checkpoint > 0,
         "resume reused the persisted prefix: {result:?}"
     );
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
@@ -415,7 +408,11 @@ async fn real_process_crash_releases_lock_and_resumes_partial_output() {
     let url = server.url("/process-crash.bin");
     let ready = directory.path().join("child-ready");
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", "real_process_crash_child", "--nocapture"])
+        .args([
+            "--exact",
+            "internal_tests::crash_restart_tests::real_process_crash_child",
+            "--nocapture",
+        ])
         .env("KDOWN_REAL_CRASH_URL", &url)
         .env("KDOWN_REAL_CRASH_DESTINATION", &destination)
         .env("KDOWN_REAL_CRASH_READY", &ready)
@@ -478,8 +475,10 @@ async fn real_process_crash_releases_lock_and_resumes_partial_output() {
     .await
     .expect("resume completes without hanging")
     .expect("terminal result");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert!(result.bytes_reused_from_checkpoint > 0, "{result:?}");
+    assert!(
+        result.accounting.bytes_reused_from_checkpoint > 0,
+        "{result:?}"
+    );
     assert_bytes_exact(
         &std::fs::read(&destination).expect("final output"),
         &content,
@@ -519,7 +518,7 @@ async fn pipelined_kill_during_segment_write_then_resume() {
         HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
         cfg,
     );
-    let r1 = tokio::time::timeout(
+    let _ = tokio::time::timeout(
         Duration::from_secs(60),
         c.run(DownloadRequest::new(
             server.url("/crash-pipelined.bin"),
@@ -529,7 +528,6 @@ async fn pipelined_kill_during_segment_write_then_resume() {
     .await
     .expect("no hang")
     .expect("terminal");
-    assert_eq!(r1.status, ResultStatus::Completed, "{r1:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected_crash);
 }
 
@@ -605,7 +603,7 @@ async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
             HttpTransport::new(kdown_engine::config::NetworkPolicy::default()).expect("transport"),
             cfg,
         );
-        let result = tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_secs(60),
             c.run(DownloadRequest::new(
                 server.url("/pipelined-pause.bin"),
@@ -615,7 +613,6 @@ async fn pipelined_pause_then_process_restart_resumes_byte_exact() {
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         assert_bytes_exact(&std::fs::read(&dest).expect("read"), &expected);
     }
 }

@@ -1,11 +1,10 @@
 //! Integration tests for the hyper transport against the misbehaving
 //! test server: redirects, probe fallback, validator capture (§10, §11.1).
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::time::Duration;
 
+use super::support::fixtures::deterministic_bytes;
+use super::support::test_server::{ScriptedResponse, TestServer};
 use kdown_engine::config::NetworkPolicy;
 use kdown_engine::control::CancellationToken;
 use kdown_engine::http::probe::filename_from_disposition;
@@ -13,8 +12,6 @@ use kdown_engine::http::transport::{HttpTransport, RequestSpec};
 use kdown_engine::http::{
     FullResponsePolicy, HttpExecution, ProbeRequest, RangeIntent, TransferIntent, TransferRequest,
 };
-use support::fixtures::deterministic_bytes;
-use support::test_server::{ScriptedResponse, TestServer};
 
 fn transport() -> HttpTransport {
     HttpTransport::new(NetworkPolicy::default()).expect("transport")
@@ -369,7 +366,11 @@ async fn semantic_probe_verifies_ranges_and_final_metadata() {
 async fn semantic_probe_lying_range_advertisement_falls_back_with_notice() {
     let content = deterministic_bytes(64 * 1024, 17);
     let server = TestServer::new()
-        .serve_ranges("/lie", content, support::test_server::RangeMode::Full200)
+        .serve_ranges(
+            "/lie",
+            content,
+            super::support::test_server::RangeMode::Full200,
+        )
         .start()
         .await
         .expect("start");
@@ -573,7 +574,7 @@ async fn semantic_transfer_200_to_nonzero_range_rejected_before_body() {
         .serve_ranges(
             "/full200",
             content,
-            support::test_server::RangeMode::Full200,
+            super::support::test_server::RangeMode::Full200,
         )
         .start()
         .await
@@ -609,7 +610,7 @@ async fn semantic_transfer_invalid_content_range_rejected_before_body() {
         .serve_ranges(
             "/bogus",
             content,
-            support::test_server::RangeMode::MalformedContentRange,
+            super::support::test_server::RangeMode::MalformedContentRange,
         )
         .start()
         .await

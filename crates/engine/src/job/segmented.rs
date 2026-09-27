@@ -19,19 +19,18 @@ use crate::config::{DurabilityMode, EngineConfig};
 use crate::control::origin::OriginRegistry;
 use crate::control::retry::{RetryClassifier, RetryDecision};
 use crate::control::CancellationToken;
-use crate::error::DownloadError;
+use crate::error::{ArtifactDisposition, DownloadError};
 use crate::http::probe::ProbeMetadata;
 use crate::http::{
     BodyEvent, FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, RequestSpec,
     TransferIntent, TransferRequest,
 };
 use crate::io::output_session::OutputSession;
-use crate::io::write_budget::{ByteReservation, JobWriteBudget, WriteBudgets};
 use crate::io::write_executor::{
     SessionDisposition, WriteCompletion, WriteExecutor, WriteOutcome, WriteSession, WriteSubmission,
 };
 use crate::io::write_frontier::{CompletionStatus, LeaseFrontier};
-use crate::job::controller::{DownloadRequest, ResultStatus};
+use crate::job::controller::{CancelMode, DownloadRequest, ResultStatus};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::SharedHub;
@@ -89,6 +88,10 @@ pub struct SegmentedJob {
     /// Throttle events (429/503-style responses) observed by any worker
     ///.
     throttle_events: AtomicU64,
+    /// The job's transfer-memory ledger (design D3): every worker charges
+    /// frame arrivals and writer submissions here; one instance per job
+    /// shared by all workers and the controller.
+    ledger: std::sync::Arc<crate::io::transfer_ledger::JobLedger>,
     /// Writer acknowledgement-latency histogram: per-window
     /// p50/p95 for the adaptive controller instead of a last-value sample.
     ack_latency: crate::metrics::histogram::LatencyHistogram,
@@ -118,6 +121,10 @@ pub struct SegmentedJob {
     /// Duration of the last coordinator checkpoint save, in microseconds
     ///. `0` means no save has completed yet.
     last_checkpoint_save_us: AtomicU64,
+    /// Whether any coordinator checkpoint save persisted during this run:
+    /// the terminal artifact disposition ORs this with the admitted
+    /// checkpoint state.
+    checkpoint_saved: AtomicBool,
     /// Configured bounds for manual concurrency control.
     min_workers: u64,
     max_workers: u64,
@@ -627,7 +634,8 @@ impl SegmentedJob {
 }
 
 /// A completed segmented transfer's accounting (before verify/commit).
-pub struct SegmentedOutcome {
+/// Crate plumbing: the public terminal API lives in [`crate::error`].
+pub(crate) struct SegmentedOutcome {
     pub status: ResultStatus,
     pub error: Option<DownloadError>,
     pub network_bytes: u64,
@@ -647,7 +655,15 @@ pub struct SegmentedOutcome {
     pub validators: crate::http::validators::ResourceValidators,
     pub warnings: Vec<String>,
     /// Completed ranges at terminal time (for pause/keep persistence).
+    /// Completed ranges at terminal time (for pause/keep persistence).
+    /// Consumed by future pause-persistence work (task 4.x); carried on the
+    /// outcome so terminal accounting stays complete.
+    #[allow(dead_code)]
     pub completed_ranges: Vec<(u64, u64)>,
+    /// Disposition of retained artifacts at this outcome (§9.4).
+    pub artifacts: crate::error::ArtifactDisposition,
+    /// The cancellation mode in effect (for typed cancellation summaries).
+    pub cancel_mode: CancelMode,
 }
 
 /// Run a segmented download over a validated probe result.
@@ -672,11 +688,17 @@ pub(crate) async fn run_segmented(
     cancel_mode: Arc<std::sync::atomic::AtomicU8>,
     start_offset_ranges: Vec<(u64, u64)>,
     started: Instant,
+    // Whether a resumable checkpoint was already on disk when this
+    // segmented phase started (admission state).
+    checkpoint_retained: bool,
     handle_cell: Option<Arc<std::sync::OnceLock<Arc<SegmentedJob>>>>,
     initial_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
     origin_registry: Arc<OriginRegistry>,
     global_rate_bucket: Arc<crate::control::rate_limit::TokenBucket>,
+    job_ledger: std::sync::Arc<crate::io::transfer_ledger::JobLedger>,
 ) -> SegmentedOutcome {
+    let cancel_mode_value =
+        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst));
     let mut warnings: Vec<String> = vec![];
     // Lease sizing per configuration: the explicit
     // `initial_segment_size` is honored (previously ignored in favor of
@@ -751,6 +773,11 @@ pub(crate) async fn run_segmented(
                 validators: meta.validators.clone(),
                 warnings,
                 completed_ranges: start_offset_ranges,
+                artifacts: ArtifactDisposition {
+                    temp_retained: true,
+                    checkpoint_retained,
+                },
+                cancel_mode: cancel_mode_value,
             };
         }
     };
@@ -775,6 +802,7 @@ pub(crate) async fn run_segmented(
         revision_tx: Arc::new(revision_tx),
         save_now_tx,
         desired_workers: AtomicU64::new(desired),
+        ledger: job_ledger,
         manual_override: AtomicBool::new(false),
         throttle_events: AtomicU64::new(0),
         ack_latency: crate::metrics::histogram::LatencyHistogram::new(),
@@ -785,6 +813,7 @@ pub(crate) async fn run_segmented(
         splits: AtomicU64::new(0),
         segment_requests: AtomicU64::new(0),
         last_checkpoint_save_us: AtomicU64::new(0),
+        checkpoint_saved: AtomicBool::new(false),
         worker_states: (0..config.transfer.max_workers.max(1) as usize)
             .map(|_| AtomicU8::new(0))
             .collect(),
@@ -851,6 +880,12 @@ pub(crate) async fn run_segmented(
                 validators: meta.validators.clone(),
                 warnings,
                 completed_ranges: start_offset_ranges,
+                artifacts: ArtifactDisposition {
+                    temp_retained: true,
+                    checkpoint_retained: checkpoint_retained
+                        || job.checkpoint_saved.load(Ordering::Relaxed),
+                },
+                cancel_mode: cancel_mode_value,
             };
         }
     };
@@ -861,13 +896,6 @@ pub(crate) async fn run_segmented(
     // proves parity.
     let pipelined = config.write_executor.pipeline_writes;
     let write_executor = pipelined.then(|| WriteExecutor::new(&config.write_executor));
-    let write_budgets = pipelined.then(|| {
-        WriteBudgets::new(
-            config.write_budget.global_max_bytes,
-            config.write_budget.job_max_bytes,
-            config.write_budget.worker_read_ahead_bytes,
-        )
-    });
     // Workers own their writer-lane lifecycle — each receives one
     // write-only capability and spawns its blocking lane on first activation,
     // releasing it on dormancy or exit. `worker join` therefore implies every
@@ -879,18 +907,19 @@ pub(crate) async fn run_segmented(
         let classifier = RetryClassifier::new(config.retry.clone());
         let job = job.clone();
         let output = writers.pop().expect("one output handle per worker");
-        let writer = match (&write_executor, &write_budgets) {
-            (Some(executor), Some(budgets)) => {
+        let writer = match &write_executor {
+            Some(executor) => {
                 let (session, completions) = executor.session(0, Arc::new(output));
                 WorkerWriter::Pipelined(Box::new(PipelinedWriter {
                     session,
                     completions,
-                    budget: budgets.job(0),
+                    ledger: job.ledger.clone(),
                     frame_quantum: u64::from(config.read_buffer_size),
+                    read_ahead_bytes: config.write_budget.worker_read_ahead_bytes,
                     reservations: std::collections::HashMap::new(),
                 }))
             }
-            _ => WorkerWriter::Legacy { lane: None, output },
+            None => WorkerWriter::Legacy { lane: None, output },
         };
         let req_spec = WorkerRequestSpec {
             url: meta.final_url.clone(),
@@ -1004,19 +1033,32 @@ pub(crate) async fn run_segmented(
     // failures become warnings without rewriting the outcome (§9.2).
     if job.cancel.is_cancelled() {
         let completed = job.completed_ranges().await;
-        let cleanup_warnings = if ownership_reclaimed {
-            crate::job::controller::DownloadController::cleanup_cancelled(
-                crate::job::controller::CancelMode::from_u8(
-                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+        let cleanup = if ownership_reclaimed {
+            Some(
+                crate::job::controller::DownloadController::cleanup_cancelled(
+                    crate::job::controller::CancelMode::from_u8(
+                        cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                    ),
+                    session,
+                    store.as_ref(),
+                    identity,
                 ),
-                session,
-                store.as_ref(),
-                identity,
             )
         } else {
-            vec![]
+            None
         };
-        warnings.extend(cleanup_warnings);
+        let cleanup_artifacts =
+            cleanup
+                .as_ref()
+                .map(|c| c.artifacts)
+                .unwrap_or(ArtifactDisposition {
+                    // Ownership was not reclaimed: the shared session cannot be
+                    // cleaned safely, so the partial file remains on disk.
+                    temp_retained: true,
+                    checkpoint_retained: checkpoint_retained
+                        || job.checkpoint_saved.load(Ordering::Relaxed),
+                });
+        warnings.extend(cleanup.map(|c| c.warnings).unwrap_or_default());
         // One consistent fold for the whole terminal record.
         let snap = counters.fold();
         return SegmentedOutcome {
@@ -1038,6 +1080,16 @@ pub(crate) async fn run_segmented(
             validators: job.validators.clone(),
             warnings,
             completed_ranges: completed,
+            artifacts: if ownership_reclaimed {
+                cleanup_artifacts
+            } else {
+                ArtifactDisposition {
+                    temp_retained: true,
+                    checkpoint_retained: checkpoint_retained
+                        || job.checkpoint_saved.load(Ordering::Relaxed),
+                }
+            },
+            cancel_mode: cancel_mode_value,
         };
     }
     if let Some(f) = job.take_fatal() {
@@ -1064,6 +1116,12 @@ pub(crate) async fn run_segmented(
             validators: job.validators.clone(),
             warnings,
             completed_ranges: completed,
+            artifacts: ArtifactDisposition {
+                temp_retained: true,
+                checkpoint_retained: checkpoint_retained
+                    || job.checkpoint_saved.load(Ordering::Relaxed),
+            },
+            cancel_mode: cancel_mode_value,
         };
     }
     if !complete {
@@ -1086,6 +1144,12 @@ pub(crate) async fn run_segmented(
             validators: job.validators.clone(),
             warnings,
             completed_ranges: completed,
+            artifacts: ArtifactDisposition {
+                temp_retained: true,
+                checkpoint_retained: checkpoint_retained
+                    || job.checkpoint_saved.load(Ordering::Relaxed),
+            },
+            cancel_mode: cancel_mode_value,
         };
     }
     SegmentedOutcome {
@@ -1103,6 +1167,8 @@ pub(crate) async fn run_segmented(
         validators: job.validators.clone(),
         warnings,
         completed_ranges: completed,
+        artifacts: ArtifactDisposition::default(),
+        cancel_mode: cancel_mode_value,
     }
 }
 
@@ -1133,13 +1199,24 @@ enum WorkerWriter {
 struct PipelinedWriter {
     session: WriteSession,
     completions: mpsc::UnboundedReceiver<WriteCompletion>,
-    budget: JobWriteBudget,
+    /// The job's transfer-memory ledger (design D3, task 3.5): the single
+    /// accounting domain the pipelined writer draws pre-read quanta from.
+    ledger: std::sync::Arc<crate::io::transfer_ledger::JobLedger>,
     /// Bytes to reserve before polling the next body chunk (one frame
     /// quantum, design D2).
     frame_quantum: u64,
+    /// Per-worker read-ahead bound (subordinate to the ledger's writer
+    /// component cap, validated at configuration).
+    read_ahead_bytes: u64,
     /// Reservations covering queued+executing payload, keyed by
     /// (lease id, offset); released when the write settles.
-    reservations: std::collections::HashMap<(u64, u64), (ByteReservation, std::time::Instant)>,
+    reservations: std::collections::HashMap<
+        (u64, u64),
+        (
+            crate::io::transfer_ledger::TransferReservation,
+            std::time::Instant,
+        ),
+    >,
 }
 
 /// Errors inside one lease attempt.
@@ -1851,7 +1928,61 @@ async fn consume_legacy_body(
                 // flush.
                 let chunk_was_truncated = owned_len < original_len;
                 let owned = data.split_to(owned_len as usize);
+                // Transfer-memory admission (design D3, task 3.4): the
+                // owned chunk is charged to the job ledger from receipt
+                // (Frames tag) through the writer submission (Writer tag)
+                // until the write acknowledges — released by drop on every
+                // error/cancel path. An atomic chunk larger than a cap can
+                // never fit: typed refusal.
+                let mut reservation = match job
+                    .ledger
+                    .reserve(
+                        crate::io::transfer_ledger::Component::Frames,
+                        owned.len() as u64,
+                    )
+                    .await
+                {
+                    Ok(reservation) => reservation,
+                    Err(crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                        crate::io::transfer_ledger::OversizeRefusal {
+                            component,
+                            requested,
+                            cap,
+                        },
+                    )) => {
+                        return Err(WorkerError::Fatal(DownloadError::MemoryCapExceeded {
+                            component: component.name(),
+                            requested,
+                            cap,
+                        }));
+                    }
+                    Err(crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_)) => {
+                        unreachable!("reserve waits fairly for capacity")
+                    }
+                };
                 job.acquire_rate(owned.len() as u64).await;
+                // Writer admission shares the ledger: the same bytes retag
+                // Frames -> Writer (single charge) while the writer
+                // component cap bounds queued+in-flight writes.
+                reservation
+                    .retag(crate::io::transfer_ledger::Component::Writer)
+                    .await
+                    .map_err(|refusal| match refusal {
+                        crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                            crate::io::transfer_ledger::OversizeRefusal {
+                                component,
+                                requested,
+                                cap,
+                            },
+                        ) => WorkerError::Fatal(DownloadError::MemoryCapExceeded {
+                            component: component.name(),
+                            requested,
+                            cap,
+                        }),
+                        crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_) => {
+                            unreachable!("retag waits fairly for capacity")
+                        }
+                    })?;
                 let write_started = Instant::now();
                 lane.write(abs_offset, owned.clone())
                     .await
@@ -1862,6 +1993,8 @@ async fn consume_legacy_body(
                 // observed depth is 1 by construction.
                 job.record_ack_latency(write_started.elapsed());
                 job.record_queue_depth(1);
+                // The write acknowledged: the bytes are no longer held.
+                drop(reservation);
                 in_range_offset += owned.len() as u64;
 
                 // Hot-path progress (§13.3): publish the
@@ -2068,7 +2201,7 @@ async fn consume_pipelined_body(
     }
     // The pre-read reservation: held across the body poll and
     // reconciled to the actual frame size after receipt.
-    let mut reservation: Option<ByteReservation> = None;
+    let mut reservation: Option<crate::io::transfer_ledger::TransferReservation> = None;
 
     loop {
         // Register the current revision BEFORE the read: a fatal
@@ -2085,9 +2218,11 @@ async fn consume_pipelined_body(
             return Err(WorkerError::Fatal(DownloadError::Cancelled));
         }
 
-        // Pre-read reservation : hold byte budget for
+        // Pre-read reservation : hold writer-component bytes for
         // the next frame BEFORE polling the body, bounded by the worker
-        // read-ahead so a fast connection cannot outrun a slow sink.
+        // read-ahead so a fast connection cannot outrun a slow sink. The
+        // single ledger admits the quantum against the writer component,
+        // job and engine aggregate caps at once (design D3, task 3.5).
         if reservation.is_none() {
             // Byte-budget wait: the read-ahead wait loop plus the
             // reservation acquisition, both of which are storage backpressure.
@@ -2097,9 +2232,9 @@ async fn consume_pipelined_body(
                 let held: u64 = writer
                     .reservations
                     .values()
-                    .map(|(reservation, _)| reservation.held())
+                    .map(|(reservation, _)| reservation.bytes())
                     .sum();
-                if held + quantum <= writer.budget.worker_read_ahead_bytes() {
+                if held + quantum <= writer.read_ahead_bytes {
                     break;
                 }
                 // Read-ahead exhausted: wait for a completion to release
@@ -2128,7 +2263,29 @@ async fn consume_pipelined_body(
                     }
                 }
             }
-            reservation = Some(writer.budget.reserve(quantum).await);
+            reservation = match writer
+                .ledger
+                .reserve(crate::io::transfer_ledger::Component::Writer, quantum)
+                .await
+            {
+                Ok(reservation) => Some(reservation),
+                Err(crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                    crate::io::transfer_ledger::OversizeRefusal {
+                        component,
+                        requested,
+                        cap,
+                    },
+                )) => {
+                    return Err(WorkerError::Fatal(DownloadError::MemoryCapExceeded {
+                        component: component.name(),
+                        requested,
+                        cap,
+                    }));
+                }
+                Err(crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_)) => {
+                    unreachable!("reserve waits fairly for capacity")
+                }
+            };
             job.add_budget_wait(wait_started.elapsed());
         }
 
@@ -2216,10 +2373,28 @@ async fn consume_pipelined_body(
                 // Rate tokens first: payload bytes only (§18.2).
                 job.acquire_rate(chunk_len).await;
                 let mut frame = reservation.take().expect("pre-read reservation held");
-                if chunk_len > frame.held() {
+                if chunk_len > frame.bytes() {
                     // Oversize frame: grow the reservation (design D2
-                    // oversize-frame reconciliation).
-                    frame.grow(chunk_len - frame.held()).await;
+                    // oversize-frame reconciliation) with the ledger's
+                    // typed oversize refusal.
+                    frame.grow(chunk_len - frame.bytes()).await.map_err(
+                        |refusal| match refusal {
+                            crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                                crate::io::transfer_ledger::OversizeRefusal {
+                                    component,
+                                    requested,
+                                    cap,
+                                },
+                            ) => WorkerError::Fatal(DownloadError::MemoryCapExceeded {
+                                component: component.name(),
+                                requested,
+                                cap,
+                            }),
+                            crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_) => {
+                                unreachable!("grow waits fairly for capacity")
+                            }
+                        },
+                    )?;
                 }
                 frame.reconcile(chunk_len);
                 frontier.record_received(abs_offset, chunk_len);
@@ -2717,6 +2892,28 @@ async fn attempt_coordinator_save(
     cp.total_size = Some(job.total_size);
     cp.validators = candidates.validators.clone();
     cp.completed_ranges = candidates.ranges.clone();
+    // Transfer-memory admission (task 3.6): the checkpoint's estimated
+    // serialized size is charged to the Checkpoint component before the
+    // store allocates; a refusal fails the save (and the job) safely.
+    let estimate = cp.serialized_size_estimate();
+    let reservation = job
+        .ledger
+        .reserve(crate::io::transfer_ledger::Component::Checkpoint, estimate)
+        .await
+        .map_err(|refusal| match refusal {
+            crate::io::transfer_ledger::LedgerRefusal::Oversize(
+                crate::io::transfer_ledger::OversizeRefusal {
+                    requested: size,
+                    cap,
+                    ..
+                },
+            ) => DownloadError::Checkpoint(format!(
+                "checkpoint size {size} exceeds the configured budget {cap}"
+            )),
+            crate::io::transfer_ledger::LedgerRefusal::NoCapacity(_) => {
+                unreachable!("reserve waits fairly for capacity")
+            }
+        })?;
     let store_result = {
         let checkpoint = cp;
         let store = store.clone();
@@ -2730,10 +2927,13 @@ async fn attempt_coordinator_save(
             DownloadError::Checkpoint(format!("checkpoint store task failed: {join_err}"))
         })?
     };
+    drop(reservation);
     match store_result {
         Ok(()) => {
             // Revision advances only on a successful save.
             *last_saved = Some(candidates);
+            // A persisted checkpoint now exists on disk for this run.
+            job.checkpoint_saved.store(true, Ordering::Relaxed);
             job.last_checkpoint_save_us.store(
                 save_started.elapsed().as_micros().max(1) as u64,
                 Ordering::Relaxed,
@@ -2824,6 +3024,16 @@ mod durability_tests {
             revision_tx: Arc::new(revision_tx),
             save_now_tx,
             desired_workers: AtomicU64::new(1),
+            ledger: {
+                let memory = crate::config::TransferMemoryConfig::default();
+                std::sync::Arc::new(
+                    crate::io::transfer_ledger::TransferLedger::new(
+                        &memory,
+                        memory.connection_ingress_reserve(128 * 1024, 16),
+                    )
+                    .job(&memory),
+                )
+            },
             manual_override: AtomicBool::new(false),
             throttle_events: AtomicU64::new(0),
             ack_latency: crate::metrics::histogram::LatencyHistogram::new(),
@@ -2834,6 +3044,7 @@ mod durability_tests {
             splits: AtomicU64::new(0),
             segment_requests: AtomicU64::new(0),
             last_checkpoint_save_us: AtomicU64::new(0),
+            checkpoint_saved: AtomicBool::new(false),
             worker_states: vec![AtomicU8::new(0)],
             worker_lane_live: vec![AtomicBool::new(false)],
             min_workers: 1,
@@ -3147,7 +3358,7 @@ mod write_pipeline_tests {
     use super::*;
     use crate::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
     use crate::io::fault_script::{OutputFaultScript, OutputOperation};
-    use crate::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+    use crate::job::controller::{DownloadController, DownloadRequest};
     use std::time::Duration;
 
     const TOTAL: u64 = 2000;
@@ -3407,10 +3618,9 @@ mod write_pipeline_tests {
             .expect("no hang")
             .expect("join")
             .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-        assert_eq!(result.completed_bytes, TOTAL);
+        assert_eq!(result.accounting.completed_bytes, TOTAL);
         assert_eq!(
-            result.bytes_downloaded_from_network, TOTAL,
+            result.accounting.bytes_downloaded_from_network, TOTAL,
             "two submitted writes, two receipts — no duplicate-wire inflation"
         );
         assert_eq!(std::fs::read(&dest).expect("content"), content);
@@ -3443,11 +3653,10 @@ mod write_pipeline_tests {
             ))
             .await
             .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         // Server-emitted == client-received (no over-send on the scripted
         // path), and the useful completion equals the wire payload.
-        assert_eq!(result.bytes_downloaded_from_network, TOTAL);
-        assert_eq!(result.completed_bytes, TOTAL);
+        assert_eq!(result.accounting.bytes_downloaded_from_network, TOTAL);
+        assert_eq!(result.accounting.completed_bytes, TOTAL);
         assert_eq!(
             std::fs::read(&destination).expect("content"),
             content,
@@ -3504,14 +3713,13 @@ mod write_pipeline_tests {
         // (The gate only holds the first Write operation.)
         gate.release();
         let result = task.await.expect("job task").expect("job completes");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         assert_eq!(
             std::fs::read(&destination).expect("content"),
             content,
             "reverse completion must still produce byte-exact output"
         );
-        assert_eq!(result.bytes_downloaded_from_network, TOTAL);
-        assert_eq!(result.completed_bytes, TOTAL);
+        assert_eq!(result.accounting.bytes_downloaded_from_network, TOTAL);
+        assert_eq!(result.accounting.completed_bytes, TOTAL);
     }
 
     /// Bounded bytes: with a one-frame read-ahead, a blocked
@@ -3558,8 +3766,7 @@ mod write_pipeline_tests {
 
         // Releasing the sink completes the transfer byte-exactly.
         gate.release();
-        let result = task.await.expect("job task").expect("job completes");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+        let _ = task.await.expect("job task").expect("job completes");
         assert_eq!(
             std::fs::read(&destination).expect("content"),
             content,
@@ -3618,15 +3825,17 @@ mod write_pipeline_tests {
             ))
             .await
             .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         assert_eq!(
             std::fs::read(&destination).expect("content"),
             content,
             "retry from the settled prefix must complete byte-exactly"
         );
-        assert_eq!(result.completed_bytes, TOTAL, "unique coverage once");
+        assert_eq!(
+            result.accounting.completed_bytes, TOTAL,
+            "unique coverage once"
+        );
         assert!(
-            result.bytes_downloaded_from_network >= TOTAL,
+            result.accounting.bytes_downloaded_from_network >= TOTAL,
             "wire bytes cover the payload (any waste is accounted separately)"
         );
     }
@@ -3736,13 +3945,15 @@ mod write_pipeline_tests {
         // the tail is re-fetched; the job completes byte-exactly.
         handle.resume_now();
         let result = task.await.expect("job task").expect("job completes");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         assert_eq!(
             std::fs::read(&destination).expect("content"),
             content,
             "resume after drained pause completes byte-exactly"
         );
-        assert_eq!(result.completed_bytes, TOTAL, "unique coverage once");
+        assert_eq!(
+            result.accounting.completed_bytes, TOTAL,
+            "unique coverage once"
+        );
     }
 
     /// Cancellation: cancelling with queued writes converges
@@ -3786,9 +3997,12 @@ mod write_pipeline_tests {
             let result = tokio::time::timeout(Duration::from_secs(10), task)
                 .await
                 .expect("cancellation must converge without deadlock")
-                .expect("terminal")
-                .expect("job task");
-            assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
+                .expect("job task")
+                .expect_err("terminal cancellation");
+            assert!(
+                matches!(result, crate::error::DownloadRunError::Cancelled(_)),
+                "{result:?}"
+            );
 
             let partial = directory.path().join("output.bin.part");
             match mode {
@@ -3841,11 +4055,10 @@ mod write_pipeline_tests {
             )
             .await
             .expect("write failure must terminate without deadlock")
-            .expect("terminal");
-            assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+            .expect_err("terminal");
             assert_eq!(
-                result.error.as_ref().map(DownloadError::category),
-                Some(expected_category),
+                result.category(),
+                expected_category,
                 "structured sink error surfaces"
             );
             assert!(
@@ -3866,14 +4079,13 @@ mod write_pipeline_tests {
             HttpExecution::from_adapter(pipeline_http(&content)),
             pipeline_config(false, 4),
         );
-        let result = controller
+        let _ = controller
             .run(DownloadRequest::new(
                 "https://scripted/legacy",
                 destination.clone(),
             ))
             .await
             .expect("terminal");
-        assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
         assert_eq!(std::fs::read(&destination).expect("content"), content);
     }
 }

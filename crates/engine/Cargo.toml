@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# Internal-facing integration tests compile as crate-internal modules
+# (src/internal_tests.rs) so they keep access to implementation internals;
+# only the supported-surface facade tests remain external targets.
+autotests = false
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal"] }
 rand = "0.9"
@@ -26,13 +31,83 @@ tracing = "0.1"
 bytes = "1"
 fs2 = "0.4"
 
+[features]
+# Non-default: exposes fuzz entry points to the `cargo fuzz` harness only.
+fuzz-entry = []
+
 [dev-dependencies]
+futures-core = "0.3"
 proptest = "1"
 criterion = "0.5"
 tempfile = "3"
 tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = "0.14"
+trybuild = "1.0.119"
+
+[[test]]
+name = "fixture_isolated_tests"
+path = "tests/fixture_isolated_tests.rs"
+
+[[test]]
+name = "external_consumer_fixture"
+path = "tests/external_consumer_fixture.rs"
+
+[[test]]
+name = "retired_seam_negative"
+path = "tests/retired_seam_negative.rs"
+
+[[test]]
+name = "allocation_tests"
+path = "tests/allocation_tests.rs"
+
+[[test]]
+name = "connection_pool_tests"
+path = "tests/connection_pool_tests.rs"
+
+[[test]]
+name = "fixtures_tests"
+path = "tests/fixtures_tests.rs"
+
+[[test]]
+name = "h2_tests"
+path = "tests/h2_tests.rs"
+
+[[test]]
+name = "handle_control_tests"
+path = "tests/handle_control_tests.rs"
+
+[[test]]
+name = "metrics_tests"
+path = "tests/metrics_tests.rs"
+
+[[test]]
+name = "origin_coordination_tests"
+path = "tests/origin_coordination_tests.rs"
+
+[[test]]
+name = "proxy_tests"
+path = "tests/proxy_tests.rs"
+
+[[test]]
+name = "randomized_disconnect_tests"
+path = "tests/randomized_disconnect_tests.rs"
+
+[[test]]
+name = "rate_limit_tests"
+path = "tests/rate_limit_tests.rs"
+
+[[test]]
+name = "redaction_audit_tests"
+path = "tests/redaction_audit_tests.rs"
+
+[[test]]
+name = "test_server_integration"
+path = "tests/test_server_integration.rs"
+
+[[test]]
+name = "wire_amplification_tests"
+path = "tests/wire_amplification_tests.rs"
 
 [[bench]]
 name = "throughput"

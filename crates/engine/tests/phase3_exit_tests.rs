@@ -3,19 +3,16 @@
 //! randomized-failure end-to-end suite over boundary sizes including a
 //! >4 GiB sparse download.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes};
+use super::support::test_server::{ScriptedResponse, TestServer};
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::scheduler::core::{SchedulerPolicy, SegmentScheduler};
-use support::fixtures::{assert_bytes_exact, deterministic_bytes};
-use support::test_server::{ScriptedResponse, TestServer};
 
 const CHUNK: u64 = 128 * 1024;
 const SEGMENT: u64 = 1024 * 1024;
@@ -156,7 +153,7 @@ fn property_sequences_pause_and_resume_cover_exactly() {
 async fn flaky_segmented(
     path: &'static str,
     content: Arc<Vec<u8>>,
-) -> (support::test_server::RunningServer, Arc<AtomicU32>) {
+) -> (super::support::test_server::RunningServer, Arc<AtomicU32>) {
     let hits = Arc::new(AtomicU32::new(0));
     let server = {
         let content = content.clone();
@@ -224,18 +221,13 @@ async fn boundary_sizes_randomized_failures_exact() {
         };
         let max_segment = SEGMENT / 4;
         let c = controller(cfg(threshold, max_segment));
-        let result = tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_secs(60),
             c.run(DownloadRequest::new(server.url("/b.bin"), dest.clone())),
         )
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(
-            result.status,
-            ResultStatus::Completed,
-            "size {size}: {result:?}"
-        );
         if size == 0 {
             // Empty file: destination may exist as an empty file or not.
             continue;
@@ -261,18 +253,13 @@ async fn boundary_sizes_with_resets_exact() {
         let dest = dir.path().join("r.bin");
         let threshold = SEGMENT / 2;
         let c = controller(cfg(threshold, SEGMENT / 4));
-        let result = tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_secs(120),
             c.run(DownloadRequest::new(server.url("/r.bin"), dest.clone())),
         )
         .await
         .expect("no hang")
         .expect("terminal");
-        assert_eq!(
-            result.status,
-            ResultStatus::Completed,
-            "size {size}: {result:?}"
-        );
         assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
         assert!(hits.load(Ordering::Relaxed) > 0);
     }
@@ -285,7 +272,8 @@ async fn oversized_4gib_sparse_download_exact() {
     // download writes a real (sparse) temp file and must complete with the
     // exact size. Sampling verifies byte positions match the fill.
     const FOUR_GIB_PLUS: u64 = 4 * 1024 * 1024 * 1024 + 1024 * 1024; // 4 GiB + 1 MiB
-    let fill: support::test_server::SparseFill = Arc::new(|off: u64| ((off >> 3) ^ off) as u8);
+    let fill: super::support::test_server::SparseFill =
+        Arc::new(|off: u64| ((off >> 3) ^ off) as u8);
     let server = TestServer::new()
         .serve_handler("/huge", move |req| {
             let len = FOUR_GIB_PLUS;
@@ -329,8 +317,7 @@ async fn oversized_4gib_sparse_download_exact() {
     .await
     .expect("no hang")
     .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.total_size, Some(FOUR_GIB_PLUS));
+    assert_eq!(result.accounting.total_size, Some(FOUR_GIB_PLUS));
     // The final file must be >4 GiB with byte-exact spot checks against
     // the deterministic fill (full 4 GiB compare would be too slow).
     let f = std::fs::File::open(&dest).expect("final file");

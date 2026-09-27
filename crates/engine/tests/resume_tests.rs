@@ -2,22 +2,19 @@
 //! downloads resume without corruption; generation changes never mix;
 //! pause persists resumable state.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes};
+use super::support::test_server::{ScriptedResponse, TestServer};
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
 use kdown_engine::resume::{DurabilityMode, FileCheckpointStore};
-use support::fixtures::{assert_bytes_exact, deterministic_bytes};
-use support::test_server::{ScriptedResponse, TestServer};
 
 fn controller() -> DownloadController {
     DownloadController::new(
@@ -77,14 +74,13 @@ async fn interrupted_download_resumes_byte_identical() {
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("res.bin");
     let c = controller_fast();
-    let result = tokio::time::timeout(
+    let _ = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         c.run(DownloadRequest::new(server.url("/res.bin"), dest.clone())),
     )
     .await
     .expect("no hang")
     .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Checkpoint deleted on success (§14.6 step 5).
     let identity = kdown_engine::resume::job_identity(&server.url("/res.bin"), &dest);
@@ -178,15 +174,14 @@ async fn validator_mismatch_resume_fails_structured() {
     let result = c
         .run(DownloadRequest::new(server.url("/gen.bin"), dest.clone()))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error,
+            result.as_engine_error(),
             Some(kdown_engine::DownloadError::ResourceChanged(_))
         ),
         "structured ResourceChanged expected, got {:?}",
-        result.error
+        result.as_engine_error()
     );
     // Old partial data preserved (Fail policy, §26).
     assert!(temp.exists());
@@ -244,20 +239,23 @@ async fn mid_transfer_generation_change_never_mixes() {
     let c = controller();
     let result = c
         .run(DownloadRequest::new(server.url("/flip.bin"), dest.clone()))
-        .await
-        .expect("terminal");
+        .await;
     // The If-Range-protected resume must not append gen-b bytes to
     // gen-a data. With matching ETag the server answers 206 correctly.
     // Either Completed (etag still gen-a) or ResourceChanged is
     // acceptable; mixing is not: the final file must be exact.
-    if result.status == ResultStatus::Completed {
-        assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content_for_assert);
-    } else {
-        assert!(matches!(
-            result.error,
-            Some(kdown_engine::DownloadError::ResourceChanged(_))
-                | Some(kdown_engine::DownloadError::InvalidRangeResponse(_))
-        ));
+    match result {
+        Ok(completed) => {
+            assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content_for_assert);
+            let _ = completed;
+        }
+        Err(error) => {
+            assert!(matches!(
+                error.as_engine_error(),
+                Some(kdown_engine::DownloadError::ResourceChanged(_))
+                    | Some(kdown_engine::DownloadError::InvalidRangeResponse(_))
+            ));
+        }
     }
 }
 
@@ -289,8 +287,11 @@ async fn pause_persists_checkpoint_for_restart_resume() {
         .await
         .expect("prompt")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled);
+        .expect_err("terminal");
+    assert!(matches!(
+        result,
+        kdown_engine::error::DownloadRunError::Cancelled(_)
+    ));
     // Cancel deletes temp+checkpoint (§9.4 DeletePartial) — assert no
     // residue; the pause-checkpoint behavior is asserted by
     // checkpoint_written_during_transfer_and_valid.
@@ -321,7 +322,7 @@ async fn corrupt_checkpoint_fails_safely() {
     std::fs::write(dir.path().join("corrupt.bin.part"), vec![1u8; 1024]).expect("temp");
 
     let c = scripted_controller(&scripted);
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/corrupt.bin",
             dest.clone(),
@@ -330,7 +331,6 @@ async fn corrupt_checkpoint_fails_safely() {
         .expect("terminal");
     // Conservative recovery: corrupt checkpoint -> restart from zero,
     // fresh download succeeds (§15.1 fail-safe, §38).
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Consumed request sequence: one probe, one full transfer.
     let log = scripted.request_log();
@@ -369,9 +369,11 @@ async fn partial_checkpoint_resumes_at_prefix_with_reused_bytes() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    assert_eq!(result.bytes_reused_from_checkpoint, prefix_len as u64);
+    assert_eq!(
+        result.accounting.bytes_reused_from_checkpoint,
+        prefix_len as u64
+    );
     // Committed download leaves no resumable state (§14.6 step 5).
     assert!(store.load(&identity).expect("load").is_none());
     assert!(!temp.exists());
@@ -394,15 +396,14 @@ async fn required_resume_without_checkpoint_fails_before_probing() {
         .await
         .expect("prompt")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error,
+            result.as_engine_error(),
             Some(kdown_engine::DownloadError::Checkpoint(_))
         ),
         "structured checkpoint error expected, got {:?}",
-        result.error
+        result.as_engine_error()
     );
     // The stream must stay empty: the job never probed and never emitted.
     if let Some(event) = tokio::time::timeout(std::time::Duration::from_millis(50), events.next())
@@ -466,15 +467,14 @@ async fn stale_generation_emits_resource_changed_before_failure() {
         .await
         .expect("prompt")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+        .expect_err("terminal");
     assert!(
         matches!(
-            result.error,
+            result.as_engine_error(),
             Some(kdown_engine::DownloadError::ResourceChanged(_))
         ),
         "structured ResourceChanged expected, got {:?}",
-        result.error
+        result.as_engine_error()
     );
     // Old partial data preserved (Fail policy, §26).
     assert!(temp.exists());
@@ -519,10 +519,9 @@ async fn required_resume_with_corrupt_checkpoint_fails_closed() {
     let mut request = DownloadRequest::new("https://scripted/req-corrupt.bin", dest.clone());
     request.resume = kdown_engine::config::ResumePolicy::Required;
     let c = scripted_controller(&scripted);
-    let result = c.run(request).await.expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
+    let result = c.run(request).await.expect_err("terminal");
     assert!(matches!(
-        result.error,
+        result.as_engine_error(),
         Some(kdown_engine::DownloadError::Checkpoint(_))
     ));
     assert!(scripted.request_log().is_empty(), "no probe before failure");

@@ -23,63 +23,8 @@
 //! a log of consumed calls ([`ScriptedHttp::request_log`]) and asserts
 //! full consumption ([`ScriptedHttp::assert_all_consumed`]).
 //!
-//! # Example
-//!
-//! ```
-//! use kdown_engine::control::CancellationToken;
-//! use kdown_engine::http::scripted::{ScriptedHttp, ProbeStep, TransferStep, TransferOk};
-//! use kdown_engine::http::{
-//!     HttpExecution, ProbeMetadata, ProbeRequest, RequestSpec, TransferIntent, TransferRequest,
-//! };
-//!
-//! tokio::runtime::Runtime::new().unwrap().block_on(async {
-//!     let scripted = ScriptedHttp::new()
-//!         .expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
-//!             total_size: Some(5),
-//!             ..ProbeMetadata::default()
-//!         }))
-//!         .expect_transfer(
-//!             TransferStep::new()
-//!                 .ok(TransferOk::new().total(5).chunk(b"hello".as_slice())),
-//!         );
-//!     let execution = HttpExecution::from_adapter(scripted.clone());
-//!     let cancel = CancellationToken::new();
-//!
-//!     let outcome = execution
-//!         .probe(
-//!             ProbeRequest {
-//!                 spec: RequestSpec {
-//!                     url: "https://x/f.bin".into(),
-//!                     ..RequestSpec::default()
-//!                 },
-//!                 segmentation_threshold: 1024,
-//!                 verify_range_support: true,
-//!             },
-//!             &cancel,
-//!         )
-//!         .await
-//!         .expect("probe");
-//!     assert_eq!(outcome.metadata.total_size, Some(5));
-//!
-//!     let response = execution
-//!         .transfer(
-//!             TransferRequest {
-//!                 spec: RequestSpec {
-//!                     url: "https://x/f.bin".into(),
-//!                     ..RequestSpec::default()
-//!                 },
-//!                 intent: TransferIntent::Full,
-//!             },
-//!             &cancel,
-//!         )
-//!         .await
-//!         .expect("transfer");
-//!     assert_eq!(response.total_size, Some(5));
-//!
-//!     scripted.assert_all_consumed();
-//!     assert_eq!(scripted.request_log().len(), 2);
-//! });
-//! ```
+//! Usage examples live in the relocated internal conformance tests; the
+//! adapter is crate-internal and not part of the supported surface.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;

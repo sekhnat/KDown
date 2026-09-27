@@ -12,7 +12,6 @@
 //! failure; the phase-3 target is stricter, <1.10 on the clean split
 //! fixture).
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::future::Future as _;
@@ -22,7 +21,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy, SegmentSizing, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -98,11 +97,10 @@ async fn live_tail_split_never_doubles_wire_payload() {
         .await
         .expect("terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Accepted unique coverage is exact regardless of overlap.
     assert_eq!(
-        result.completed_bytes, len,
+        result.accounting.completed_bytes, len,
         "accepted bytes must equal file size"
     );
 
@@ -369,9 +367,11 @@ async fn run_h2_split_case(seed: u64, pipeline: bool, label: &str) {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    assert_eq!(result.completed_bytes, len, "unique coverage exact");
+    assert_eq!(
+        result.accounting.completed_bytes, len,
+        "unique coverage exact"
+    );
 
     let emitted_bytes = emitted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(emitted_bytes >= len, "server served at least the payload");
@@ -422,9 +422,11 @@ async fn live_tail_split_pipelined_duration_holds_amplification_bound() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    assert_eq!(result.completed_bytes, len, "unique coverage exact");
+    assert_eq!(
+        result.accounting.completed_bytes, len,
+        "unique coverage exact"
+    );
 
     let emitted = server.payload_emitted().await;
     let amplification = emitted as f64 / len as f64;

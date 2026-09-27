@@ -26,7 +26,10 @@ use tracing::debug;
 
 use crate::config::{ConnectionTarget, ProxyConfig, TlsConfig};
 use crate::error::DownloadError;
+use crate::io::transfer_ledger::{ConnectionIngressReservation, TransferLedger};
 use crate::redact::Redactor;
+
+use super::transport::IngressProfile;
 
 /// A TCP or TLS stream with its connection-limit permits attached: the
 /// permits live until the stream (and any pool idle time) is dropped, so
@@ -41,6 +44,11 @@ pub struct LimitedConn {
     /// handshake actually negotiated it.
     alpn_h2_requested: bool,
     _permits: LimitPermits,
+    /// The connection's reserved ingress footprint (task 3.3): charged
+    /// before dialing, released when the connection closes. Held only for
+    /// its `Drop` release, never read.
+    #[allow(dead_code)]
+    ingress: Option<ConnectionIngressReservation>,
 }
 
 enum ConnIo {
@@ -49,17 +57,29 @@ enum ConnIo {
 }
 
 impl LimitedConn {
-    fn new(io: ConnIo, proxied: bool, alpn_h2_requested: bool, permits: LimitPermits) -> Self {
+    fn new(
+        io: ConnIo,
+        proxied: bool,
+        alpn_h2_requested: bool,
+        permits: LimitPermits,
+        ingress: Option<ConnectionIngressReservation>,
+    ) -> Self {
         Self {
             io,
             proxied,
             alpn_h2_requested,
             _permits: permits,
+            ingress,
         }
     }
 
-    fn plain(tcp: tokio::net::TcpStream, proxied: bool, permits: LimitPermits) -> Self {
-        Self::new(ConnIo::Plain(tcp), proxied, false, permits)
+    fn plain(
+        tcp: tokio::net::TcpStream,
+        proxied: bool,
+        permits: LimitPermits,
+        ingress: Option<ConnectionIngressReservation>,
+    ) -> Self {
+        Self::new(ConnIo::Plain(tcp), proxied, false, permits, ingress)
     }
 
     fn tls(
@@ -67,12 +87,14 @@ impl LimitedConn {
         proxied: bool,
         alpn_h2_requested: bool,
         permits: LimitPermits,
+        ingress: Option<ConnectionIngressReservation>,
     ) -> Self {
         Self::new(
             ConnIo::Tls(Box::new(tls)),
             proxied,
             alpn_h2_requested,
             permits,
+            ingress,
         )
     }
 }
@@ -444,6 +466,11 @@ pub(crate) struct EngineConnector {
     /// Shared protocol instrumentation: requests/streams vs
     /// physical establishments, labeled by negotiated protocol.
     stats: Arc<HttpProtocolStats>,
+    /// Transfer-memory ledger plus the per-connection ingress footprint
+    /// (task 3.3): every new connection reserves its worst-case buffered
+    /// ingress from the engine-wide aggregate BEFORE dialing, and the
+    /// charge rides on the connection until it closes.
+    ingress: Option<(Arc<TransferLedger>, IngressProfile)>,
     proxy: ProxyConfig,
     tls: Option<Arc<TlsSettings>>,
     address_filter: Option<Arc<dyn crate::config::AddressFilter>>,
@@ -467,6 +494,7 @@ impl Clone for EngineConnector {
         Self {
             stats: self.stats.clone(),
             limits: self.limits.clone(),
+            ingress: self.ingress.clone(),
             proxy: self.proxy.clone(),
             tls: self.tls.clone(),
             address_filter: self.address_filter.clone(),
@@ -480,9 +508,35 @@ impl Clone for EngineConnector {
 impl EngineConnector {
     /// Assemble the stack from engine configuration.
     ///
+    /// Standalone accounting domain; the transport path uses
+    /// [`new_with_ledger`](Self::new_with_ledger). Kept for relocated
+    /// internal tests that build a connector directly.
+    ///
     /// # Errors
     /// TLS trust-set load failures (§21.1: fail closed).
+    #[allow(dead_code)]
     pub fn new(cfg: &crate::config::EngineConfig) -> Result<Self, DownloadError> {
+        // A standalone connector owns its own accounting domain (task 3.3);
+        // `HttpTransport::from_config` shares the controller's ledger via
+        // `new_with_ledger`.
+        let ledger = Arc::new(TransferLedger::new(
+            &cfg.transfer_memory,
+            cfg.transfer_memory
+                .connection_ingress_reserve(cfg.read_buffer_size, cfg.max_connections_total),
+        ));
+        Self::new_with_ledger(cfg, ledger, IngressProfile::from_config(cfg))
+    }
+
+    /// Assemble the stack from engine configuration, accounting connection
+    /// ingress against a shared engine-wide transfer ledger (task 3.3).
+    ///
+    /// # Errors
+    /// TLS trust-set load failures (§21.1: fail closed).
+    pub fn new_with_ledger(
+        cfg: &crate::config::EngineConfig,
+        ledger: std::sync::Arc<TransferLedger>,
+        ingress: IngressProfile,
+    ) -> Result<Self, DownloadError> {
         let tls = Some(Arc::new(TlsSettings::new(&cfg.tls, cfg.prefer_http2)?));
         let proxy_auth = match &cfg.proxy {
             ProxyConfig::Http { url } => {
@@ -510,6 +564,7 @@ impl EngineConnector {
                 cfg.max_connections_total,
                 cfg.max_connections_per_origin,
             )),
+            ingress: Some((ledger, ingress)),
             proxy: cfg.proxy.clone(),
             tls,
             address_filter: cfg.address_filter.clone(),
@@ -577,11 +632,21 @@ impl EngineConnector {
         let key = origin_key(&scheme, &host, port, proxy_addr.as_deref());
         let permits = self.limits.acquire(&key).await;
 
+        // Bounded ingress (tasks 3.3/3.8): meter this connection's
+        // worst-case buffered footprint for the connection's lifetime.
+        // The total connection memory is bounded by the carve-out taken
+        // from the aggregate cap at ledger construction (validated), so
+        // the meter is observation, not admission — no dynamic hold can
+        // starve the pipeline.
+        let ingress = self.ingress.as_ref().map(|(ledger, profile)| {
+            ledger.charge_connection_ingress(profile.connection_footprint)
+        });
+
         match (&self.proxy, scheme.as_str()) {
             (ProxyConfig::None, "http") => {
                 let tcp = self.connect_tcp(&host, port, true).await?;
                 self.stats.record_establishment(HttpProtocol::Http1);
-                let conn = LimitedConn::plain(tcp, false, permits);
+                let conn = LimitedConn::plain(tcp, false, permits, ingress);
                 Ok(conn)
             }
             (ProxyConfig::None, "https") => {
@@ -589,7 +654,7 @@ impl EngineConnector {
                 let tls = self.tls_handshake(tcp, &host).await?;
                 let protocol = Self::tls_protocol(&tls);
                 self.stats.record_establishment(protocol);
-                let conn = LimitedConn::tls(tls, false, self.alpn_h2, permits);
+                let conn = LimitedConn::tls(tls, false, self.alpn_h2, permits, ingress);
                 Ok(conn)
             }
             (ProxyConfig::Http { .. }, "https") => {
@@ -621,7 +686,7 @@ impl EngineConnector {
                 let tls = self.tls_handshake(raw, &host).await?;
                 let protocol = Self::tls_protocol(&tls);
                 self.stats.record_establishment(protocol);
-                let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits);
+                let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits, ingress);
                 Ok(conn)
             }
             (ProxyConfig::Socks5 { .. }, _) => {
@@ -653,11 +718,11 @@ impl EngineConnector {
                     let tls = self.tls_handshake(raw, &host).await?;
                     let protocol = Self::tls_protocol(&tls);
                     self.stats.record_establishment(protocol);
-                    let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits);
+                    let conn = LimitedConn::tls(tls, true, self.alpn_h2, permits, ingress);
                     Ok(conn)
                 } else {
                     self.stats.record_establishment(HttpProtocol::Http1);
-                    let conn = LimitedConn::plain(raw, true, permits);
+                    let conn = LimitedConn::plain(raw, true, permits, ingress);
                     Ok(conn)
                 }
             }
@@ -676,7 +741,7 @@ impl EngineConnector {
                 }
                 let tcp = self.connect_tcp(&phost, pport, false).await?;
                 self.stats.record_establishment(HttpProtocol::Http1);
-                let conn = LimitedConn::plain(tcp, true, permits);
+                let conn = LimitedConn::plain(tcp, true, permits, ingress);
                 Ok(conn)
             }
             _ => Err(ConnectError(DownloadError::UnsupportedScheme(scheme))),

@@ -1,5 +1,8 @@
 //! Segment leases with generation guards (§31, D7).
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 /// Lease identifier; unique per scheduler.
 pub type LeaseId = u64;
 
@@ -31,6 +34,7 @@ impl SegmentLease {
 
     /// Whether this lease matches the given generation stamp.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_current(&self, generation: u64) -> bool {
         self.generation == generation
     }

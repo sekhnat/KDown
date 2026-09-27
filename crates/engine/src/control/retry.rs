@@ -68,6 +68,7 @@ impl RetryClassifier {
             | C::Cancelled
             | C::DeadlineExceeded
             | C::Configuration
+            | C::MemoryCap
             | C::Redirect => false,
         }
     }

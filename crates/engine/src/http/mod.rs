@@ -1,28 +1,38 @@
 //! HTTP transport layer (§11, §32): request execution, redirect policy,
 //! probe, validators.
 
+// Transport construction, policy, and response-metadata types are the
+// supported HTTP surface (docs/api-surface.md).
 pub mod connect;
-pub mod execution;
-pub mod probe;
-pub mod range;
 pub mod redirect;
-pub mod scripted;
 pub mod transport;
 pub mod validators;
+
+// Execution/injection internals: the scripted seam is crate-internal
+// (consumer-api task 2.3); it never appears in the supported surface.
+// Relocated internal tests exercise the whole surface, so the non-test
+// build tolerates its unused remainder as dead code.
+#[allow(dead_code)]
+pub(crate) mod execution;
+#[allow(dead_code)]
+pub(crate) mod probe;
+#[allow(dead_code)]
+pub(crate) mod range;
+#[allow(dead_code)]
+pub(crate) mod scripted;
 
 pub use connect::{
     ConnectError, ConnectionLimits, HttpProtocol, HttpProtocolStats, H2_FLOW_CONTROL_INSTRUMENTED,
 };
-pub use execution::{
-    BodyEvent, FullResponsePolicy, HttpBody, HttpBodySource, HttpExecution, HttpExecutor,
-    HttpFailure, ProbeOutcome, ProbeRequest, RangeIntent, TransferIntent, TransferRequest,
-    TransferResponse,
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use execution::{
+    BodyEvent, FullResponsePolicy, HttpBody, HttpExecution, HttpFailure, ProbeRequest, RangeIntent,
+    TransferIntent, TransferRequest, TransferResponse,
 };
-pub use probe::{filename_from_disposition, ProbeMetadata};
-pub use range::{RangeRejection, RejectionKind, ValidatedRange};
+pub(crate) use probe::filename_from_disposition;
+// Test-only convenience re-export (relocated internal tests).
+#[allow(unused_imports)]
+pub(crate) use probe::ProbeMetadata;
 pub use redirect::{RedirectAction, RedirectDecision, RedirectPolicy, RedirectTracker};
-pub use scripted::{
-    CallKind, CallRecord, ProbeStep, ScriptedBodyEvent, ScriptedHttp, TransferOk, TransferStep,
-};
 pub use transport::{HttpTransport, RequestSpec};
 pub use validators::{ContentRange, ResourceValidators};

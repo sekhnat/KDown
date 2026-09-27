@@ -2,15 +2,14 @@
 //! activity promptly (§9.3); cancel is deterministic (§9.4); the state
 //! machine reaches terminal states correctly (§9.2).
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::time::Duration;
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
-use kdown_engine::job::state::JobState;
+use kdown_engine::JobState;
+use kdown_engine::{DownloadController, DownloadRequest};
 use support::fixtures::deterministic_bytes;
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -62,8 +61,11 @@ async fn pause_stops_network_activity_promptly() {
         .await
         .expect("converges quickly")
         .expect("join")
-        .expect("terminal result");
-    assert_eq!(result.status, ResultStatus::Cancelled);
+        .expect_err("terminal result");
+    assert!(matches!(
+        result,
+        kdown_engine::error::DownloadRunError::Cancelled(_)
+    ));
     assert_eq!(handle.state(), JobState::Cancelled);
     // Temp cleaned up (DeletePartial default for cancel, §9.4).
     assert!(!dir.path().join("paused.bin.part").exists());
@@ -90,12 +92,11 @@ async fn resume_after_pause_completes() {
     handle.pause();
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.resume_now();
-    let result = tokio::time::timeout(Duration::from_secs(30), join)
+    let _ = tokio::time::timeout(Duration::from_secs(30), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     let got = std::fs::read(&dest).expect("final");
     assert_eq!(got, expected);
     assert_eq!(handle.state(), JobState::Completed);
@@ -122,12 +123,11 @@ async fn cancel_midstream_deletes_temp() {
         .await
         .expect("prompt convergence")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled);
-    assert!(
-        matches!(result.error, Some(kdown_engine::DownloadError::Cancelled)),
-        "structured cancellation (§20)"
-    );
+        .expect_err("terminal");
+    assert!(matches!(
+        result,
+        kdown_engine::error::DownloadRunError::Cancelled(_)
+    ));
     // DeletePartial semantics: temp removed, no residue (§9.4).
     assert!(!dir.path().join("cancelled.bin.part").exists());
     assert!(!dest.exists());
@@ -148,8 +148,7 @@ async fn state_machine_terminal_after_normal_run() {
         server.url("/state"),
         dir.path().join("state.bin"),
     ));
-    let result = join.await.expect("join").expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed);
+    let _ = join.await.expect("join").expect("terminal");
     assert_eq!(handle.state(), JobState::Completed);
     assert!(handle.state().is_terminal());
     // Snapshot reflects full download.
@@ -171,8 +170,7 @@ async fn failed_job_leaves_no_temp_residue() {
         server.url("/dead"),
         dir.path().join("dead.bin"),
     ));
-    let result = join.await.expect("join").expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+    let _ = join.await.expect("join").expect_err("terminal");
     assert_eq!(handle.state(), JobState::Failed);
     assert!(!dir.path().join("dead.bin.part").exists());
 }

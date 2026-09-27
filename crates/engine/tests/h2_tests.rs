@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, H2ConnectionPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 
 mod support;
 use support::fixtures;
@@ -146,14 +146,16 @@ async fn h2_segmented_download_is_byte_exact() {
         dest.clone(),
     );
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content)
     );
     // H2 was actually negotiated: the result records the HTTP version of
     // the probe response.
-    assert_eq!(result.validators.total_size, Some(content.len() as u64));
+    assert_eq!(
+        result.accounting.validators.total_size,
+        Some(content.len() as u64)
+    );
 }
 
 /// The additional-connections hook opens more than one connection to the
@@ -178,14 +180,7 @@ async fn h2_additional_connections_policy_hook() {
         format!("https://localhost:{}/file.bin", addr.port()),
         dest.clone(),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(
-        result.status,
-        ResultStatus::Completed,
-        "{:?}\nca_len={}",
-        result.error,
-        ca_pem.len()
-    );
+    let _ = controller.run(req).await.expect("run");
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content)
@@ -217,8 +212,7 @@ async fn h2_single_connection_default_multiplexes() {
         format!("https://localhost:{}/file.bin", addr.port()),
         dest.clone(),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let _ = controller.run(req).await.expect("run");
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content)
@@ -259,14 +253,13 @@ async fn h2_pipelined_segmented_download_is_byte_exact_on_one_connection() {
         dest.clone(),
     );
     let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content),
         "pipelined writes must assemble every H2 stream byte-exactly"
     );
     assert_eq!(
-        result.bytes_downloaded_from_network,
+        result.accounting.bytes_downloaded_from_network,
         content.len() as u64,
         "received payload equals the server-emitted body"
     );
@@ -303,8 +296,7 @@ async fn h2_pipelined_respects_additional_connections_policy() {
         format!("https://localhost:{}/file.bin", addr.port()),
         dest.clone(),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let _ = controller.run(req).await.expect("run");
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content)
@@ -447,6 +439,7 @@ async fn h2_adaptive_growth_not_capped_by_connection_limits() {
     cfg.pool.max_per_origin = 1;
     cfg.max_connections_total = 1;
     cfg.max_connections_per_origin = 1;
+    cfg.pool.max_total = 1;
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
@@ -473,10 +466,9 @@ async fn h2_adaptive_growth_not_capped_by_connection_limits() {
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     eprintln!(
         "[dbg] segment_requests={} warnings={:?}",
-        result.segment_requests, result.warnings
+        result.accounting.segment_requests, result.accounting.warnings
     );
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
@@ -527,6 +519,7 @@ async fn h2_additional_policy_stays_compatible_with_adaptive() {
     cfg.pool.max_per_origin = 4;
     cfg.max_connections_total = 4;
     cfg.max_connections_per_origin = 4;
+    cfg.pool.max_total = 4;
 
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let stats = transport.protocol_stats().clone();
@@ -548,12 +541,11 @@ async fn h2_additional_policy_stays_compatible_with_adaptive() {
         }
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(180), join)
+    let _ = tokio::time::timeout(Duration::from_secs(180), join)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_eq!(
         fixtures::file_sha256(dest.as_path()),
         fixtures::sha256_hex(&content)

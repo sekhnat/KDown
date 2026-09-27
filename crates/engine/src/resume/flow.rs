@@ -9,6 +9,9 @@
 //! the controller, which publishes returned notification facts; the
 //! resume module never emits events itself.
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256, Sha512};
@@ -21,6 +24,7 @@ use crate::resume::checkpoint_store::CheckpointStore;
 
 /// Policy for detected generation changes (§26: safety default is Fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum GenerationChangePolicy {
     /// Fail with `ResourceChanged` (default; §11.3 core safety).
     #[default]

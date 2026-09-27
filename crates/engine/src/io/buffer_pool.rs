@@ -177,6 +177,7 @@ impl PooledBuffer {
     }
 
     /// Frozen view of the buffer contents (zero-copy hand-off to transport).
+    #[allow(dead_code)]
     #[must_use]
     pub fn freeze(&mut self) -> Bytes {
         self.buf.as_mut().expect("buffer alive").split().freeze()

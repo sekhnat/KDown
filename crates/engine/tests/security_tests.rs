@@ -17,11 +17,10 @@ use std::sync::Arc;
 use kdown_engine::config::{ConnectionTarget, EngineConfig, NetworkPolicy};
 use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::{config::AddressFilter, io::sanitize_filename};
 
-mod support;
-use support::test_server::{ScriptedResponse, TestServer};
+use super::support::test_server::{ScriptedResponse, TestServer};
 
 mod tls_support {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,14 +126,14 @@ async fn invalid_certificate_fails_by_default() {
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
-    let err = result.error.expect("structured error");
+    let result = controller.run(req).await.expect_err("run");
+    let err = result.as_engine_error().expect("structured error");
     assert_eq!(err.category(), ErrorCategory::Tls, "{err}");
     // No bytes were transferred: the origin may have been connected, but
     // no HTTP body was ever fetched (the handshake failed).
     assert_eq!(
-        result.bytes_downloaded_from_network, 0,
+        result.accounting().bytes_downloaded_from_network,
+        0,
         "no bytes may transfer under TLS failure"
     );
     let _ = conns;
@@ -158,8 +157,7 @@ async fn custom_ca_bundle_honored() {
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let _ = controller.run(req).await.expect("run");
 }
 
 /// Hostname validation remains enforced even with a trusted CA bundle:
@@ -180,9 +178,11 @@ async fn hostname_validation_enforced_with_custom_ca() {
         format!("https://localhost:{}/f.bin", addr.port()),
         dir.path().join("out.bin"),
     );
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
-    assert_eq!(result.error.expect("err").category(), ErrorCategory::Tls);
+    let result = controller.run(req).await.expect_err("run");
+    assert_eq!(
+        result.as_engine_error().expect("err").category(),
+        ErrorCategory::Tls
+    );
 }
 
 /// No silent HTTPS→HTTP downgrade: a redirect from HTTPS to HTTP is
@@ -257,8 +257,7 @@ async fn redirect_to_other_host_strips_credentials() {
         "Authorization".to_string(),
         "Bearer same-origin-cred".into(),
     ));
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let _ = controller.run(req).await.expect("run");
 }
 
 /// Content-Disposition filename cannot traverse (§21.3): the sanitize
@@ -337,11 +336,10 @@ async fn endless_headers_bounded() {
     let transport = HttpTransport::new(cfg.network.clone()).expect("transport");
     let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(format!("http://{addr}/f.bin"), dir.path().join("out.bin"));
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
+    let result = controller.run(req).await.expect_err("run");
     // The bound triggered: structured failure (timeout or protocol), never
     // an unbounded memory event (§21.4).
-    let cat = result.error.expect("err").category();
+    let cat = result.as_engine_error().expect("err").category();
     assert!(
         matches!(
             cat,
@@ -379,10 +377,12 @@ async fn ssrf_hook_blocks_disallowed_targets() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(server.url("/f.bin"), dir.path().join("out.bin"));
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Failed);
-    assert_eq!(result.error.expect("err").category(), ErrorCategory::Proxy);
-    assert_eq!(result.bytes_downloaded_from_network, 0);
+    let result = controller.run(req).await.expect_err("run");
+    assert_eq!(
+        result.as_engine_error().expect("err").category(),
+        ErrorCategory::Proxy
+    );
+    assert_eq!(result.accounting().bytes_downloaded_from_network, 0);
 }
 
 /// The SSRF hook allows matching targets: normal downloads proceed
@@ -424,8 +424,7 @@ async fn ssrf_hook_allows_permitted_targets() {
     let transport = HttpTransport::from_config(&cfg).expect("transport");
     let controller = DownloadController::new(transport, cfg);
     let req = DownloadRequest::new(server.url("/f.bin"), dir.path().join("out.bin"));
-    let result = controller.run(req).await.expect("run");
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
+    let _ = controller.run(req).await.expect("run");
 }
 
 // Mutex import for the redirect-observation test.

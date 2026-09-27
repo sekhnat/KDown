@@ -104,8 +104,22 @@ pub trait CheckpointStoreResolver: Send + Sync {
 /// Places `<destination_parent>/<job_identity>.kdown` with the configured
 /// durability, so one resolver serves controllers whose jobs have unrelated
 /// destination parents.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SidecarCheckpointResolver;
+#[derive(Debug, Clone, Default)]
+pub struct SidecarCheckpointResolver {
+    /// Serialized-size budget forwarded to the resolved sidecar store
+    /// (task 3.6); `None` keeps the store unbounded.
+    max_serialized_bytes: Option<u64>,
+}
+
+impl SidecarCheckpointResolver {
+    /// Bound the resolved store's checkpoint serialization (task 3.6):
+    /// saves and loads exceeding the budget fail safely before allocating.
+    #[must_use]
+    pub fn with_checkpoint_budget(mut self, cap: u64) -> Self {
+        self.max_serialized_bytes = Some(cap);
+        self
+    }
+}
 
 impl CheckpointStoreResolver for SidecarCheckpointResolver {
     fn resolve(
@@ -113,7 +127,10 @@ impl CheckpointStoreResolver for SidecarCheckpointResolver {
         context: &CheckpointResolveContext,
     ) -> Result<Arc<dyn CheckpointStore>, CheckpointError> {
         let dir = context.destination_parent();
-        let store = FileCheckpointStore::new(&dir, context.durability)?;
+        let mut store = FileCheckpointStore::new(&dir, context.durability)?;
+        if let Some(cap) = self.max_serialized_bytes {
+            store = store.with_checkpoint_budget(cap);
+        }
         Ok(Arc::new(store))
     }
 }
@@ -123,6 +140,9 @@ impl CheckpointStoreResolver for SidecarCheckpointResolver {
 pub struct FileCheckpointStore {
     dir: PathBuf,
     durability: DurabilityMode,
+    /// Serialized-size budget (task 3.6): saves are bounded before
+    /// serialization, loads before reading; `None` = unbounded.
+    max_serialized_bytes: Option<u64>,
 }
 
 impl FileCheckpointStore {
@@ -136,7 +156,17 @@ impl FileCheckpointStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             durability,
+            max_serialized_bytes: None,
         })
+    }
+
+    /// Bound checkpoint serialization and load reads (task 3.6): a save
+    /// whose estimate exceeds `cap` fails before allocating; a load whose
+    /// sidecar exceeds it fails before reading.
+    #[must_use]
+    pub fn with_checkpoint_budget(mut self, cap: u64) -> Self {
+        self.max_serialized_bytes = Some(cap);
+        self
     }
 
     fn path_for(&self, job_identity: &str) -> PathBuf {
@@ -155,6 +185,16 @@ impl FileCheckpointStore {
 impl CheckpointStore for FileCheckpointStore {
     fn load(&self, job_identity: &str) -> Result<Option<Checkpoint>, CheckpointError> {
         let path = self.path_for(job_identity);
+        // Bounded load (task 3.6): an oversized sidecar is refused before
+        // reading (never overclaims durable ranges — it simply fails).
+        if let Some(cap) = self.max_serialized_bytes {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let size = meta.len();
+                if size > cap {
+                    return Err(CheckpointError::TooLarge { size, cap });
+                }
+            }
+        }
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let json = String::from_utf8(bytes)
@@ -170,7 +210,19 @@ impl CheckpointStore for FileCheckpointStore {
     }
 
     fn save_atomic(&self, checkpoint: &Checkpoint) -> Result<(), CheckpointError> {
+        // Bounded serialization (task 3.6): the estimate (range-count
+        // policy included) must fit the budget BEFORE allocating; the
+        // actual serialization must fit again before any write.
+        if let Some(cap) = self.max_serialized_bytes {
+            checkpoint.check_serialized_within(cap)?;
+        }
         let json = checkpoint.to_json()?;
+        if let Some(cap) = self.max_serialized_bytes {
+            let actual = json.len() as u64;
+            if actual > cap {
+                return Err(CheckpointError::TooLarge { size: actual, cap });
+            }
+        }
         let path = self.path_for(&checkpoint.job_id);
         // Collision-resistant temp name: PID alone would collide across
         // concurrent workers of one process; the sequence suffix makes
@@ -361,7 +413,7 @@ mod tests {
         let parent_b = dir.path().join("b");
         std::fs::create_dir_all(&parent_a).expect("mkdir a");
         std::fs::create_dir_all(&parent_b).expect("mkdir b");
-        let resolver = SidecarCheckpointResolver;
+        let resolver = SidecarCheckpointResolver::default();
 
         let dest_a = parent_a.join("out.bin");
         let dest_b = parent_b.join("out.bin");
@@ -402,7 +454,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let blocked = dir.path().join("occupied");
         std::fs::write(&blocked, b"not a directory").expect("file");
-        let resolver = SidecarCheckpointResolver;
+        let resolver = SidecarCheckpointResolver::default();
         let resolved = resolver.resolve(&CheckpointResolveContext::new(
             "job-z",
             blocked.join("out.bin"),

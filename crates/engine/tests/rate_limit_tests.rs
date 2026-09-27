@@ -6,8 +6,8 @@
 use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
-use kdown_engine::job::controller::{DownloadController, DownloadHandle};
-use kdown_engine::{DownloadRequest, ResultStatus};
+use kdown_engine::DownloadRequest;
+use kdown_engine::{DownloadController, DownloadHandle};
 
 mod support;
 
@@ -32,21 +32,14 @@ async fn start_server(content: Vec<u8>) -> RunningServer {
 async fn run_to_completion(
     _handle: &DownloadHandle,
     join: tokio::task::JoinHandle<
-        Result<kdown_engine::DownloadResult, kdown_engine::DownloadError>,
+        Result<kdown_engine::error::CompletedDownload, kdown_engine::error::DownloadRunError>,
     >,
-) -> kdown_engine::DownloadResult {
+) -> kdown_engine::error::CompletedDownload {
     let result = tokio::time::timeout(Duration::from_secs(120), join)
         .await
         .expect("job must finish")
         .expect("join")
         .expect("terminal");
-    assert_eq!(
-        result.status,
-        ResultStatus::Completed,
-        "expected completion, got {:?} ({:?})",
-        result.status,
-        result.error
-    );
     result
 }
 
@@ -81,7 +74,7 @@ async fn single_stream_path_applies_job_rate_limit() {
         wall < Duration::from_secs(40),
         "unreasonably slow: {wall:?}"
     );
-    assert_eq!(result.completed_bytes, size);
+    assert_eq!(result.accounting.completed_bytes, size);
 }
 
 /// The engine-global limit binds alongside the job limit: 4 MiB/s job with a
@@ -116,7 +109,7 @@ async fn segmented_path_global_limit_binds_alongside_job_limit() {
         wall < Duration::from_secs(60),
         "unreasonably slow: {wall:?}"
     );
-    assert_eq!(result.completed_bytes, size);
+    assert_eq!(result.accounting.completed_bytes, size);
 }
 
 /// One controller's global bucket is shared by its jobs: 2 × 8 MiB with a
@@ -145,7 +138,10 @@ async fn global_limit_is_shared_across_jobs() {
     let r2 = run_to_completion(&h2, _j2).await;
     let combined = started.elapsed();
 
-    assert_eq!(r1.completed_bytes + r2.completed_bytes, 2 * size);
+    assert_eq!(
+        r1.accounting.completed_bytes + r2.accounting.completed_bytes,
+        2 * size
+    );
     assert!(
         combined >= Duration::from_secs(7),
         "global limit not shared/enforced across jobs: {combined:?}"
@@ -195,7 +191,7 @@ async fn rate_update_applies_live_on_running_single_stream_job() {
         wall <= Duration::from_secs(5),
         "live update did not speed the running job up (still limited?): {wall:?}"
     );
-    assert_eq!(result.completed_bytes, size);
+    assert_eq!(result.accounting.completed_bytes, size);
 }
 
 /// Waiting for tokens must stop promptly on cancellation (§18 / transfer-core

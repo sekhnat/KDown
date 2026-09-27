@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 
 use kdown_engine::config::EngineConfig;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest};
+use kdown_engine::{DownloadController, DownloadRequest};
 
 mod support;
 use support::test_server::{ScriptedResponse, TestServer};
@@ -104,7 +104,7 @@ async fn run_with_capture(
 ) -> (
     usize,
     Vec<String>,
-    kdown_engine::job::controller::DownloadResult,
+    Result<kdown_engine::error::CompletedDownload, kdown_engine::error::DownloadRunError>,
 ) {
     let captured = capture_sink();
     let before = captured.lock().expect("records").len();
@@ -113,7 +113,7 @@ async fn run_with_capture(
     let transport =
         kdown_engine::http::transport::HttpTransport::new(cfg.network.clone()).expect("transport");
     let controller = DownloadController::new(transport, cfg);
-    let result = controller.run(request).await.expect("run");
+    let result = controller.run(request).await;
     let records = records_since(&captured, before);
     (before, records, result)
 }
@@ -149,10 +149,7 @@ async fn credentials_never_appear_in_logs() {
     let req = test_request(server.url("/secret.bin"), dir.path().join("out.bin"));
     let (before, records, result) = run_with_capture(server.url("/"), req).await;
     let _ = before;
-    assert_eq!(
-        result.status,
-        kdown_engine::job::controller::ResultStatus::Failed
-    );
+    assert!(result.is_err(), "the 403 job must fail: {result:?}");
     assert!(
         !records.is_empty(),
         "the failing job must have produced log records"
@@ -183,10 +180,7 @@ async fn successful_job_logs_correlated_without_secrets() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let req = test_request(server.url("/f.bin"), dir.path().join("out.bin"));
     let (_before, records, result) = run_with_capture(server.url("/"), req).await;
-    assert_eq!(
-        result.status,
-        kdown_engine::job::controller::ResultStatus::Completed
-    );
+    assert!(result.is_ok(), "the plain job must complete: {result:?}");
     for r in &records {
         assert!(!r.contains("super-secret-bearer-token"), "bearer leak: {r}");
         assert!(!r.contains("TOP-SECRET-COOKIE"), "cookie leak: {r}");

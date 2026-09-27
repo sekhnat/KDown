@@ -5,9 +5,8 @@
 //! any body byte is accepted, and well-behaved 206 responses validate
 //! through with correct offsets.
 
-#[path = "support/mod.rs"]
-mod support;
-
+use super::support::fixtures::deterministic_bytes;
+use super::support::test_server::{RangeMode, TestServer};
 use kdown_engine::config::NetworkPolicy;
 use kdown_engine::control::CancellationToken;
 use kdown_engine::http::transport::{HttpTransport, RequestSpec};
@@ -15,8 +14,6 @@ use kdown_engine::http::{
     FullResponsePolicy, HttpExecution, HttpFailure, RangeIntent, TransferIntent, TransferRequest,
 };
 use kdown_engine::DownloadError;
-use support::fixtures::deterministic_bytes;
-use support::test_server::{RangeMode, TestServer};
 
 fn transport() -> HttpTransport {
     HttpTransport::new(NetworkPolicy::default()).expect("transport")
@@ -153,7 +150,7 @@ async fn range_request_carries_identity_encoding() {
     // §11.4: ranged requests send Accept-Encoding: identity.
     let server = TestServer::new()
         .serve_handler("/enc", |_req| {
-            support::test_server::ScriptedResponse::ok(b"identity-ok".to_vec())
+            super::support::test_server::ScriptedResponse::ok(b"identity-ok".to_vec())
         })
         .start()
         .await
@@ -225,11 +222,11 @@ async fn established_total_conflict_rejected() {
             let total = content.len() as u64;
             if let Some((s, e)) = req.range {
                 let body = content[s as usize..=(e as usize).min(content.len() - 1)].to_vec();
-                support::test_server::ScriptedResponse::new(206)
+                super::support::test_server::ScriptedResponse::new(206)
                     .with_body(body)
                     .with_header("content-range", &format!("bytes {s}-{e}/{total}"))
             } else {
-                support::test_server::ScriptedResponse::ok(content.clone())
+                super::support::test_server::ScriptedResponse::ok(content.clone())
                     .with_header("accept-ranges", "bytes")
             }
         })
@@ -254,7 +251,7 @@ async fn validators_passed_to_gate_detect_generation_change() {
     // validators: the gate rejects with a resource-change error (§26).
     let server = TestServer::new()
         .serve_handler("/gen", |_req| {
-            support::test_server::ScriptedResponse::new(206)
+            super::support::test_server::ScriptedResponse::new(206)
                 .with_body(vec![1u8; 100])
                 .with_header("etag", "\"generation-2\"")
                 .with_header("content-range", "bytes 0-99/1000")

@@ -3,7 +3,6 @@
 //! 429/503/Retry-After feedback across jobs that share a normalized final
 //! origin, while unrelated origins stay independent.
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use kdown_engine::config::EngineConfig;
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 use support::test_server::{ScriptedResponse, TestServer};
 
@@ -122,18 +121,17 @@ async fn throttle_on_one_job_delays_same_origin_peer() {
     let throttled_at = fixture.arrival(0);
     let (hb, jb) = c.start(DownloadRequest::new(url, dir.path().join("b.bin")));
 
-    let ra = tokio::time::timeout(Duration::from_secs(60), ja)
+    let _ = tokio::time::timeout(Duration::from_secs(60), ja)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal a");
-    let rb = tokio::time::timeout(Duration::from_secs(60), jb)
+    let _ = tokio::time::timeout(Duration::from_secs(60), jb)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal b");
-    assert_eq!(ra.status, ResultStatus::Completed, "{:?}", ra.error);
-    assert_eq!(rb.status, ResultStatus::Completed, "{:?}", rb.error);
+
     assert_bytes_exact(
         &std::fs::read(dir.path().join("a.bin")).expect("read a"),
         &content,
@@ -185,24 +183,23 @@ async fn unrelated_origin_is_not_delayed_by_shared_backoff() {
         dir.path().join("b.bin"),
     ));
 
-    let rb = tokio::time::timeout(Duration::from_secs(30), jb)
+    let _ = tokio::time::timeout(Duration::from_secs(30), jb)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal b");
     let b_elapsed = b_started.elapsed();
-    assert_eq!(rb.status, ResultStatus::Completed, "{:?}", rb.error);
     assert!(
         b_elapsed < Duration::from_secs(4),
         "unrelated origin must not inherit A's 5 s cooldown: {b_elapsed:?}"
     );
     // A still completes after its own cooldown (no starvation).
-    let ra = tokio::time::timeout(Duration::from_secs(60), ja)
+    let _ = tokio::time::timeout(Duration::from_secs(60), ja)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal a");
-    assert_eq!(ra.status, ResultStatus::Completed, "{:?}", ra.error);
+
     let _ = (ha, hb);
 }
 
@@ -219,7 +216,7 @@ async fn retry_after_is_capped_by_policy_for_the_shared_window() {
 
     let c = controller(cfg);
     let started = Instant::now();
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             fixture.server.url("/capped"),
             dir.path().join("out.bin"),
@@ -227,7 +224,6 @@ async fn retry_after_is_capped_by_policy_for_the_shared_window() {
         .await
         .expect("run");
     let elapsed = started.elapsed();
-    assert_eq!(result.status, ResultStatus::Completed, "{:?}", result.error);
     assert_bytes_exact(
         &std::fs::read(dir.path().join("out.bin")).expect("read"),
         &content,
@@ -260,9 +256,11 @@ async fn repeated_throttling_exhausts_structured_without_unbounded_requests() {
     )
     .await
     .expect("no hang")
-    .expect("run");
-    assert_eq!(result.status, ResultStatus::Failed, "{:?}", result.error);
-    assert!(result.error.is_some(), "structured failure expected");
+    .expect_err("run");
+    assert!(
+        result.as_engine_error().is_some(),
+        "structured failure expected"
+    );
     // Bounded attempts (probe retries), not an infinite hammer.
     let arrivals = fixture.arrival_count();
     assert!(
@@ -311,18 +309,17 @@ async fn throttle_feedback_follows_the_final_redirect_origin() {
         dir.path().join("two.bin"),
     ));
 
-    let r1 = tokio::time::timeout(Duration::from_secs(60), j1)
+    let _ = tokio::time::timeout(Duration::from_secs(60), j1)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal 1");
-    let r2 = tokio::time::timeout(Duration::from_secs(60), j2)
+    let _ = tokio::time::timeout(Duration::from_secs(60), j2)
         .await
         .expect("no hang")
         .expect("join")
         .expect("terminal 2");
-    assert_eq!(r1.status, ResultStatus::Completed, "{:?}", r1.error);
-    assert_eq!(r2.status, ResultStatus::Completed, "{:?}", r2.error);
+
     assert_bytes_exact(
         &std::fs::read(dir.path().join("one.bin")).expect("read"),
         &content,

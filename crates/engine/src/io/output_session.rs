@@ -227,6 +227,11 @@ impl OutputSession {
         }
     }
 
+    /// Whether dropping this session keeps the partial file on disk (the
+    /// disposition at terminal time decides the reported artifact state).
+    pub(crate) fn preserves_partial_on_drop(&self) -> bool {
+        self.disposition == PartialArtifactDisposition::PreserveOnDrop
+    }
     /// Lend write-only capabilities to segmented workers. The
     /// session retains lifecycle/sync ownership and cannot finalize, abort,
     /// resize or publish until `reclaim_exclusive` succeeds.

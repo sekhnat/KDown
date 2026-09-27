@@ -3,22 +3,19 @@
 //! randomized-failure behavior (§36.6). Single-stream fallbacks and
 //! unknown-length handling live here too (task 5.7).
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes};
+use super::support::test_server::{RangeMode, ScriptedResponse, TestServer};
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::resume::checkpoint_store::CheckpointStore;
-use support::fixtures::{assert_bytes_exact, deterministic_bytes};
-use support::test_server::{RangeMode, ScriptedResponse, TestServer};
 
 fn cfg(threshold: u64) -> EngineConfig {
     let mut c = EngineConfig {
@@ -68,8 +65,7 @@ async fn segmented_download_byte_exact() {
         .run(DownloadRequest::new(server.url("/seg.bin"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
+    assert_eq!(result.final_path, dest);
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("seg.bin.part").exists(), "no temp residue");
     // Multiple range requests prove segmented mode ran.
@@ -98,14 +94,13 @@ async fn small_resource_uses_single_stream() {
                 .chunk(content.clone())),
         );
     let c = scripted_controller(&scripted, cfg(16 * 1024 * 1024));
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             "https://scripted/small.bin",
             tempfile::tempdir().expect("tmp").path().join("small.bin"),
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     // HEAD probe + one sequential transfer; no per-segment requests.
     assert!(
         scripted.request_log().len() <= 2,
@@ -128,11 +123,10 @@ async fn lying_range_server_downgrades_to_single_stream() {
     let dir = tempfile::tempdir().expect("tmp");
     let dest = dir.path().join("liar.bin");
     let c = controller(cfg(1024 * 1024));
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(server.url("/liar.bin"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(!dir.path().join("liar.bin.part").exists());
 }
@@ -157,9 +151,11 @@ async fn unknown_length_server_uses_sequential_mode() {
         .run(DownloadRequest::new(server.url("/unknown"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
-    assert_eq!(result.total_size, None, "unknown length stays unknown");
+    assert_eq!(
+        result.accounting.total_size, None,
+        "unknown length stays unknown"
+    );
 }
 
 #[tokio::test]
@@ -197,11 +193,10 @@ async fn randomized_failures_segmented_still_exact() {
     c_cfg.transfer.max_segment_size = 512 * 1024;
     c_cfg.retry.max_attempts_per_segment = 16;
     let c = controller(c_cfg);
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(server.url("/flaky-seg"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     assert!(
         resets.load(Ordering::Relaxed) > 0,
@@ -257,11 +252,10 @@ async fn coordinated_503_backoff_completes() {
     c_cfg.transfer.max_segment_size = 1000;
     c_cfg.transfer.min_segment_size = 1;
     let c = scripted_controller(&scripted, c_cfg);
-    let result = c
+    let _ = c
         .run(DownloadRequest::new("https://scripted/gate", dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // §17.4: coordinated delay — bounded requests rather than every
     // worker hammering independently: exactly one 503 + one success per
@@ -321,11 +315,10 @@ async fn induced_503_never_redownloads_completed_ranges() {
     let mut c_cfg = cfg(1024 * 1024);
     c_cfg.transfer.max_segment_size = 1024 * 1024;
     let c = controller(c_cfg);
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(server.url("/tail"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // No two range requests may cover the same completed range in full:
     // every requested range must be unique (§17.3 tail-only retry).
@@ -379,11 +372,10 @@ async fn oversized_body_overrun_detected() {
     c_cfg.transfer.max_segment_size = 256 * 1024;
     c_cfg.retry.max_attempts_per_segment = 8;
     let c = controller(c_cfg);
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(server.url("/overrun"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -435,10 +427,12 @@ async fn segmented_resume_reuses_all_completed_ranges() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
     // Both disjoint ranges counted once as reused.
-    assert_eq!(result.bytes_reused_from_checkpoint, 2 * prefix_len as u64);
+    assert_eq!(
+        result.accounting.bytes_reused_from_checkpoint,
+        2 * prefix_len as u64
+    );
     // No residue after commit (§14.6 step 5).
     assert!(store.load(&identity).expect("load").is_none());
     assert!(!temp.exists());

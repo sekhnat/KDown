@@ -13,6 +13,9 @@
 //! - DEBUG: segment assignment, retry classification, connection decisions
 //! - TRACE: detailed request lifecycle with sensitive data redacted
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use std::fmt;
 
 use tracing::{debug, error, info, warn};
@@ -40,6 +43,7 @@ pub struct Correlation {
     pub category: Option<ErrorCategory>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Correlation {
     #[must_use]
     pub fn new() -> Self {

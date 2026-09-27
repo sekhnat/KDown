@@ -4,8 +4,6 @@
 //! behavior. The scenario table is the shared oracle; the mode is the
 //! only variable.
 
-mod support;
-
 use std::time::Duration;
 
 use kdown_engine::config::{
@@ -15,7 +13,7 @@ use kdown_engine::error::ErrorCategory;
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::DownloadError;
 
 use kdown_engine::metrics::events::{Event, EventStream};
@@ -139,7 +137,17 @@ fn mode_cfg(segmented: bool) -> EngineConfig {
     c
 }
 
-async fn run_mode(segmented: bool, scenario: &Scenario) -> (ResultStatus, Option<ErrorCategory>) {
+/// Test-local terminal kind: the typed API distinguishes outcomes by
+/// variant instead of a status enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    Completed,
+    Failed,
+    #[allow(dead_code)] // parity harness covers the cancelled kind too
+    Cancelled,
+}
+
+async fn run_mode(segmented: bool, scenario: &Scenario) -> (Terminal, Option<ErrorCategory>) {
     let mut scripted = ScriptedHttp::new().expect_probe(ProbeStep::new().ok_meta(ProbeMetadata {
         status: 200,
         total_size: Some(TOTAL),
@@ -160,8 +168,8 @@ async fn run_mode(segmented: bool, scenario: &Scenario) -> (ResultStatus, Option
             dir.path().join("out.bin"),
         ))
         .await
-        .expect("terminal");
-    (result.status, result.error.map(|e| e.category()))
+        .expect_err("terminal failure");
+    (Terminal::Failed, Some(result.category()))
 }
 
 /// The parity table: each scenario produces the same terminal status and
@@ -171,12 +179,7 @@ async fn sequential_and_segmented_report_the_same_categories() {
     for s in scenarios() {
         let (seq_status, seq_cat) = run_mode(false, &s).await;
         let (seg_status, seg_cat) = run_mode(true, &s).await;
-        assert_eq!(
-            seq_status,
-            ResultStatus::Failed,
-            "{}: {seq_status:?}",
-            s.name
-        );
+        assert_eq!(seq_status, Terminal::Failed, "{}: {seq_status:?}", s.name);
         assert_eq!(seq_status, seg_status, "{}: terminal status", s.name);
         assert_eq!(
             seq_cat, seg_cat,
@@ -210,7 +213,7 @@ async fn run_completion_mode(
     segmented: bool,
     hashes: Vec<ExpectedHash>,
     content: &[u8],
-) -> (ResultStatus, Option<ErrorCategory>, Vec<&'static str>) {
+) -> (Terminal, Option<ErrorCategory>, Vec<&'static str>) {
     let mut config = mode_cfg(segmented);
     config.transfer.preallocate_output = false;
     if segmented {
@@ -268,12 +271,13 @@ async fn run_completion_mode(
     let mut events = handle.events();
     // Subscription is live: release the parked probe/transfer calls.
     scripted.open_gate("subscribe");
-    let result = task
-        .await
-        .expect("job task")
-        .expect("structured terminal result");
+    let terminal = task.await.expect("job task");
+    let (kind, category) = match terminal {
+        Ok(_) => (Terminal::Completed, None),
+        Err(error) => (Terminal::Failed, Some(error.category())),
+    };
     let published = std::fs::read(&destination).expect("read destination after completion");
-    if result.status == ResultStatus::Completed {
+    if kind == Terminal::Completed {
         assert_eq!(
             published, content,
             "successful verification publishes new bytes"
@@ -302,17 +306,13 @@ async fn run_completion_mode(
         );
         assert!(requests[1].range.is_none());
     }
-    (
-        result.status,
-        result.error.as_ref().map(DownloadError::category),
-        completion_events,
-    )
+    (kind, category, completion_events)
 }
 
 async fn assert_completion_parity(
     scenario: &str,
     hashes: Vec<ExpectedHash>,
-    expected_status: ResultStatus,
+    expected_status: Terminal,
     expected_category: Option<ErrorCategory>,
     expected_events: &[&str],
     content: &[u8],
@@ -366,7 +366,7 @@ async fn completion_verification_order_and_categories_match_across_modes() {
                 hex: sha512.clone(),
             },
         ],
-        ResultStatus::Completed,
+        Terminal::Completed,
         None,
         &["started", "passed", "committed"],
         &content,
@@ -378,7 +378,7 @@ async fn completion_verification_order_and_categories_match_across_modes() {
             algorithm: HashAlgorithm::Sha256,
             hex: "0".repeat(64),
         }],
-        ResultStatus::Failed,
+        Terminal::Failed,
         Some(ErrorCategory::IntegrityMismatch),
         &["started", "failed"],
         &content,
@@ -396,7 +396,7 @@ async fn completion_verification_order_and_categories_match_across_modes() {
                 hex: "0".repeat(128),
             },
         ],
-        ResultStatus::Failed,
+        Terminal::Failed,
         Some(ErrorCategory::IntegrityMismatch),
         &["started", "failed"],
         &content,
@@ -405,7 +405,7 @@ async fn completion_verification_order_and_categories_match_across_modes() {
     assert_completion_parity(
         "known-size mismatch",
         vec![],
-        ResultStatus::Failed,
+        Terminal::Failed,
         Some(ErrorCategory::IntegrityMismatch),
         &["started", "failed"],
         &content[..content.len() - 1],

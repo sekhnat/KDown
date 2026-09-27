@@ -1,26 +1,23 @@
 //! End-to-end single-stream controller tests (task 3.7): byte-exact
 //! download, correct final path, no temp residue, structured failures.
 
-#[path = "support/mod.rs"]
-mod support;
-
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use super::support::fixtures::{assert_bytes_exact, deterministic_bytes, sha256_hex};
+use super::support::test_server::{ScriptedResponse, TestServer};
 use kdown_engine::config::{EngineConfig, ExpectedHash, HashAlgorithm, IntegrityPolicy};
 use kdown_engine::http::probe::ProbeMetadata;
 use kdown_engine::http::scripted::{ProbeStep, ScriptedHttp, TransferOk, TransferStep};
 use kdown_engine::http::transport::HttpTransport;
 use kdown_engine::http::HttpExecution;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::job::controller::{DownloadController, DownloadRequest};
 use kdown_engine::resume::{
     CheckpointError, CheckpointResolveContext, CheckpointStore, CheckpointStoreResolver,
     SidecarCheckpointResolver,
 };
-use support::fixtures::{assert_bytes_exact, deterministic_bytes, sha256_hex};
-use support::test_server::{ScriptedResponse, TestServer};
 
 fn controller() -> DownloadController {
     DownloadController::new(
@@ -47,7 +44,7 @@ impl CheckpointStoreResolver for CountingResolver {
         context: &CheckpointResolveContext,
     ) -> Result<Arc<dyn CheckpointStore>, CheckpointError> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        SidecarCheckpointResolver.resolve(context)
+        SidecarCheckpointResolver::default().resolve(context)
     }
 }
 
@@ -68,9 +65,8 @@ async fn downloads_fixture_byte_exact_real() {
         .await
         .expect("run terminal");
 
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    assert_eq!(result.final_path.as_deref(), Some(dest.as_path()));
-    assert_eq!(result.total_size, Some(1024 * 1024));
+    assert_eq!(result.final_path, dest);
+    assert_eq!(result.accounting.total_size, Some(1024 * 1024));
     let got = std::fs::read(&dest).expect("final file");
     assert_bytes_exact(&got, &content);
     // No temp residue (§14.1).
@@ -99,10 +95,9 @@ async fn hash_mismatch_prevents_commit() {
     };
 
     let c = controller();
-    let result = c.run(req).await.expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+    let result = c.run(req).await.expect_err("terminal");
     assert!(matches!(
-        result.error,
+        result.as_engine_error(),
         Some(kdown_engine::DownloadError::IntegrityMismatch(_))
     ));
     // Destination untouched (integrity spec: no file created/replaced).
@@ -134,8 +129,7 @@ async fn hash_match_commits() {
     };
 
     let c = controller();
-    let result = c.run(req).await.expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    let _ = c.run(req).await.expect("terminal");
     assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
 }
 
@@ -155,10 +149,9 @@ async fn fail_if_exists_rejects_before_network() {
             dest.clone(),
         ))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+        .expect_err("terminal");
     assert!(matches!(
-        result.error,
+        result.as_engine_error(),
         Some(kdown_engine::DownloadError::DestinationConflict(_))
     ));
     // Existing file untouched.
@@ -185,8 +178,7 @@ async fn replace_policy_replaces_an_existing_real_file() {
     let mut request = DownloadRequest::new("https://scripted/replace", destination.clone());
     request.overwrite = kdown_engine::config::OverwritePolicy::Replace;
 
-    let result = controller.run(request).await.expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
+    let _ = controller.run(request).await.expect("terminal");
     assert_eq!(
         std::fs::read(&destination).expect("new destination"),
         b"new!!"
@@ -248,11 +240,14 @@ async fn concurrent_different_urls_cannot_touch_the_same_partial_output() {
             destination.clone(),
         ))
         .await
-        .expect("second job returns a structured terminal result");
+        .expect_err("second job returns a structured terminal result");
 
-    assert_eq!(second.status, ResultStatus::Failed);
     assert!(matches!(
-        second.error,
+        second,
+        kdown_engine::error::DownloadRunError::Infrastructure(_)
+    ));
+    assert!(matches!(
+        second.as_engine_error(),
         Some(kdown_engine::DownloadError::DestinationConflict(_))
     ));
     assert_eq!(
@@ -271,11 +266,7 @@ async fn concurrent_different_urls_cannot_touch_the_same_partial_output() {
         .await
         .expect("join first job")
         .expect("first job terminal");
-    assert_eq!(
-        first_result.status,
-        ResultStatus::Completed,
-        "{first_result:?}"
-    );
+    assert!(first_result.final_path.is_file(), "{first_result:?}");
     assert_eq!(std::fs::read(&destination).expect("read final"), b"hello");
     first_script.assert_all_consumed();
 }
@@ -295,10 +286,9 @@ async fn non_retryable_404_fails_immediately() {
             dir.path().join("x"),
         ))
         .await
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+        .expect_err("terminal");
     assert!(matches!(
-        result.error,
+        result.as_engine_error(),
         Some(kdown_engine::DownloadError::NotFound { status: 404 })
     ));
     // HEAD is the only request; no retry storm (§17.1).
@@ -328,14 +318,13 @@ async fn truncated_body_retries_from_zero_and_completes() {
         .run(DownloadRequest::new(server.url("/flaky"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     let got = std::fs::read(&dest).expect("final");
     assert_bytes_exact(&got, &content);
     assert!(
-        result.bytes_downloaded_from_network >= content.len() as u64,
+        result.accounting.bytes_downloaded_from_network >= content.len() as u64,
         "network bytes must cover the full content ({}): {}",
         content.len(),
-        result.bytes_downloaded_from_network
+        result.accounting.bytes_downloaded_from_network
     );
     // Wasted bytes counted when the failed attempt surfaced data through
     // frames (buffering may swallow them; then 0 wasted is acceptable).
@@ -355,10 +344,9 @@ async fn oversize_body_rejected() {
     let mut req = DownloadRequest::new(server.url("/big"), dir.path().join("big.bin"));
     req.expected_size = Some(1024); // smaller than actual
     let c = controller();
-    let result = c.run(req).await.expect("terminal");
-    assert_eq!(result.status, ResultStatus::Failed);
+    let result = c.run(req).await.expect_err("terminal");
     assert!(matches!(
-        result.error,
+        result.as_engine_error(),
         Some(kdown_engine::DownloadError::Protocol(_))
     ));
     assert!(!dir.path().join("big.bin").exists());
@@ -376,17 +364,16 @@ async fn under_size_body_fails_integrity() {
         .expect("start");
     let dir = tempfile::tempdir().expect("tmp");
     let c = controller();
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(
             server.url("/short"),
             dir.path().join("short.bin"),
         ))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
     // The transport delivers a truncated body (connection close before
     // content-length satisfied); the engine must not commit 100 bytes as
     // a 1000-byte download (§16.3 via connection-close detection).
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
     assert!(!dir.path().join("short.bin").exists());
 }
 
@@ -415,11 +402,10 @@ async fn rate_limited_with_retry_after_retries_then_completes() {
     let dest = dir.path().join("limited.bin");
     let c = controller();
     let started = std::time::Instant::now();
-    let result = c
+    let _ = c
         .run(DownloadRequest::new(server.url("/limited"), dest.clone()))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     // The Retry-After (1 s) delayed the retry.
     assert!(
         started.elapsed() >= Duration::from_millis(900),
@@ -456,11 +442,10 @@ async fn cancel_stops_download_promptly() {
         .await
         .expect("no hang: cancellation interrupts the pending read")
         .expect("join")
-        .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Cancelled, "{result:?}");
-    assert!(matches!(
-        result.error,
-        Some(kdown_engine::DownloadError::Cancelled)
-    ));
+        .expect_err("terminal");
+    assert!(
+        matches!(result, kdown_engine::error::DownloadRunError::Cancelled(_)),
+        "{result:?}"
+    );
     scripted.assert_all_consumed();
 }

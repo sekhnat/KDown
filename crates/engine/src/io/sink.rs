@@ -4,6 +4,9 @@
 //! destination; commit is an atomic rename. Errors map to the structured
 //! taxonomy ([`DownloadError::from_io`]).
 
+// Internal module: parts of the surface are exercised only by
+// relocated internal tests or reserved for platform-specific paths.
+#![allow(dead_code)]
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
@@ -96,6 +99,7 @@ pub trait Sink {
 
 /// Durability level for a flush (§14.6, §15.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum FlushLevel {
     /// Hand bytes to the OS page cache; no fsync.
     PageCache,

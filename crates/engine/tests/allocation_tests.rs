@@ -5,7 +5,6 @@
 //! while genuine out-of-space and permission failures surface as sink
 //! errors and never publish incomplete output.
 
-#[path = "support/mod.rs"]
 mod support;
 
 use std::io::BufRead as _;
@@ -14,7 +13,7 @@ use std::time::Duration;
 
 use kdown_engine::config::{EngineConfig, TransferPolicy};
 use kdown_engine::http::transport::HttpTransport;
-use kdown_engine::job::controller::{DownloadController, DownloadRequest, ResultStatus};
+use kdown_engine::{DownloadController, DownloadRequest};
 use support::fixtures::{assert_bytes_exact, deterministic_bytes};
 
 fn cfg(physical: bool) -> EngineConfig {
@@ -92,8 +91,7 @@ async fn unsupported_physical_allocation_falls_back_and_completes() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    let path = result.final_path.expect("published");
+    let path = result.final_path;
     assert_eq!(support::fixtures::file_sha256(&path), sha, "content exact");
     // The temp is gone; the destination holds the full file.
     assert!(!dir.path().join("out.bin.part").exists());
@@ -115,8 +113,7 @@ async fn logical_only_allocation_completes_identically() {
         ))
         .await
         .expect("terminal");
-    assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
-    let path = result.final_path.expect("published");
+    let path = result.final_path;
     assert_eq!(support::fixtures::file_sha256(&path), sha, "content exact");
 }
 
@@ -150,22 +147,21 @@ async fn storage_permission_failure_surfaces_and_never_publishes() {
     let result = c
         .run(DownloadRequest::new(server.url("/perm.bin"), dest.clone()))
         .await
-        .expect("terminal");
+        .expect_err("terminal");
     // Restore permissions so the tempdir can be cleaned up.
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
             .expect("restore permissions");
     }
-    assert_eq!(result.status, ResultStatus::Failed, "{result:?}");
-    assert!(result.final_path.is_none(), "nothing published");
+    assert!(!dest.exists(), "nothing published");
     assert!(!dest.exists(), "no partial output at the destination");
     assert!(!blocked.join("out.bin.part").exists(), "no temp residue");
     // The permission failure surfaces as a structured error (the
     // destination lockfile/PermissionDenied family) — never silently.
     assert!(
         matches!(
-            result.error.as_ref().expect("error"),
+            result.as_engine_error().expect("error"),
             kdown_engine::DownloadError::SinkOpen(_)
                 | kdown_engine::DownloadError::PermissionDenied(_)
                 | kdown_engine::DownloadError::Commit(_)
@@ -213,15 +209,10 @@ async fn allocation_paths_preserve_retry_and_resume_semantics() {
         c_cfg.transfer.max_segment_size = 256 * 1024;
         c_cfg.retry.base_delay = Duration::from_millis(10);
         let c = controller(c_cfg);
-        let result = c
+        let _ = c
             .run(DownloadRequest::new(server.url("/alloc.bin"), dest.clone()))
             .await
             .expect("terminal");
-        assert_eq!(
-            result.status,
-            ResultStatus::Completed,
-            "physical={physical}: {result:?}"
-        );
         assert_bytes_exact(&std::fs::read(&dest).expect("read"), &content);
         assert!(!dir.path().join("out.bin.part").exists());
     }
