@@ -73,3 +73,6 @@ mod sink_fault_tests;
 
 #[path = "../../tests/platform_lease_tests.rs"]
 mod platform_lease_tests;
+
+#[path = "../../tests/regression_tests.rs"]
+mod regression_tests;

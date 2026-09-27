@@ -12,6 +12,8 @@ use kdown_engine::{
     config::{OverwritePolicy, ResumePolicy},
     DownloadController, DownloadRequest, EngineConfig, HttpTransport,
 };
+#[cfg(windows)]
+use std::path::Path;
 
 use support::fixtures;
 use support::test_server::TestServer;
