@@ -1,0 +1,1 @@
+{"format_version":1,"job_id":"seed","original_url":"https://example.test/file","final_url":"https://cdn.example.test/file","temp_path_identity":"fixture","total_size":1,"validators":{"etag":"\"seed\"","etag_is_weak":false,"last_modified":null,"total_size":1},"completed_ranges":[[0,0]],"expected_hashes":[],"created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"}

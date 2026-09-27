@@ -1,0 +1,130 @@
+name: fuzz-and-stress
+
+on:
+  schedule:
+    - cron: "23 2 * * 1"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_url
+          - fuzz_content_range
+          - fuzz_etag
+          - fuzz_content_disposition
+          - fuzz_checkpoint
+    env:
+      # Scheduled/manual runs use 2 minutes per parser. Release tags get
+      # 10 minutes per target; each overall job also has a hard 30-minute cap.
+      FUZZ_SECONDS: ${{ github.event_name == 'push' && '600' || '120' }}
+      # libFuzzer accepts an integer seed; the run number plus target and commit
+      # is recorded so a minimized failure can be replayed exactly.
+      FUZZ_SEED: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Record replay instructions
+        run: |
+          mkdir -p artifacts/fuzz-run fuzz/artifacts/${{ matrix.target }}
+          {
+            echo "target=${{ matrix.target }}"
+            echo "seed=${FUZZ_SEED}"
+            echo "budget_seconds=${FUZZ_SECONDS}"
+            echo "commit=${GITHUB_SHA}"
+            echo "replay=cargo fuzz run ${{ matrix.target }} -- -seed=${FUZZ_SEED} -max_total_time=${FUZZ_SECONDS} -timeout=10 -max_len=65536"
+          } > "artifacts/fuzz-run/${{ matrix.target }}.replay.txt"
+      - name: Run bounded libFuzzer target
+        id: fuzz
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -seed="${FUZZ_SEED}" \
+            -max_total_time="${FUZZ_SECONDS}" \
+            -timeout=10 \
+            -max_len=65536 \
+            2>&1 | tee "artifacts/fuzz-run/${{ matrix.target }}.log"
+      - name: Retain seed corpus, crash artifacts, and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}/
+            fuzz/artifacts/${{ matrix.target }}/
+            artifacts/fuzz-run/${{ matrix.target }}.*
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Fail the job when a fuzz seed crashes
+        if: steps.fuzz.outcome == 'failure'
+        run: |
+          echo "Fuzz target ${{ matrix.target }} failed; replay artifact uploaded above."
+          exit 1
+
+  state-machine-stress:
+    name: scheduler-checkpoint-commit-concurrency-stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      STRESS_CASES: "4096"
+      STRESS_BASE_SEED: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run scheduler, checkpoint, publication, restart, and multi-job stress
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/stress
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "base_seed=${STRESS_BASE_SEED}"
+            echo "proptest_cases=${STRESS_CASES}"
+            for round in 0 1 2; do
+              seed=$((STRESS_BASE_SEED + round))
+              echo "=== stress round=${round} seed=${seed} ==="
+              echo "round=${round} seed=${seed}" >> artifacts/stress/replay.txt
+              echo "scheduler_command=PROPTEST_RNG_SEED=${seed} PROPTEST_CASES=${STRESS_CASES} cargo test --locked -p kdown-engine --lib internal_tests::scheduler_property_tests -- --test-threads=1" >> artifacts/stress/replay.txt
+              echo "checkpoint_command=cargo test --locked -p kdown-engine --lib internal_tests::checkpoint_seam_tests -- --test-threads=1" >> artifacts/stress/replay.txt
+              echo "publication_command=cargo test --locked -p kdown-engine --lib io::publish::tests -- --test-threads=1" >> artifacts/stress/replay.txt
+              echo "restart_command=cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1" >> artifacts/stress/replay.txt
+              echo "concurrency_command=cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1" >> artifacts/stress/replay.txt
+              PROPTEST_RNG_SEED="${seed}" PROPTEST_CASES="${STRESS_CASES}" \
+                cargo test --locked -p kdown-engine --lib internal_tests::scheduler_property_tests -- --test-threads=1
+              cargo test --locked -p kdown-engine --lib internal_tests::checkpoint_seam_tests -- --test-threads=1
+              cargo test --locked -p kdown-engine --lib io::publish::tests -- --test-threads=1
+              cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1
+              cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1
+            done
+          } 2>&1 | tee artifacts/stress/stress.log
+      - name: Retain stress logs and minimized property seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-machine-stress-${{ github.run_id }}
+          path: |
+            artifacts/stress/
+            crates/engine/tests/scheduler_property_tests.proptest-regressions
+            fuzz/corpus/
+            fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 90
