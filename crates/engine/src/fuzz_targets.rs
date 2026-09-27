@@ -47,7 +47,15 @@ pub fn fuzz_content_disposition(data: &[u8]) {
         assert!(!safe.contains('\0'));
         assert!(!safe.contains('/'));
         assert!(!safe.contains('\\'));
-        assert!(!safe.contains(".."));
+        // `..` can occur within an ordinary basename (e.g. `..*name`);
+        // the safety invariant is one normal path component, not absence
+        // of those characters anywhere in the basename.
+        let mut components = std::path::Path::new(&safe).components();
+        assert!(matches!(
+            components.next(),
+            Some(std::path::Component::Normal(_))
+        ));
+        assert!(components.next().is_none());
         assert!(safe.len() <= crate::io::sanitize::MAX_FILENAME_LEN);
     }
 }

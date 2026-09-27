@@ -206,3 +206,36 @@ async fn regression_2026_09_27_seeded_loss_replay_drift() {
         }
     }
 }
+
+/// Regression from the scheduled `fuzz_content_disposition` campaign:
+/// the minimized seed contains `..` within the final basename, but has no
+/// parent-directory component after sanitization. The old fuzz invariant
+/// incorrectly rejected any `..` substring, turning this safe filename
+/// into a fuzzer crash.
+///
+/// - **Observed**: `@ttachment; filename=\"../../../..*etcmensswd\"`
+///   made the fuzz target panic at `assert!(!safe.contains(\"..\"))`.
+/// - **Expected**: the sanitized result is exactly one normal path
+///   component; embedded dots are harmless when separators are removed.
+/// - **Reproduction**: `cargo test -p kdown-engine --lib
+///   regression_2026_09_27_fuzzer_dotdot_component_not_traversal`.
+///   The original crash seed is retained at
+///   `fuzz/corpus/fuzz_content_disposition/regression_dotdot_component`.
+/// - **Fix**: test path-component safety rather than banning every `..`
+///   substring in `fuzz_targets::fuzz_content_disposition`.
+#[test]
+fn regression_2026_09_27_fuzzer_dotdot_component_not_traversal() {
+    let input =
+        include_bytes!("../../../fuzz/corpus/fuzz_content_disposition/regression_dotdot_component");
+    let header = std::str::from_utf8(input).expect("retained fuzz corpus is UTF-8");
+    let name =
+        crate::http::probe::filename_from_disposition(Some(header)).expect("filename is present");
+    let safe = crate::io::sanitize_filename(&name);
+    assert_eq!(safe, "..*etcmensswd");
+    let mut components = std::path::Path::new(&safe).components();
+    assert!(matches!(
+        components.next(),
+        Some(std::path::Component::Normal(_))
+    ));
+    assert!(components.next().is_none());
+}
