@@ -449,8 +449,10 @@ async fn deadline_during_gated_commit_reports_success_truthfully() {
     .await
     .expect("gate waiter")
     .expect("job reached the commit gate");
+    eprintln!("[test] entered observed for {}", dest.display());
     // The deadline expires while the atomic publication is held at the gate.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    eprintln!("[test] sending release for {}", dest.display());
     release_tx.send(()).expect("release commit");
     let completed = tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
