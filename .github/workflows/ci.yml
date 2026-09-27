@@ -32,6 +32,55 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  dependency-audit:
+    name: dependency-audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      # Audit the committed lockfiles directly; cargo-audit does not resolve
+      # or rewrite dependencies. Keep warnings visible, but fail on advisories.
+      # RUSTSEC-2026-0009 has a narrow, documented dev-only exception in
+      # .cargo/audit.toml due to its Rust 1.88 patch exceeding our Rust 1.85 MSRV;
+      # no other RustSec IDs are ignored. The unmaintained-parser warning is
+      # tracked in docs/acceptance-v1.md for planned migration.
+      - uses: actions-rust-lang/audit@v1
+        with:
+          file: Cargo.lock
+          denyWarnings: false
+          createIssues: false
+      - uses: actions-rust-lang/audit@v1
+        with:
+          file: fuzz/Cargo.lock
+          denyWarnings: false
+          createIssues: false
+
+  property-fuzz-smoke:
+    name: property-fuzz-smoke
+    runs-on: ubuntu-latest
+    env:
+      # Fixed seed + finite cases make this additional PR lane reproducible
+      # and bounded. The all-OS matrix still runs each property's normal count.
+      PROPTEST_RNG_SEED: "2026092701"
+      PROPTEST_CASES: "64"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Bounded deterministic scheduler properties
+        run: cargo test --locked -p kdown-engine --lib internal_tests::scheduler_property_tests -- --test-threads=1
+      - name: Adversarial parser corpus smoke
+        run: cargo test --locked -p kdown-engine --lib fuzz_targets::smoke::corpus_smoke_no_panics -- --exact
+      - name: Compile all libFuzzer targets
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+
+
   fmt:
     runs-on: ubuntu-latest
     steps:

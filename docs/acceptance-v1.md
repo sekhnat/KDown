@@ -60,6 +60,7 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Resource bounds | endless-header, redirect-loop, checkpoint/range parser tests |
 | SSRF restrictions | allow/block `AddressFilter` tests |
 | Proxy/auth safety | `proxy_tests`: CONNECT, absolute-form, bounded credential-provider stages |
+| Locked dependency audit | PR audits both tracked lockfiles; `RUSTSEC-2026-0009` is narrowly excepted in `.cargo/audit.toml` because `time` is dev-only via `rcgen`, and its fix requires Rust 1.88 (above MSRV 1.85); re-review/remove before production release. `RUSTSEC-2025-0134` (unmaintained `rustls-pemfile`) remains a visible warning with no ignore; review a maintained PEM parser. |
 
 ## Verification commands
 
@@ -68,8 +69,15 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
 cargo test -p kdown-engine fuzz_targets::smoke::corpus_smoke_no_panics
+cargo audit --file Cargo.lock
+cargo audit --file fuzz/Cargo.lock
+PROPTEST_RNG_SEED=2026092701 PROPTEST_CASES=64 cargo test --locked -p kdown-engine --lib internal_tests::scheduler_property_tests -- --test-threads=1
+cargo test --locked -p kdown-engine --lib fuzz_targets::smoke::corpus_smoke_no_panics -- --exact
+cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
 cargo bench -p kdown-engine --bench throughput -- --warm-up-time 0.5 --measurement-time 1.5
 ```
+
+`cargo audit` requires the `cargo-audit` subcommand (`cargo install cargo-audit --locked`); it reads the committed lockfiles and honors the reviewed exception in `.cargo/audit.toml`.
 
 `cargo-fuzz` target manifests are checked with `cargo check
 --manifest-path fuzz/Cargo.toml`. The current workstation does not have a

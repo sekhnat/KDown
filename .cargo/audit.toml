@@ -1,0 +1,10 @@
+# Reviewed exception for the root workspace's development dependency graph.
+# RUSTSEC-2026-0009 affects `time` before 0.3.47 when parsing untrusted RFC 2822.
+# Here `time` is reachable only through the dev-only `rcgen` fixture generator;
+# production dependencies do not include it and the engine never parses an
+# untrusted RFC 2822 date through that path. The patched release requires
+# Rust 1.88, above the crate's declared MSRV 1.85. Remove this exception when
+# replacing/upgrading the test-certificate dependency or intentionally revising
+# the MSRV; re-review it before any production-stable release.
+[advisories]
+ignore = ["RUSTSEC-2026-0009"]
