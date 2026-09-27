@@ -29,7 +29,7 @@
 
 - [x] 4.1 Add deterministic latency/jitter/loss/bandwidth/reset controls to `tests/support/test_server.rs` with recorded seeds; verify replay yields identical error/output/accounting under both sequential and segmented modes.
 - [x] 4.2 Extend HTTP tests for absent, ignored, mismatched and changing Range/validators plus redirected cache/CDN and authenticated proxy cases; verify byte-exact verified publication or safe typed failure with no corrupt final output.
-- [ ] 4.3 Add delayed, short-write, full-disk and fail-after-ack sink tests at high concurrent-job counts, cancellation and checkpoint/restart boundaries; verify durable ranges, bounded retries/memory, and no destructive publication.
+- [x] 4.3 Add delayed, short-write, full-disk and fail-after-ack sink tests at high concurrent-job counts, cancellation and checkpoint/restart boundaries; verify durable ranges, bounded retries/memory, and no destructive publication.
 - [ ] 4.4 Extend filesystem matrix cases for Linux/macOS/Windows path, sharing/lock, sparse/preallocation, rename/no-replace and crash/restart differences; verify targeted tests run on all three CI OS jobs and unsupported behaviors fail safely with documented evidence.
 - [ ] 4.5 Add a seed/fixture retention and severity-triage process for discovered production bugs; verify a deliberately replayed failure becomes a named regression test with deterministic reproduction instructions.
 

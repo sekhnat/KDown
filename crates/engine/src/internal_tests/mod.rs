@@ -67,3 +67,6 @@ mod transfer_memory_tests;
 
 #[path = "../../tests/metrics_transfer_tests.rs"]
 mod metrics_transfer_tests;
+
+#[path = "../../tests/sink_fault_tests.rs"]
+mod sink_fault_tests;

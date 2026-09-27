@@ -300,8 +300,12 @@ async fn many_jobs_share_one_aggregate_ledger_within_its_cap() {
     // their full job cap plus connection footprints.
     let mut joins = Vec::new();
     let mut handles = Vec::new();
+    let mut registrations = Vec::new();
     for job in 0..4 {
         let dest = dir.path().join(format!("out-{job}.bin"));
+        registrations.push(kdown_engine::io::fault_script::OutputFaultScript::register(
+            &dest,
+        ));
         let request = DownloadRequest::new(format!("http://127.0.0.1:{}/file", addr.port()), dest);
         let (handle, join) = controller.start(request);
         handles.push(handle);
