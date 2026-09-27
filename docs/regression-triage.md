@@ -63,3 +63,40 @@ demonstrably red on the unfixed code path. When the unfixed path can no
 longer be built (the fix is structural), the test documents the pre-fix
 observable from the bug report instead, and the triage entry links the
 failing pre-fix run.
+
+## 5. Dynamic-checker and benchmark limitations
+
+The release gate (task 5.4) distinguishes three outcomes that are easy to
+confuse, and this section is the review record for the third:
+
+1. **Checker failure** — Miri/sanitizer reported a defect. Recorded as
+   `failed`. Blocking, never waivable.
+2. **Checker unavailable with a documented equivalent** — the tool cannot run on
+   the runner (missing toolchain, unsupported platform). The lane runs the
+   applicable equivalent and records `passed_equivalent` naming the substitute,
+   or records `unavailable` with the limitation text and exits non-zero so its
+   job is red.
+3. **Reviewed exception** — an `unavailable` entry may be waived only by an
+   entry in `release/evidence-manifest.json`:
+
+   ```json
+   {
+     "id": "security_dynamic_tsan",
+     "review_ref": "docs/regression-triage.md#5-dynamic-checker-and-benchmark-limitations",
+     "reason": "ThreadSanitizer cannot map its shadow region on this runner; the address "
+               "sanitizer lane, targeted Miri lane and the scheduled multi-job stress lane "
+               "cover the same concurrency surface.",
+     "approved_by": "<reviewer>",
+     "expires_at": "2027-01-31T00:00:00Z"
+   }
+   ```
+
+   Exceptions require a review reference, an expiry date and a named approver;
+   an expired or reference-less exception blocks. Exceptions never waive a
+   `failed` or missing gate.
+
+Benchmark noise follows the same spirit: a run whose spread exceeds the noise
+limit, or whose matched-host fingerprint does not match the baseline, is
+recorded as `noise`/`unavailable` rather than passed or reported as a
+regression. The disposition is to re-record on a controlled matched host, never
+to widen the numeric threshold silently.

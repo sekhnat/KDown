@@ -32,11 +32,11 @@ baseline in `crates/engine/benches/results/baseline.md`.
 
 | Criterion | Evidence |
 |---|---|
-| Bounded transfer memory | `BufferPool` budget tests; criterion RSS record fields |
+| Bounded transfer memory | End-to-end transfer-memory admission and telemetry (`transfer_memory_tests`, `ingress_bound_tests`, `metrics_transfer_tests`; adversarial multi-job/RSS profiles) plus the `transfer-resource-bounds` capability; the standalone `BufferPool` budget is no longer the claim. Per-axis release numbers and the configured-cap checks live in `docs/performance-report-v1.md`. |
 | No thread per segment | Tokio worker tasks; no OS-thread worker creation |
 | Connection pooling | `connection_pool_tests`, `ConnectionLimits`, idle timeout/retry config |
 | H2 multiplexing | `h2_single_connection_default_multiplexes` (exactly one TLS connection) |
-| Loopback throughput | `benches/results/baseline.md`: ~1.67–1.96 GiB/s, 4 workers |
+| Loopback throughput | `benches/results/baseline.md`: ~1.67–1.96 GiB/s, 4 workers (historical criterion axis); release gating uses the multi-axis profile suite and versioned baselines in `crates/engine/benches/results/baselines/` |
 | No hot global scheduler lock | atomic `LeaseProgress` cells; boundary reconciliation tests |
 
 ## API quality
@@ -63,6 +63,36 @@ baseline in `crates/engine/benches/results/baseline.md`.
 | Proxy/auth safety | `proxy_tests`: CONNECT, absolute-form, bounded credential-provider stages |
 | Locked dependency audit | PR audits both tracked lockfiles; `RUSTSEC-2026-0009` is narrowly excepted in `.cargo/audit.toml` because `time` is dev-only via `rcgen`, and its fix requires Rust 1.88 (above MSRV 1.85); re-review/remove before production release. `RUSTSEC-2025-0134` (unmaintained `rustls-pemfile`) remains a visible warning with no ignore; review a maintained PEM parser. |
 
+## Release readiness (machine-checkable evidence gate)
+
+`release/evidence-manifest.json` declares every gate a production-stable verdict
+needs (three-OS correctness and durability, resource bound, interoperability,
+scheduled fuzz/stress lanes, dependency audit, targeted dynamic checks, and the
+loopback/low-latency/WAN performance profiles). Each verification lane records a
+JSON fragment (`scripts/evidence_io.py`); the gate aggregates them and refuses
+the verdict for missing, failed, stale, non-approving, fingerprint-mismatched or
+unavailable evidence, and for untriaged high-severity defects:
+
+```sh
+cp release/evidence-manifest.json /tmp/manifest.json
+python3 scripts/release_gate.py merge  --manifest /tmp/manifest.json artifacts/evidence artifacts/dynamic
+python3 scripts/release_gate.py status --manifest /tmp/manifest.json --commit "$(git rev-parse HEAD)"
+python3 scripts/release_gate.py check  --manifest /tmp/manifest.json --commit "$(git rev-parse HEAD)"
+```
+
+`python3 scripts/release_gate.py self-test` proves the blocking semantics
+(missing / failed / stale / non-approving / unavailable / untriaged-defect),
+including that the PR benchmark smoke can never approve a release.
+
+**Status: production stability is NOT declared for this revision.** The local
+verification run passed the Linux correctness, durability, resource-bound,
+interoperability, dependency-audit and shaped-profile (low-latency, WAN)
+lanes, and recorded `unavailable` for the dynamic checkers (no nightly
+toolchain on this host), `failed` for the loopback performance profile (host
+noise limit), and no evidence for the macOS/Windows and fuzz lanes (CI-only).
+The full verdict, blockers and evidence are in
+[`docs/performance-report-v1.md`](performance-report-v1.md) §4–§7.
+
 ## Verification commands
 
 ```sh
@@ -76,6 +106,20 @@ PROPTEST_RNG_SEED=2026092701 PROPTEST_CASES=64 cargo test --locked -p kdown-engi
 cargo test --locked -p kdown-engine --lib fuzz_targets::smoke::corpus_smoke_no_panics -- --exact
 cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
 cargo bench -p kdown-engine --bench throughput -- --warm-up-time 0.5 --measurement-time 1.5
+```
+
+Verification lanes and gates added by the production-stability change:
+
+```sh
+scripts/ci_lane.sh correctness|durability|resource-bound|interoperability
+scripts/dynamic_checks.sh probe|miri|address|thread|self-test
+scripts/bench_check.sh --self-test
+scripts/bench_check.sh --smoke
+scripts/bench_check.sh --release loopback|low-latency|wan|all
+scripts/bench_check.sh --baseline <profile>          # reviewed baseline (re-)record
+python3 scripts/bench_gate.py self-test
+python3 scripts/release_gate.py self-test
+python3 scripts/release_gate.py merge|status|check --manifest <file>
 ```
 
 `cargo audit` requires the `cargo-audit` subcommand (`cargo install cargo-audit --locked`); it reads the committed lockfiles and honors the reviewed exception in `.cargo/audit.toml`.

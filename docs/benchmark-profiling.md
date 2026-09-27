@@ -90,6 +90,58 @@ Server behavior controls: `--ignore-ranges`, `--throttle-mib-s F`,
 `READY`. The isolated server is plaintext HTTP/1.1; H2 multiplexing stays
 covered by the in-process smoke scenarios.
 
+## Release profile suite and per-axis gates (tasks 6.1-6.4)
+
+```sh
+# Machine-readable multi-axis report per pinned profile (throughput, network
+# amplification, CPU per byte, managed-memory high-water, job/worker scaling).
+cargo bench --locked -p kdown-engine --bench throughput -- --suite loopback|low-latency|wan|all
+# Options: --suite-out DIR, --reps N (>=5), --dataset SIZE, --dest-dir DIR,
+#          --disk-label NAME, --suite-scenario SUBSTRING, --suite-seed N
+
+scripts/bench_check.sh --release <profile|all>   # run + gate against the baseline
+scripts/bench_check.sh --baseline <profile>      # (re-)record a reviewed baseline
+scripts/bench_check.sh --self-test               # per-axis gate semantics
+scripts/bench_check.sh --smoke                   # PR smoke (non-approving evidence)
+```
+
+Pinned profiles: `loopback` (64 MiB, no shaping, workers 1/4/8 × jobs 1/4, 7
+repetitions), `low-latency` (8 MiB, 10 ms RTT, 1 ms jitter, 100 Mbps, 0.1 %
+loss, workers 1/4, 5 repetitions) and `wan` (8 MiB, 80 ms RTT, 20 ms jitter,
+20 Mbps, 1 % loss, workers 1/4, 5 repetitions). Every report records the pinned
+inputs, the dataset/protocol/worker/job counts, the host and build fingerprint
+(OS, kernel, CPU model, logical CPUs, rustc, commit, disk filesystem type,
+fixture shaping flags) and the per-repetition samples.
+
+Reports land in `benches/results/suite/<profile>/metrics.json` (schema
+`kdown.bench.suite/1`). Baselines and thresholds are versioned per profile in
+`benches/results/baselines/<profile>.json`; each carries the matched-host
+fingerprint and the reviewed numeric thresholds. `scripts/bench_gate.py` refuses
+to compare across fingerprints, treats a stale baseline (180-day review window)
+as blocking, marks unavailable axes as errors (never as zero or passing), and
+reports a `noise` disposition when a run's spread exceeds 15 % so a noisy host
+cannot pass or masquerade as an engine regression. Full numbers, the noise
+disposition and the blocker list are in
+[`docs/performance-report-v1.md`](performance-report-v1.md).
+
+### Fixture shaping semantics (updated)
+
+* `--throttle-mib-s F` now emulates **one shared link**: a single slot schedule
+  serves every connection, so N concurrent range responses share the budget and
+  the achieved aggregate rate matches F. The earlier per-response cap let each
+  parallel response use the full rate, which made shaped profiles meaningless
+  under concurrency.
+* Pacing uses absolute/virtual-clock deadlines admitted in 64 KiB quanta, so the
+  ~1 ms timer wheel no longer caps the achieved rate near 4 MiB/s. The
+  previously documented "1 Gbps axis is fixture-limited/not run" note in
+  `benches/results/baseline-v2-wan.md` is therefore obsolete: a 12.5 MiB/s
+  target measures 12.49 MiB/s, and a 4 × 4 MiB concurrent batch completes in
+  1282 ms against the 1280 ms the shared link allows.
+* `--jitter-ms MS` adds a deterministic per-response delay (0..=MS, drawn from
+  the server seed) so a jittered profile replays identically.
+* The report's disk condition is observed from the destination filesystem
+  (`/proc/mounts`) or set with `--disk-label`; it is part of the fingerprint.
+
 ## Profiling procedures
 
 ### Always available (no extra tooling; used by the harness)
@@ -292,10 +344,12 @@ for the scheduler rework.
 
 ### Controlled shaping modes (task 0.3) and axis availability
 
-The isolated fixture server now supports `--rtt-ms F` (one RTT before each
+The isolated fixture server supports `--rtt-ms F` (one RTT before each
 response's headers — a lower bound on real RTT), `--loss-percent P`
-(deterministic, seed-derived per-response connection truncation), and
-`--retry-after SECS` for transient-fail responses. Calibration is verified by
+(deterministic, seed-derived per-response connection truncation),
+`--jitter-ms MS` (seeded jitter) and `--retry-after SECS` for transient-fail
+responses; `--throttle-mib-s` shares one link budget across connections (see the
+release-suite section above). Calibration is verified by
 `fixture_isolated_tests` (3 RTTs ≥ 3×40 ms across a three-segment transfer;
 loss recovers through retries; Retry-After value observed on the wire).
 
