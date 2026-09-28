@@ -399,7 +399,18 @@ pub(crate) fn select_rename_candidate(
         let (checkpoint, admission_warnings) =
             match discover_admission(ctx.resume, &identity, store.as_ref()) {
                 Ok(AdmissionDiscovery::Found(checkpoint)) => (Some(*checkpoint), vec![]),
-                Ok(AdmissionDiscovery::Absent { warnings }) => (None, warnings),
+                Ok(AdmissionDiscovery::Absent { warnings }) => {
+                    if ctx.resume == ResumePolicy::Required {
+                        // Required resume refuses a fresh download: a free
+                        // candidate without a usable checkpoint still fails
+                        // Checkpoint (§15.5) instead of silently restarting.
+                        drop(lease);
+                        return Ok(RenameSelection::Exhausted {
+                            required_checkpoint_missing: true,
+                        });
+                    }
+                    (None, warnings)
+                }
                 Err(failure) => return Err(failure.error),
             };
         return Ok(RenameSelection::Selected(Box::new(SelectedDestination {

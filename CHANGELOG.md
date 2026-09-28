@@ -6,6 +6,23 @@ All notable changes to KDown Engine are documented here.
 
 ### Added
 
+### Fixed
+
+- HTTP/2 flow-control windows no longer throttle WAN transfers: the
+  bounded-ingress ceiling (`INGRESS_WINDOW_CAP`) rises from 128 KiB to
+  2 MiB, the per-stream window tracks the connection window instead of
+  the HTTP/1 read-buffer size, and the default `TransferMemoryConfig`
+  envelope scales with it (`aggregate_max_bytes` 64 MiB → 1 GiB
+  guarantee ceiling — a worst-case bound, not an allocation;
+  `network_ingress_max_bytes` 1 MiB → 8 MiB). A single connection was
+  previously capped at window/RTT (a few MB/s on typical CDN RTTs) no
+  matter how many streams multiplexed over it.
+- `OverwritePolicy::Rename` selection no longer turns `ResumePolicy::Required`
+  into a fresh download: a free candidate without a usable checkpoint now
+  fails `Checkpoint` instead of silently restarting from zero (matching the
+  download-destination-resolution spec; the non-Rename path already
+  rejected).
+
 ### Added (automatic-filename-resolution)
 
 - Directory-target downloads (opt-in): `DirectoryDownloadRequest` with

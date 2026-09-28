@@ -503,3 +503,37 @@ async fn custom_checkpoint_resolver_sees_the_final_destination() {
         &completed.final_path
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_rename_with_required_resume_and_no_checkpoint_fails() {
+    // Rename + Required: a free candidate must never become a fresh
+    // download when no usable checkpoint exists (§15.5).
+    let server = TestServer::new()
+        .serve_handler("/file", |_| ScriptedResponse::ok(BODY.to_vec()))
+        .start()
+        .await
+        .expect("start");
+    let dir = tempfile::tempdir().expect("tmpdir");
+
+    let mut request = directory_request(server.url("/file"), dir.path());
+    request.request_mut().overwrite = OverwritePolicy::Rename;
+    request.request_mut().resume = ResumePolicy::Required;
+    let result = run(request).await.expect_err("terminal failure");
+    assert!(
+        matches!(result.as_engine_error(), Some(DownloadError::Checkpoint(_))),
+        "expected Checkpoint for {result:?}"
+    );
+    // No output artifact may appear for the refused fresh download; only
+    // lease lock remnants are tolerated.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .all(|name| name.starts_with(".kdown-destination")),
+        "no output artifact expected, got {entries:?}"
+    );
+}
