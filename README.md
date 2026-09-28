@@ -59,6 +59,41 @@ cargo run --release --example download -- \
   https://example.test/archive.tar.zst archive.tar.zst
 ```
 
+For a quick URL download with automatic filename resolution, use the
+`download_link` example through the provided launcher:
+
+```sh
+scripts/download.sh https://example.test/archive.tar.zst
+scripts/download.sh https://example.test/archive.tar.zst ~/downloads
+```
+
+Tuning options are forwarded to the engine: `--segments N` sets the
+parallel range-worker count (and lowers the segmentation threshold so
+N-way splitting applies even to smaller files; the server must still
+advertise range support), `--segment-size N` sets the initial range size
+(`4M`-style K/M/G decimal suffixes accepted), `--rate N` applies a
+per-job bytes/s limit, and `--retries`, `--resume`, and `--overwrite`
+adjust retry attempts, resume policy, and collision handling.
+`--connections N` sets the parallel HTTP/2 connection slots (default 8):
+each slot adds another bounded 2 MiB flow-control window, so transfers
+scale past the single-connection window/RTT ceiling on high-bandwidth or
+high-RTT paths — a 10 Gbit line at 50 ms RTT wants roughly `32`.
+`download.sh --help` prints the full list. The final summary line reports
+wall time, average speed, checkpoint reuse, wasted retransmit bytes,
+retries, and the number of HTTP range requests issued.
+
+The script wraps `cargo run --release --example download_link URL
+[DIRECTORY]` (`DIRECTORY` defaults to the current directory and must
+already exist). The output filename is resolved from the server's
+`Content-Disposition`, the final redirected URL, or the original URL, and
+an existing file is never replaced: `OverwritePolicy::Rename` picks a free
+`name (1).ext` sibling instead. While the job runs, a progress line shows
+transferred bytes, a decimal MB/s rate over a rolling 5 s window, and the
+estimated time remaining; the ETA shows `--` while the total size is
+unknown or the rate is below the engine's meaningfulness threshold
+(1 KiB/s). Exit codes: 0 success, 1 download failure, 2 usage or
+configuration error.
+
 ## Supported surface and versioning
 
 `kdown-engine` 0.1 was followed by a **breaking** API cleanup: success and
