@@ -152,6 +152,7 @@ pub use error::{
     EngineFailure, ErrorCategory, FailureDomain, Retryability, TransferAccounting, TransferFailure,
 };
 pub use http::HttpTransport;
+pub use job::controller::DirectoryDownloadRequest;
 #[allow(deprecated)]
 pub use job::controller::SingleStreamController;
 pub use job::controller::{CancelMode, DownloadController, DownloadHandle, DownloadRequest};

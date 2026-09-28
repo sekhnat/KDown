@@ -57,7 +57,7 @@ blocks = re.findall(r'pub use\b.*?;', lib, re.S)
 text = '\n'.join(blocks)
 
 TYPES = [
-    "DownloadRequest", "DownloadController", "DownloadHandle", "CancelMode",
+    "DownloadRequest", "DirectoryDownloadRequest", "DownloadController", "DownloadHandle", "CancelMode",
     "SingleStreamController",
     "CompletedDownload", "DownloadRunError", "TransferFailure", "EngineFailure",
     "CancellationSummary", "TransferAccounting", "ArtifactDisposition",

@@ -417,7 +417,19 @@ impl HttpTransport {
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| {
+                // Only the probe's Content-Disposition header is decoded
+                // lossily from non-UTF-8 transport bytes: a raw non-UTF-8
+                // ordinary `filename` must survive for automatic filename
+                // resolution. Every other header keeps its existing strict
+                // UTF-8-or-empty interpretation.
+                let value = if k == hyper::header::CONTENT_DISPOSITION {
+                    String::from_utf8_lossy(v.as_bytes()).into_owned()
+                } else {
+                    v.to_str().unwrap_or("").to_string()
+                };
+                (k.as_str().to_string(), value)
+            })
             .collect();
         Ok(HeadResponse {
             parts,

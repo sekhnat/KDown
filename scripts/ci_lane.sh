@@ -113,6 +113,7 @@ lane_durability() {
     "cargo test --locked -p kdown-engine --lib internal_tests::crash_restart_tests -- --test-threads=1" \
     "cargo test --locked -p kdown-engine --lib internal_tests::sink_fault_tests -- --test-threads=1" \
     "cargo test --locked -p kdown-engine --lib internal_tests::resume_tests -- --test-threads=1" \
+    "cargo test --locked -p kdown-engine --lib internal_tests::directory_resolution_tests -- --test-threads=1" \
     "cargo test --locked -p kdown-engine --lib internal_tests::checkpoint_seam_tests -- --test-threads=1"
 }
 

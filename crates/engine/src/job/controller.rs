@@ -34,6 +34,10 @@ use crate::io::destination_lease::DestinationLease;
 use crate::io::output_session::{OutputSession, PartialArtifactOwner};
 use crate::io::publish::PublishMode;
 use crate::io::sink::{FlushLevel, Sink, TempFileSpec};
+use crate::job::naming::{
+    resolve_directory_basename, select_rename_candidate, validate_directory_target, JobTarget,
+    RenameSelection, RenameSelectionContext, MAX_FINAL_BASENAME_BYTES,
+};
 use crate::job::state::{JobState, StateMachine};
 use crate::metrics::counters::JobCounters;
 use crate::metrics::events::{Event, EventHub, SharedHub};
@@ -43,11 +47,15 @@ use crate::resume::checkpoint_store::{
     DurabilityMode as StoreDurability, SidecarCheckpointResolver,
 };
 use crate::resume::durable_ranges::DurableRangeTracker;
+use crate::resume::flow::{discover_admission_pieces, AdmissionPieces, PendingAdmission};
 fn publication_mode(policy: OverwritePolicy) -> PublishMode {
     match policy {
         OverwritePolicy::FailIfExists => PublishMode::NoReplace,
         OverwritePolicy::Replace => PublishMode::Replace,
         OverwritePolicy::ResumeIfMatching => PublishMode::Replace,
+        // Rename never replaces an existing entry: publication is always the
+        // atomic no-replace operation (automatic-filename-resolution).
+        OverwritePolicy::Rename => PublishMode::NoReplace,
     }
 }
 
@@ -113,6 +121,81 @@ impl DownloadRequest {
             authorization: None,
             credential_provider: None,
         }
+    }
+}
+
+/// Opt-in directory-target download (automatic-filename-resolution): the
+/// caller supplies an existing directory instead of naming an output file.
+/// The final basename is resolved from the final HEAD metadata, the
+/// redirected/original URLs, or the validated fallback after the probe,
+/// then leased and transferred through the ordinary pipeline.
+///
+/// The wrapped [`DownloadRequest`] carries every request option: mutate it
+/// through [`request_mut`](Self::request_mut) to set headers, integrity,
+/// overwrite (including `Rename`) and resume policies. `destination` is
+/// engine-reserved for this request and is replaced by the selected path.
+#[derive(Clone)]
+pub struct DirectoryDownloadRequest {
+    pub(crate) request: DownloadRequest,
+    pub(crate) directory: std::path::PathBuf,
+    pub(crate) fallback: String,
+    pub(crate) max_filename_bytes: usize,
+}
+
+impl std::fmt::Debug for DirectoryDownloadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delegates to the redacting request Debug (§35.3); the directory
+        // and naming options are not secret.
+        f.debug_struct("DirectoryDownloadRequest")
+            .field("request", &self.request)
+            .field("directory", &self.directory)
+            .field("fallback", &self.fallback)
+            .field("max_filename_bytes", &self.max_filename_bytes)
+            .finish()
+    }
+}
+
+impl DirectoryDownloadRequest {
+    /// Target an existing `directory` with `url`. Validation of the
+    /// directory and naming options happens before any network activity
+    /// and fails in the Configuration category with no output artifacts.
+    #[must_use]
+    pub fn new(url: impl Into<String>, directory: std::path::PathBuf) -> Self {
+        Self {
+            // Placeholder destination: replaced by the resolved final path
+            // after the probe; never used before then.
+            request: DownloadRequest::new(
+                url,
+                directory.join(crate::job::naming::DEFAULT_FALLBACK_FILENAME),
+            ),
+            directory,
+            fallback: crate::job::naming::DEFAULT_FALLBACK_FILENAME.to_string(),
+            max_filename_bytes: crate::job::naming::MAX_FINAL_BASENAME_BYTES,
+        }
+    }
+
+    /// Mutate the wrapped ordinary request (headers, expected size,
+    /// integrity, overwrite, resume, credential options).
+    #[must_use]
+    pub fn request_mut(&mut self) -> &mut DownloadRequest {
+        &mut self.request
+    }
+
+    /// Replace the fallback basename (default `download`). Must already be
+    /// a single normal component unchanged by sanitization.
+    #[must_use]
+    pub fn with_fallback_filename(mut self, fallback: impl Into<String>) -> Self {
+        self.fallback = fallback.into();
+        self
+    }
+
+    /// Bound the final basename (including every generated `Rename`
+    /// sibling) to this many UTF-8 bytes. Default 250; at most 250, at
+    /// least the fallback's byte length, and at least 7 for `Rename`.
+    #[must_use]
+    pub fn with_max_filename_bytes(mut self, max_filename_bytes: usize) -> Self {
+        self.max_filename_bytes = max_filename_bytes;
+        self
     }
 }
 
@@ -182,6 +265,11 @@ pub struct DownloadHandle {
     /// Serializes runtime-control update+event pairs (see the field comment
     /// at construction).
     runtime_control: std::sync::Mutex<()>,
+    /// Resolved final destination (automatic-filename-resolution): preset
+    /// for explicit-file non-Rename requests, whose input path is known
+    /// immediately; directory and Rename targets publish only after
+    /// selection and lease acquisition. The value never changes once set.
+    resolved_destination: Arc<std::sync::OnceLock<std::path::PathBuf>>,
 }
 
 impl std::fmt::Debug for DownloadHandle {
@@ -321,6 +409,16 @@ impl DownloadHandle {
     pub fn events(&self) -> crate::metrics::events::EventStream {
         self.hub.subscribe()
     }
+    /// The resolved final destination, when known (automatic-filename-
+    /// resolution). Explicit-file non-Rename requests expose their input
+    /// path immediately; directory and `Rename` destinations appear only
+    /// after selection and lease acquisition. Reliable even when a
+    /// broadcast subscriber missed `Event::DestinationResolved`; the value
+    /// agrees with the committed path on success and never changes once set.
+    #[must_use]
+    pub fn resolved_destination(&self) -> Option<&Path> {
+        self.resolved_destination.get().map(|path| path.as_path())
+    }
 }
 
 /// The download job controller: starts and supervises both sequential and
@@ -379,6 +477,19 @@ impl std::fmt::Debug for DownloadController {
     note = "`SingleStreamController` starts both sequential and segmented downloads; rename to `DownloadController`"
 )]
 pub type SingleStreamController = DownloadController;
+
+/// Destination state prepared before the shared finalize step
+/// (automatic-filename-resolution): the selected lease, checkpoint
+/// identity, store and discovered admission pieces are bound together so
+/// nothing is loaded, leased or admitted twice. The lease lives through
+/// worker joins and terminal cleanup.
+struct PreparedAdmission {
+    lease: DestinationLease,
+    identity: String,
+    store: Arc<dyn CheckpointStore>,
+    checkpoint: Option<crate::resume::checkpoint::Checkpoint>,
+    admission_warnings: Vec<String>,
+}
 
 impl DownloadController {
     /// Build a controller over the production Hyper wire adapter (§32:
@@ -586,9 +697,32 @@ impl DownloadController {
     /// [`DownloadError::AdmissionRejected`] (category `MemoryCap`): no
     /// transfer begins and no artifact is written. The permit is released
     /// on success, failure, cancellation, or task abort.
+    /// Start an explicit-file download and return immediately with a
+    /// control handle (§7.2 start -> §7.3 handle).
     pub fn start(
         &self,
         request: DownloadRequest,
+    ) -> (
+        DownloadHandle,
+        tokio::task::JoinHandle<Result<CompletedDownload, DownloadRunError>>,
+    ) {
+        let resolved_destination = Arc::new(std::sync::OnceLock::new());
+        // An explicit-file non-Rename destination is known immediately
+        // (automatic-filename-resolution): Rename and directory targets
+        // publish after lease acquisition instead.
+        if request.overwrite != OverwritePolicy::Rename {
+            let _ = resolved_destination.set(request.destination.clone());
+        }
+        self.start_with_target(request, JobTarget::File, resolved_destination)
+    }
+
+    /// Shared spawn path for both target modes (§7.2): one private runner
+    /// per job — never a parallel transfer implementation.
+    fn start_with_target(
+        &self,
+        request: DownloadRequest,
+        target: JobTarget,
+        resolved_destination: Arc<std::sync::OnceLock<std::path::PathBuf>>,
     ) -> (
         DownloadHandle,
         tokio::task::JoinHandle<Result<CompletedDownload, DownloadRunError>>,
@@ -613,6 +747,7 @@ impl DownloadController {
                 CancelMode::DeletePartial as u8,
             )),
             hub: hub.clone(),
+            resolved_destination: resolved_destination.clone(),
             counters: counters.clone(),
             total_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_known: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -719,6 +854,8 @@ impl DownloadController {
             let terminal = this
                 .run_inner(
                     request,
+                    target,
+                    resolved_destination,
                     inner_state,
                     inner_cancel,
                     handle_cancel_mode,
@@ -790,11 +927,82 @@ impl DownloadController {
         Ok((terminal, handle))
     }
 
+    /// Start a directory-target download (automatic-filename-resolution):
+    /// the final basename resolves from the final HEAD metadata, the
+    /// redirected/original URLs, or the validated fallback, then leases
+    /// and transfers through the ordinary pipeline. The directory and
+    /// naming options validate before any network activity.
+    pub fn start_to_directory(
+        &self,
+        request: DirectoryDownloadRequest,
+    ) -> (
+        DownloadHandle,
+        tokio::task::JoinHandle<Result<CompletedDownload, DownloadRunError>>,
+    ) {
+        let DirectoryDownloadRequest {
+            request,
+            directory,
+            fallback,
+            max_filename_bytes,
+        } = request;
+        let resolved_destination = Arc::new(std::sync::OnceLock::new());
+        self.start_with_target(
+            request,
+            JobTarget::Directory {
+                directory,
+                options: crate::job::naming::DirectoryOptions {
+                    fallback,
+                    max_filename_bytes,
+                },
+            },
+            resolved_destination,
+        )
+    }
+
+    /// Run a directory-target download to a terminal state without
+    /// exposing the handle (fire-and-forget use case).
+    ///
+    /// # Errors
+    /// Same contract as [`DownloadController::run`].
+    pub async fn run_to_directory(
+        &self,
+        request: DirectoryDownloadRequest,
+    ) -> Result<CompletedDownload, DownloadRunError> {
+        self.run_to_directory_with_handle(request)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Run a directory-target download with a control handle: blocks until
+    /// terminal.
+    ///
+    /// # Errors
+    /// Same contract as [`DownloadController::run_with_handle`].
+    pub async fn run_to_directory_with_handle(
+        &self,
+        request: DirectoryDownloadRequest,
+    ) -> Result<(CompletedDownload, DownloadHandle), DownloadRunError> {
+        let (handle, join) = self.start_to_directory(request);
+        // A task-join failure (the spawned job panicked or was aborted)
+        // stays distinct from the job's own terminal outcome: it maps to
+        // the engine infrastructure domain and never masks a transfer
+        // error reported through the join result.
+        let terminal = join.await.map_err(|e| {
+            DownloadRunError::Infrastructure(Box::new(EngineFailure {
+                error: DownloadError::Protocol(format!("job task panicked: {e}")),
+                partial: TransferAccounting::default(),
+                artifacts: ArtifactDisposition::default(),
+            }))
+        })??;
+        Ok((terminal, handle))
+    }
     /// Body of the job pipeline, shared by both entry points.
     #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
-        request: DownloadRequest,
+        mut request: DownloadRequest,
+        target: JobTarget,
+        resolved_destination: Arc<std::sync::OnceLock<PathBuf>>,
         state: Arc<StateMachine>,
         cancel: CancellationToken,
         cancel_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -815,115 +1023,321 @@ impl DownloadController {
             ledger: Arc::clone(&job_ledger),
             cell: job_memory_high_water,
         };
-        // Overwrite policy pre-check (§14.6): FailIfExists rejects before
-        // any network activity.
-        if request.overwrite == OverwritePolicy::FailIfExists && request.destination.exists() {
-            let error = DownloadError::DestinationConflict(format!(
-                "destination exists: {}",
-                request.destination.display()
-            ));
-            return Err(self.terminal_error(
-                &state,
-                &request,
-                error,
-                Self::sequential_accounting(
-                    &counters,
-                    None,
-                    Duration::ZERO,
-                    ResourceValidators::default(),
-                    vec![],
-                ),
-                ArtifactDisposition::default(),
-                CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-            ));
+        // ---- Destination preparation and target validation ----
+        // (automatic-filename-resolution) Explicit files keep the §14.6
+        // pre-network guarantees: the conflict check, lease acquisition
+        // and checkpoint admission all happen before any probe, and
+        // `Rename` also selects and leases its final candidate here (never
+        // after networking). Directory targets validate the caller's
+        // directory and naming options before networking — determinable
+        // invalid input fails in the Configuration category with no output
+        // artifacts — and deliberately defer lease/admission until after
+        // the probe.
+        let mut prepared: Option<PreparedAdmission> = None;
+        match &target {
+            JobTarget::File => {
+                if request.overwrite == OverwritePolicy::FailIfExists
+                    && request.destination.exists()
+                {
+                    let error = DownloadError::DestinationConflict(format!(
+                        "destination exists: {}",
+                        request.destination.display()
+                    ));
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        error,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            ResourceValidators::default(),
+                            vec![],
+                        ),
+                        ArtifactDisposition::default(),
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
+                }
+                if request.overwrite == OverwritePolicy::Rename {
+                    // Pre-probe candidate selection: the chosen name,
+                    // identity and event never change after this point.
+                    let Some(parent) = request.destination.parent() else {
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            DownloadError::Commit(format!(
+                                "destination has no parent directory: {}",
+                                request.destination.display()
+                            )),
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                ResourceValidators::default(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    };
+                    let Some(base_name) = request.destination.file_name() else {
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            DownloadError::Commit(format!(
+                                "destination has no file name: {}",
+                                request.destination.display()
+                            )),
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                ResourceValidators::default(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    };
+                    let selection = select_rename_candidate(&RenameSelectionContext {
+                        parent,
+                        base_name,
+                        // Generated explicit-file siblings reserve the
+                        // `.part` headroom against the hard component bound.
+                        cap: MAX_FINAL_BASENAME_BYTES,
+                        resume: request.resume,
+                        url: &request.url,
+                        durability: self.config.transfer.durability,
+                        resolver: self.checkpoint_resolver.as_ref(),
+                    });
+                    match selection {
+                        Ok(RenameSelection::Selected(selected)) => {
+                            request.destination = selected.destination.clone();
+                            let _ = resolved_destination.set(request.destination.clone());
+                            hub.emit(Event::DestinationResolved {
+                                path: request.destination.display().to_string(),
+                            })
+                            .await;
+                            prepared = Some(PreparedAdmission {
+                                lease: selected.lease,
+                                identity: selected.identity,
+                                store: selected.store,
+                                checkpoint: selected.checkpoint,
+                                admission_warnings: selected.admission_warnings,
+                            });
+                        }
+                        Ok(RenameSelection::Exhausted {
+                            required_checkpoint_missing,
+                        }) => {
+                            let error = if required_checkpoint_missing {
+                                DownloadError::Checkpoint(
+                                    "resume required but no checkpoint".into(),
+                                )
+                            } else {
+                                DownloadError::DestinationConflict(format!(
+                                    "no available rename candidate in {}",
+                                    parent.display()
+                                ))
+                            };
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    // Hold destination ownership before any checkpoint
+                    // resolution/admission or temp output open. The binding
+                    // lives through worker joins and terminal cleanup,
+                    // including the awaited segmented completion path.
+                    let lease = match DestinationLease::acquire(&request.destination) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    };
+                    // Resume admission, phase 1 (§15.5, §7.2): policy-aware
+                    // checkpoint loading before any network activity.
+                    // Required-state failures reject before the job enters
+                    // Probing.
+                    let identity =
+                        crate::resume::flow::job_identity(&request.url, &request.destination);
+                    // Checkpoint adapter selection (§34): one resolution
+                    // per job, before any checkpoint operation and before
+                    // probing. Resolution failure is a checkpoint-category
+                    // terminal failure.
+                    let resolve_context = CheckpointResolveContext::new(
+                        identity.clone(),
+                        request.destination.clone(),
+                        match self.config.transfer.durability {
+                            crate::config::DurabilityMode::Performance => {
+                                StoreDurability::Performance
+                            }
+                            crate::config::DurabilityMode::Durable => StoreDurability::Durable,
+                        },
+                    );
+                    let selected = match self.checkpoint_resolver.resolve(&resolve_context) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                DownloadError::Checkpoint(e.to_string()),
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    };
+                    // Per-job mutation coordination: every operation
+                    // reaches the one selected adapter through a single
+                    // serialized order (§12).
+                    let store: Arc<dyn CheckpointStore> = Arc::new(
+                        crate::resume::coordinated_store::CoordinatedCheckpointStore::new(selected),
+                    );
+                    let pieces = match discover_admission_pieces(
+                        request.resume,
+                        &identity,
+                        store.as_ref(),
+                    ) {
+                        Ok(pieces) => pieces,
+                        Err(failure) => {
+                            Self::emit_resume_notices(&hub, &failure.notices).await;
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                failure.error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    };
+                    let (checkpoint, admission_warnings) = match pieces {
+                        AdmissionPieces::Resuming(cp) => (Some(*cp), vec![]),
+                        AdmissionPieces::Fresh { warnings } => (None, warnings),
+                        AdmissionPieces::RequiredMissing => {
+                            // The existing Checkpoint rejection for
+                            // Required-without-checkpoint (§15.5), still
+                            // before the job enters Probing.
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                DownloadError::Checkpoint(
+                                    "resume required but no checkpoint".into(),
+                                ),
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    ResourceValidators::default(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    };
+                    prepared = Some(PreparedAdmission {
+                        lease,
+                        identity,
+                        store,
+                        checkpoint,
+                        admission_warnings,
+                    });
+                }
+            }
+            JobTarget::Directory { directory, options } => {
+                // Caller-selected directory with an engine-selected
+                // basename: validate before networking; the lease and
+                // checkpoint admission are deliberately deferred until
+                // after the probe (the directory-mode relaxation).
+                if let Err(error) = validate_directory_target(directory, options, request.overwrite)
+                {
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        error,
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            ResourceValidators::default(),
+                            vec![],
+                        ),
+                        ArtifactDisposition::default(),
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
+                }
+            }
         }
-
-        // Hold destination ownership before any checkpoint resolution/admission
-        // or temp output open. The binding lives through worker joins and
-        // terminal cleanup, including the awaited segmented completion path.
-        let _destination_lease = match DestinationLease::acquire(&request.destination) {
-            Ok(lease) => lease,
-            Err(error) => {
-                return Err(self.terminal_error(
-                    &state,
-                    &request,
-                    error,
-                    Self::sequential_accounting(
-                        &counters,
-                        None,
-                        Duration::ZERO,
-                        ResourceValidators::default(),
-                        vec![],
-                    ),
-                    ArtifactDisposition::default(),
-                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-                ));
-            }
-        };
-
-        // ---- Resume admission, phase 1 (§15.5, §7.2): policy-aware
-        // checkpoint loading before any network activity. Required-state
-        // failures reject before the job enters Probing.
-        let identity = crate::resume::flow::job_identity(&request.url, &request.destination);
-        // ---- Checkpoint adapter selection (§34): one resolution per job,
-        // before any checkpoint operation and before probing. Resolution
-        // failure is a checkpoint-category terminal failure.
-        let resolve_context = CheckpointResolveContext::new(
-            identity.clone(),
-            request.destination.clone(),
-            match self.config.transfer.durability {
-                crate::config::DurabilityMode::Performance => StoreDurability::Performance,
-                crate::config::DurabilityMode::Durable => StoreDurability::Durable,
-            },
-        );
-        let selected = match self.checkpoint_resolver.resolve(&resolve_context) {
-            Ok(store) => store,
-            Err(e) => {
-                return Err(self.terminal_error(
-                    &state,
-                    &request,
-                    DownloadError::Checkpoint(e.to_string()),
-                    Self::sequential_accounting(
-                        &counters,
-                        None,
-                        Duration::ZERO,
-                        ResourceValidators::default(),
-                        vec![],
-                    ),
-                    ArtifactDisposition::default(),
-                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-                ));
-            }
-        };
-        // Per-job mutation coordination: every operation reaches the one
-        // selected adapter through a single serialized order (§12).
-        let store: Arc<dyn CheckpointStore> =
-            Arc::new(crate::resume::coordinated_store::CoordinatedCheckpointStore::new(selected));
-        let pending_admission = match crate::resume::flow::begin_admission(
-            request.resume,
-            &identity,
-            TempFileSpec::default().temp_path_for(&request.destination),
-            store.as_ref(),
-        ) {
-            Ok(pending) => pending,
-            Err(failure) => {
-                Self::emit_resume_notices(&hub, &failure.notices).await;
-                return Err(self.terminal_error(
-                    &state,
-                    &request,
-                    failure.error,
-                    Self::sequential_accounting(
-                        &counters,
-                        None,
-                        Duration::ZERO,
-                        ResourceValidators::default(),
-                        vec![],
-                    ),
-                    ArtifactDisposition::default(),
-                    CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
-                ));
-            }
-        };
 
         // ---- Probe (§9.1 Probing) ----
         let _ = state.transition(JobState::Probing);
@@ -1112,6 +1526,250 @@ impl DownloadController {
             .await;
         }
 
+        // ---- Directory destination resolution (post-probe) ----
+        // (automatic-filename-resolution) The probe (HEAD plus the optional
+        // metadata-only validating ranged GET) is complete; neither consumed
+        // a body nor contributed a name from the transfer. Resolve, lease
+        // and admit the destination now, then rejoin the shared finalize
+        // step. No second probe happens after selection.
+        if let JobTarget::Directory { directory, options } = &target {
+            let basename = resolve_directory_basename(&meta, &request.url, options);
+            if request.overwrite == OverwritePolicy::Rename {
+                // Shared candidate selection; the base name is the resolved
+                // sanitized basename.
+                let selection = select_rename_candidate(&RenameSelectionContext {
+                    parent: directory,
+                    base_name: std::ffi::OsStr::new(&basename),
+                    cap: options.max_filename_bytes,
+                    resume: request.resume,
+                    url: &request.url,
+                    durability: self.config.transfer.durability,
+                    resolver: self.checkpoint_resolver.as_ref(),
+                });
+                match selection {
+                    Ok(RenameSelection::Selected(selected)) => {
+                        request.destination = selected.destination.clone();
+                        let _ = resolved_destination.set(request.destination.clone());
+                        hub.emit(Event::DestinationResolved {
+                            path: request.destination.display().to_string(),
+                        })
+                        .await;
+                        prepared = Some(PreparedAdmission {
+                            lease: selected.lease,
+                            identity: selected.identity,
+                            store: selected.store,
+                            checkpoint: selected.checkpoint,
+                            admission_warnings: selected.admission_warnings,
+                        });
+                    }
+                    Ok(RenameSelection::Exhausted {
+                        required_checkpoint_missing,
+                    }) => {
+                        let error = if required_checkpoint_missing {
+                            DownloadError::Checkpoint("resume required but no checkpoint".into())
+                        } else {
+                            DownloadError::DestinationConflict(format!(
+                                "no available rename candidate in {}",
+                                directory.display()
+                            ))
+                        };
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            error,
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                meta.validators.clone(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            error,
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                meta.validators.clone(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                let final_path = directory.join(&basename);
+                // Directory FailIfExists checks the RESOLVED destination
+                // after the probe (the relaxed ordering) and still publishes
+                // atomically with no-replace.
+                if request.overwrite == OverwritePolicy::FailIfExists
+                    && std::fs::symlink_metadata(&final_path).is_ok()
+                {
+                    return Err(self.terminal_error(
+                        &state,
+                        &request,
+                        DownloadError::DestinationConflict(format!(
+                            "destination exists: {}",
+                            final_path.display()
+                        )),
+                        Self::sequential_accounting(
+                            &counters,
+                            None,
+                            Duration::ZERO,
+                            meta.validators.clone(),
+                            vec![],
+                        ),
+                        ArtifactDisposition::default(),
+                        CancelMode::from_u8(cancel_mode.load(std::sync::atomic::Ordering::SeqCst)),
+                    ));
+                }
+                let lease = match DestinationLease::acquire(&final_path) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            error,
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                meta.validators.clone(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    }
+                };
+                request.destination = final_path;
+                let _ = resolved_destination.set(request.destination.clone());
+                hub.emit(Event::DestinationResolved {
+                    path: request.destination.display().to_string(),
+                })
+                .await;
+                let identity =
+                    crate::resume::flow::job_identity(&request.url, &request.destination);
+                let resolve_context = CheckpointResolveContext::new(
+                    identity.clone(),
+                    request.destination.clone(),
+                    match self.config.transfer.durability {
+                        crate::config::DurabilityMode::Performance => StoreDurability::Performance,
+                        crate::config::DurabilityMode::Durable => StoreDurability::Durable,
+                    },
+                );
+                let selected = match self.checkpoint_resolver.resolve(&resolve_context) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            DownloadError::Checkpoint(e.to_string()),
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                meta.validators.clone(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    }
+                };
+                let store: Arc<dyn CheckpointStore> = Arc::new(
+                    crate::resume::coordinated_store::CoordinatedCheckpointStore::new(selected),
+                );
+                let pieces =
+                    match discover_admission_pieces(request.resume, &identity, store.as_ref()) {
+                        Ok(pieces) => pieces,
+                        Err(failure) => {
+                            Self::emit_resume_notices(&hub, &failure.notices).await;
+                            return Err(self.terminal_error(
+                                &state,
+                                &request,
+                                failure.error,
+                                Self::sequential_accounting(
+                                    &counters,
+                                    None,
+                                    Duration::ZERO,
+                                    meta.validators.clone(),
+                                    vec![],
+                                ),
+                                ArtifactDisposition::default(),
+                                CancelMode::from_u8(
+                                    cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                                ),
+                            ));
+                        }
+                    };
+                let (checkpoint, admission_warnings) = match pieces {
+                    AdmissionPieces::Resuming(cp) => (Some(*cp), vec![]),
+                    AdmissionPieces::Fresh { warnings } => (None, warnings),
+                    AdmissionPieces::RequiredMissing => {
+                        // Directory mode may already have probed: the
+                        // Required failure still reports the Checkpoint
+                        // category for the resolved destination.
+                        return Err(self.terminal_error(
+                            &state,
+                            &request,
+                            DownloadError::Checkpoint("resume required but no checkpoint".into()),
+                            Self::sequential_accounting(
+                                &counters,
+                                None,
+                                Duration::ZERO,
+                                meta.validators.clone(),
+                                vec![],
+                            ),
+                            ArtifactDisposition::default(),
+                            CancelMode::from_u8(
+                                cancel_mode.load(std::sync::atomic::Ordering::SeqCst),
+                            ),
+                        ));
+                    }
+                };
+                prepared = Some(PreparedAdmission {
+                    lease,
+                    identity,
+                    store,
+                    checkpoint,
+                    admission_warnings,
+                });
+            }
+        }
+        let Some(PreparedAdmission {
+            lease: _destination_lease,
+            identity,
+            store,
+            checkpoint,
+            admission_warnings,
+        }) = prepared
+        else {
+            unreachable!("every target prepared its destination before finalization");
+        };
+        let pending_admission = PendingAdmission::from_parts(
+            store.as_ref(),
+            &identity,
+            TempFileSpec::default().temp_path_for(&request.destination),
+            checkpoint,
+            admission_warnings,
+        );
         // ---- Resume admission, phase 2 (§15.5 steps 2-7) ----
         // One decision: generation safety first (never mixing, §26),
         // then temp-output plausibility, then continue/restart selection

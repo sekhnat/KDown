@@ -62,6 +62,17 @@ pub enum Event {
     Committed {
         path: String,
     },
+    /// The final destination path was resolved and leased (directory
+    /// targets and explicit-file `Rename` jobs). Emitted exactly once per
+    /// job, after selection and lease acquisition and before meaningful
+    /// transfer progress; existing explicit-file modes never emit it. A
+    /// lagging broadcast subscriber may miss this event:
+    /// `DownloadHandle::resolved_destination` is the reliable live lookup
+    /// after resolution. The resolved path may reveal server-supplied
+    /// naming metadata and is deliberately exposed to the caller.
+    DestinationResolved {
+        path: String,
+    },
     Warning {
         detail: String,
     },

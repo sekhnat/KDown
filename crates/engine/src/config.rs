@@ -43,6 +43,14 @@ pub enum OverwritePolicy {
     /// Resume existing partial output only when validator identity matches;
     /// final publication uses replacement semantics.
     ResumeIfMatching,
+    /// Opt-in automatic collision handling for explicit-file and directory
+    /// targets: never replace an existing entry. A free base name is taken
+    /// first; occupied names fall through to `stem (1).ext` … `stem (999).ext`
+    /// under a held destination lease, preferring resumable checkpointed
+    /// siblings. Publication is always atomic no-replace; an occupied name or
+    /// a late publication race fails with `DestinationConflict` instead of
+    /// overwriting.
+    Rename,
 }
 
 /// Whether a job may resume from persisted state (§7.2).

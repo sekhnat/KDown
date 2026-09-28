@@ -6,8 +6,10 @@
 //! must handle arbitrary input.
 
 use crate::http::filename_from_disposition;
+use crate::http::probe::{disposition_filename_candidates, ProbeMetadata};
 use crate::http::validators::parse_content_range;
 use crate::io::sanitize_filename;
+use crate::job::naming::{resolve_directory_basename, url_path_basename, DirectoryOptions};
 use crate::redact::Redactor;
 use crate::resume::checkpoint::Checkpoint;
 
@@ -37,13 +39,19 @@ pub fn fuzz_etag(data: &[u8]) {
     let _ = crate::http::validators::ResourceValidators::from_headers(Some(s), Some(s), Some(1024));
 }
 
-/// Fuzz target: Content-Disposition parsing + filename sanitization (§36.5).
+/// Fuzz target: Content-Disposition parsing + filename sanitization +
+/// automatic name resolution (§36.5, automatic-filename-resolution). The
+/// ordered disposition parsing, the portable sanitizer and the URL-candidate
+/// path containment must all hold for hostile input: no panics, one normal
+/// path component, byte limits honored.
 pub fn fuzz_content_disposition(data: &[u8]) {
     let Ok(s) = std::str::from_utf8(data) else {
         return;
     };
-    if let Some(name) = filename_from_disposition(Some(s)) {
-        let safe = sanitize_filename(&name);
+    // Structured parse: both hint slots stay sanitized-safe when resolved.
+    let (hint, plain) = disposition_filename_candidates(Some(s));
+    for raw in [hint.as_deref(), plain.as_deref()].into_iter().flatten() {
+        let safe = sanitize_filename(raw);
         assert!(!safe.contains('\0'));
         assert!(!safe.contains('/'));
         assert!(!safe.contains('\\'));
@@ -57,7 +65,52 @@ pub fn fuzz_content_disposition(data: &[u8]) {
         ));
         assert!(components.next().is_none());
         assert!(safe.len() <= crate::io::sanitize::MAX_FILENAME_LEN);
+        // The fallible sanitizer either rejects or produces the same
+        // containment invariants under any byte limit.
+        if let Some(fallible) = crate::io::sanitize::try_sanitize_filename(raw, safe.len()) {
+            let mut components = std::path::Path::new(&fallible).components();
+            assert!(matches!(
+                components.next(),
+                Some(std::path::Component::Normal(_))
+            ));
+            assert!(components.next().is_none());
+        }
     }
+    // Legacy single-hint extraction keeps working on the ordered parser.
+    if filename_from_disposition(Some(s)).is_some() {
+        assert!(hint.is_some() || plain.is_some());
+    }
+    // URL-candidate containment: the basename of a hostile URL must be
+    // separator-free and single-component after sanitization, and a
+    // resolved candidate (hints -> URLs -> fallback) is always safe under
+    // the directory cap.
+    let url = format!("http://host/{s}");
+    if let Some(basename) = url_path_basename(&url) {
+        assert!(!basename.contains("%2F"));
+        let sanitized = sanitize_filename(&basename);
+        assert!(!sanitized.is_empty());
+    }
+    let meta = ProbeMetadata {
+        filename_hint: hint,
+        plain_filename_hint: plain,
+        final_url: url.clone(),
+        ..ProbeMetadata::default()
+    };
+    let resolved = resolve_directory_basename(
+        &meta,
+        &url,
+        &DirectoryOptions {
+            fallback: "download".to_string(),
+            max_filename_bytes: crate::job::naming::MAX_FINAL_BASENAME_BYTES,
+        },
+    );
+    let mut components = std::path::Path::new(&resolved).components();
+    assert!(matches!(
+        components.next(),
+        Some(std::path::Component::Normal(_))
+    ));
+    assert!(components.next().is_none());
+    assert!(resolved.len() <= crate::job::naming::MAX_FINAL_BASENAME_BYTES);
 }
 
 /// Fuzz target: checkpoint files (§36.5).

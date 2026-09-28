@@ -16,6 +16,64 @@ use kdown_engine::{
     DownloadRequest, DownloadRunError, EngineConfig, EngineMetrics, FailureDomain, HttpTransport,
     ProgressSnapshot, Redactor, TransferAccounting,
 };
+
+/// Directory-target API proofs (automatic-filename-resolution): the
+/// explicit-file request stays exhaustively constructible, `Rename` is a
+/// matchable non-exhaustive variant, and the directory request/entry
+/// points are nameable with their builder options.
+#[test]
+fn directory_api_signature_proofs() {
+    // Unchanged explicit-file struct literal: adding no fields keeps
+    // exhaustive construction compiling (source compatibility).
+    let literal = DownloadRequest {
+        url: "https://example.test/f".to_string(),
+        destination: PathBuf::from("file.bin"),
+        headers: vec![],
+        expected_size: None,
+        integrity: kdown_engine::IntegrityPolicy::default(),
+        overwrite: OverwritePolicy::default(),
+        resume: ResumePolicy::default(),
+        authorization: None,
+        credential_provider: None,
+    };
+    let _ = literal;
+
+    // `OverwritePolicy::Rename` is matchable under the non_exhaustive enum.
+    match OverwritePolicy::Rename {
+        OverwritePolicy::Rename => {}
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    // Directory request construction, mutation and builders.
+    let mut request =
+        kdown_engine::DirectoryDownloadRequest::new("https://example.test/f", PathBuf::from("."));
+    request
+        .request_mut()
+        .headers
+        .push(("accept".to_string(), "*/*".to_string()));
+    let built =
+        kdown_engine::DirectoryDownloadRequest::new("https://example.test/f", PathBuf::from("."))
+            .with_fallback_filename("fallback.bin")
+            .with_max_filename_bytes(128);
+    let _ = built;
+
+    // Entry points exist with the file-API shapes (nameable without a
+    // running server).
+    fn entry_points(controller: &DownloadController, url: String, directory: PathBuf) {
+        let request = kdown_engine::DirectoryDownloadRequest::new(url, directory);
+        let _ = controller.start_to_directory(request);
+    }
+    let _ = entry_points as fn(&DownloadController, String, PathBuf);
+    fn futures(controller: &DownloadController, url: String, directory: PathBuf) {
+        // Nameable future types (the async entry points return concrete
+        // futures; drop them explicitly without awaiting).
+        let request = kdown_engine::DirectoryDownloadRequest::new(url.clone(), directory.clone());
+        drop(controller.run_to_directory(request));
+        let request = kdown_engine::DirectoryDownloadRequest::new(url, directory);
+        drop(controller.run_to_directory_with_handle(request));
+    }
+    let _ = futures as fn(&DownloadController, String, PathBuf);
+}
 // Observation type (pre-narrowing path; re-exported at the root after the
 // visibility change).
 use kdown_engine::JobState;

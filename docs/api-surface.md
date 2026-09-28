@@ -14,6 +14,8 @@ Consumers may rely on exactly the following paths.
 
 - `DownloadRequest`, `DownloadController`, `DownloadHandle`, `CancelMode`,
   `SingleStreamController` (deprecated alias)
+- `DirectoryDownloadRequest` (opt-in directory-target request; see also
+  `DownloadHandle::resolved_destination` and `Event::DestinationResolved`)
 - `CompletedDownload`, `DownloadRunError`, `TransferFailure`, `EngineFailure`,
   `CancellationSummary`, `TransferAccounting`, `ArtifactDisposition`
 - `DownloadError`, `ErrorCategory`, `Retryability`, `FailureDomain`
@@ -25,6 +27,22 @@ Consumers may rely on exactly the following paths.
   `ProgressSnapshot`
 - `JobState` (observation only: `DownloadHandle::state()`)
 - `Redactor`
+
+### Directory-target downloads and `Rename` (additive)
+
+`DirectoryDownloadRequest` wraps an ordinary `DownloadRequest` (mutate it via
+`request_mut()`), targets an existing directory, and resolves the final
+basename from the final HEAD `Content-Disposition` (`filename*` then
+`filename`), the final/original URL segment, or the validated fallback
+(default `download`, default byte cap 250). Controllers expose
+`start_to_directory`, `run_to_directory`, and `run_to_directory_with_handle`;
+`OverwritePolicy::Rename` opts into automatic collision handling (base name
+then `stem (1).ext` … `stem (999).ext`, always atomic no-replace) for both
+target forms. Directory targets probe first and lease/admit the resolved
+destination afterward; explicit-file targets — including `Rename` — keep
+lease/admission before any networking. `Event::DestinationResolved` is
+emitted once for directory and `Rename` jobs after lease acquisition;
+`DownloadHandle::resolved_destination()` is the lag-safe lookup.
 
 ### Public modules
 

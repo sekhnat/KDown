@@ -74,5 +74,7 @@ mod sink_fault_tests;
 #[path = "../../tests/platform_lease_tests.rs"]
 mod platform_lease_tests;
 
+#[path = "../../tests/directory_resolution_tests.rs"]
+mod directory_resolution_tests;
 #[path = "../../tests/regression_tests.rs"]
 mod regression_tests;

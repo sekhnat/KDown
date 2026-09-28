@@ -209,6 +209,50 @@ pub(crate) fn begin_admission<'a>(
     temp_path: PathBuf,
     store: &'a dyn CheckpointStore,
 ) -> Result<PendingAdmission<'a>, ResumeFailure> {
+    let (checkpoint, warnings) = match discover_admission_pieces(resume, identity, store)? {
+        AdmissionPieces::Resuming(cp) => (Some(*cp), vec![]),
+        AdmissionPieces::Fresh { warnings } => (None, warnings),
+        AdmissionPieces::RequiredMissing => {
+            return Err(ResumeFailure {
+                error: DownloadError::Checkpoint("resume required but no checkpoint".into()),
+                notices: vec![],
+            });
+        }
+    };
+    Ok(PendingAdmission::from_parts(
+        store, identity, temp_path, checkpoint, warnings,
+    ))
+}
+
+/// Structural admission outcome shared by the begin/discover variants and
+/// the controller: the loaded checkpoint (when reusable) plus any
+/// corrupt-restart warnings, or the Required-without-checkpoint state.
+/// Absence is reported structurally — never by parsing an error string.
+#[derive(Debug)]
+pub(crate) enum AdmissionPieces {
+    /// No reusable checkpoint: restart from zero with these warnings
+    /// (corrupt-state cleanup under `Allowed` produces one).
+    Fresh { warnings: Vec<String> },
+    /// A structurally valid checkpoint was loaded and must be finalized
+    /// exactly once against the probe validators.
+    Resuming(Box<Checkpoint>),
+    /// `ResumePolicy::Required` found no checkpoint at all.
+    RequiredMissing,
+}
+
+/// Load the structural admission pieces for one identity (§15.5 step 1,
+/// §7.2). Corrupt-state policy is unchanged: `Allowed` deletes the state
+/// (cleanup failure stays fatal, fail closed) and restarts with a warning;
+/// `Required` load errors stay fatal.
+///
+/// # Errors
+/// [`ResumeFailure`] when unusable state cannot be cleaned up (fail
+/// closed) or a Required checkpoint is present but unreadable.
+pub(crate) fn discover_admission_pieces(
+    resume: ResumePolicy,
+    identity: &str,
+    store: &dyn CheckpointStore,
+) -> Result<AdmissionPieces, ResumeFailure> {
     let checkpoint = match resume {
         // Resume disabled: never read or disturb persisted state (§7.2).
         ResumePolicy::Never => None,
@@ -219,33 +263,56 @@ pub(crate) fn begin_admission<'a>(
             // failure is fatal (fail closed).
             Err(e) => {
                 delete_restart_state(store, identity)?;
-                return Ok(PendingAdmission::fresh(
-                    store,
-                    identity,
-                    temp_path,
-                    vec![format!("checkpoint unusable ({e}); restarting from zero")],
-                ));
+                return Ok(AdmissionPieces::Fresh {
+                    warnings: vec![format!("checkpoint unusable ({e}); restarting from zero")],
+                });
             }
         },
         ResumePolicy::Required => match store.load(identity)? {
             Some(cp) => Some(cp),
-            None => {
-                return Err(ResumeFailure {
-                    error: DownloadError::Checkpoint("resume required but no checkpoint".into()),
-                    notices: vec![],
-                });
-            }
+            None => return Ok(AdmissionPieces::RequiredMissing),
         },
     };
     Ok(match checkpoint {
-        Some(cp) => PendingAdmission {
-            store,
-            identity: identity.to_string(),
-            temp_path,
-            warnings: vec![],
-            checkpoint: Some(cp),
-        },
-        None => PendingAdmission::fresh(store, identity, temp_path, vec![]),
+        Some(cp) => AdmissionPieces::Resuming(Box::new(cp)),
+        None => AdmissionPieces::Fresh { warnings: vec![] },
+    })
+}
+
+/// Structural Rename-candidate discovery (§15.5 step 1, automatic-
+/// filename-resolution): only *absence* distinguishes candidates during
+/// the resume-first scan; every other failure is fatal. Absence carries
+/// any corrupt-restart warnings so a selected candidate keeps the
+/// existing admission warnings.
+#[derive(Debug)]
+pub(crate) enum AdmissionDiscovery {
+    /// No persisted checkpoint exists for this candidate identity.
+    Absent { warnings: Vec<String> },
+    /// A loadable checkpoint was found; the caller retains it and
+    /// finalizes admission against the probe validators later.
+    Found(Box<Checkpoint>),
+}
+
+/// Discovery variant of [`begin_admission`] for Rename candidate
+/// scanning: `ResumePolicy::Required` absence yields
+/// [`AdmissionDiscovery::Absent`] (the scan continues to the next
+/// candidate) instead of the begin_admission rejection, while corrupt-
+/// state policy is unchanged — Allowed deletes and continues, a cleanup
+/// failure stays fatal, and Required load errors stay fatal. The scan
+/// caller must retain the discovered checkpoint and admit it exactly once.
+///
+/// # Errors
+/// [`ResumeFailure`] when unusable state cannot be cleaned up (fail
+/// closed) or a Required checkpoint is present but unreadable.
+pub(crate) fn discover_admission(
+    resume: ResumePolicy,
+    identity: &str,
+    store: &dyn CheckpointStore,
+) -> Result<AdmissionDiscovery, ResumeFailure> {
+    Ok(match discover_admission_pieces(resume, identity, store)? {
+        AdmissionPieces::Resuming(cp) => AdmissionDiscovery::Found(cp),
+        AdmissionPieces::Fresh { warnings } => AdmissionDiscovery::Absent { warnings },
+        AdmissionPieces::RequiredMissing => AdmissionDiscovery::Absent { warnings: vec![] },
     })
 }
 
@@ -283,6 +350,29 @@ impl<'a> PendingAdmission<'a> {
             temp_path,
             warnings,
             checkpoint: None,
+        }
+    }
+
+    /// Build a pending admission from Rename candidate discovery: the
+    /// store, identity and loaded checkpoint are bound together so the
+    /// selected candidate is never loaded or admitted twice.
+    /// Build a pending admission from decided destination pieces: the
+    /// store, identity, loaded checkpoint (when any) and corrupt-restart
+    /// warnings are bound together so the selected destination is never
+    /// loaded or admitted twice.
+    pub(crate) fn from_parts(
+        store: &'a dyn CheckpointStore,
+        identity: &str,
+        temp_path: PathBuf,
+        checkpoint: Option<Checkpoint>,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            store,
+            identity: identity.to_string(),
+            temp_path,
+            warnings,
+            checkpoint,
         }
     }
 
@@ -879,5 +969,71 @@ mod tests {
         assert!(plan.is_resuming());
         assert_eq!(plan.sequential().offset, 1000);
         assert!(store.deleted_identities().is_empty());
+    }
+
+    #[test]
+    fn discovery_required_absence_is_absent_not_failure() {
+        let store = FakeStore::absent();
+        let discovered = discover_admission(ResumePolicy::Required, "identity", &store)
+            .expect("absence is not a scan failure");
+        assert!(matches!(discovered, AdmissionDiscovery::Absent { .. }));
+        // begin_admission, by contrast, still rejects Required absence.
+        assert!(begin(ResumePolicy::Required, &store, Path::new("/x")).is_err());
+    }
+
+    #[test]
+    fn discovery_finds_holding_checkpoints_for_allowed_and_required() {
+        for policy in [ResumePolicy::Allowed, ResumePolicy::Required] {
+            let store = FakeStore::holding(sample_cp("\"v\"", &[(0, 499)]));
+            let discovered = discover_admission(policy, "identity", &store).expect("found");
+            match discovered {
+                AdmissionDiscovery::Found(cp) => {
+                    assert!(!cp.completed_ranges.is_empty());
+                }
+                AdmissionDiscovery::Absent { .. } => panic!("checkpoint must be found"),
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_never_reads_state() {
+        let store = FakeStore::holding(sample_cp("\"v\"", &[(0, 499)]));
+        let discovered =
+            discover_admission(ResumePolicy::Never, "identity", &store).expect("absent");
+        assert!(matches!(discovered, AdmissionDiscovery::Absent { .. }));
+        assert_eq!(store.loads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn discovery_corrupt_allowed_deletes_and_reports_absent() {
+        let store = FakeStore {
+            load: Err(CheckpointError::Corrupt("bad json".into())),
+            delete: Ok(()),
+            loads: std::sync::atomic::AtomicU32::new(0),
+            deletes: std::sync::Mutex::new(vec![]),
+        };
+        let discovered =
+            discover_admission(ResumePolicy::Allowed, "identity", &store).expect("absent");
+        assert!(matches!(discovered, AdmissionDiscovery::Absent { .. }));
+        assert_eq!(store.deleted_identities(), vec!["identity".to_string()]);
+    }
+
+    #[test]
+    fn discovery_keeps_fatal_checkpoint_failures() {
+        // A Required checkpoint that is present but unreadable stays fatal.
+        let unreadable = FakeStore {
+            load: Err(CheckpointError::Corrupt("bad json".into())),
+            delete: Ok(()),
+            loads: std::sync::atomic::AtomicU32::new(0),
+            deletes: std::sync::Mutex::new(vec![]),
+        };
+        assert!(discover_admission(ResumePolicy::Required, "identity", &unreadable).is_err());
+        // Allowed corrupt state whose cleanup fails stays fatal (fail closed).
+        assert!(discover_admission(
+            ResumePolicy::Allowed,
+            "identity",
+            &FakeStore::corrupt_and_delete_fails()
+        )
+        .is_err());
     }
 }

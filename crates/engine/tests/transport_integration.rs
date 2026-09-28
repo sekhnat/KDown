@@ -722,3 +722,55 @@ async fn semantic_transfer_body_overrun_rejected_before_offending_chunk() {
         "no chunk past the accepted range may arrive"
     );
 }
+
+/// The HEAD probe decodes ONLY the Content-Disposition header lossily from
+/// non-UTF-8 transport bytes: a raw non-UTF-8 ordinary `filename` survives
+/// (lossy-replaced) while a malformed `filename*` extension is skipped, and
+/// unrelated headers keep their strict UTF-8-or-empty interpretation
+/// (automatic-filename-resolution).
+#[tokio::test]
+async fn head_content_disposition_decodes_lossily() {
+    // Raw socket: ScriptedResponse headers are String-typed, so non-UTF-8
+    // header bytes need protocol-level control.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 4096];
+        // Drain the request head before answering.
+        let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+        let mut response: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
+        let mut disposition =
+            b"attachment; filename*=UTF-8''%ZZ; filename=\"caf\xE9.txt\"".to_vec();
+        response.extend_from_slice(b"content-disposition: ");
+        response.append(&mut disposition);
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(b"content-length: 4\r\n\r\n");
+        tokio::io::AsyncWriteExt::write_all(&mut socket, &response)
+            .await
+            .expect("write");
+        tokio::io::AsyncWriteExt::shutdown(&mut socket)
+            .await
+            .expect("flush");
+    });
+
+    let outcome = executor()
+        .probe(
+            ProbeRequest {
+                spec: spec(&format!("http://{addr}/file")),
+                segmentation_threshold: u64::MAX,
+                verify_range_support: false,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("probe");
+    server.await.expect("server task");
+    let meta = outcome.metadata;
+    // The raw 0xE9 byte is lossily replaced; the malformed `%ZZ` extended
+    // value is skipped so the ordinary filename wins.
+    assert_eq!(meta.filename_hint.as_deref(), Some("caf\u{FFFD}.txt"));
+    assert_eq!(meta.plain_filename_hint.as_deref(), Some("caf\u{FFFD}.txt"));
+}

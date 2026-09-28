@@ -5,6 +5,38 @@ All notable changes to KDown Engine are documented here.
 ## [Unreleased]
 
 ### Added
+
+### Added (automatic-filename-resolution)
+
+- Directory-target downloads (opt-in): `DirectoryDownloadRequest` with
+  `request_mut()`, `with_fallback_filename` and `with_max_filename_bytes`, plus
+  `DownloadController::{start_to_directory, run_to_directory,
+  run_to_directory_with_handle}`. The final basename resolves from the final
+  HEAD `Content-Disposition` (`filename*` then `filename`), the final/original
+  URL segment, or the validated fallback (`download`, byte cap 250), sanitized
+  portably into a single normal component beneath the caller's directory.
+- `OverwritePolicy::Rename` (non-exhaustive additive variant): automatic
+  collision handling for explicit-file and directory targets — base name then
+  `stem (1).ext` … `stem (999).ext`, checkpoint-first resumable sibling
+  discovery, destination-lease protection and atomic no-replace publication.
+- `DownloadHandle::resolved_destination()` and `Event::DestinationResolved`: a
+  lag-safe accessor and a once-per-job event for directory and `Rename` jobs,
+  emitted after selection and lease acquisition and before transfer progress.
+- Ordered bounded `Content-Disposition` parsing (quoted-string/quoted-pair and
+  RFC 5987 `filename*` aware) with a plain-filename fallback hint; the HEAD
+  probe decodes only that header lossily so raw non-UTF-8 filenames survive;
+  extended fuzz coverage includes URL-name containment.
+
+### Changed (automatic-filename-resolution)
+
+- Filename sanitization is stricter and portable: Windows-illegal punctuation
+  (`< > : " | ? *`) is replaced per character (a drive-like prefix is no longer
+  stripped), Windows-invalid trailing spaces/periods are trimmed, reserved
+  device names include the superscript `COM¹`–`COM³`/`LPT¹`–`LPT³` spellings,
+  and truncation re-validates the result. The regression-corpus expectation
+  for an embedded `*` changed accordingly. The sanitizer stays crate-internal,
+  so this is not a breaking change for external consumers.
+
 - Release-evidence gate: `release/evidence-manifest.json` declares the gates a
   production-stable verdict needs (three-OS correctness/durability, resource
   bound, interoperability, scheduled fuzz/stress, dependency audit, targeted

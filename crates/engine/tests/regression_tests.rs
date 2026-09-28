@@ -231,7 +231,9 @@ fn regression_2026_09_27_fuzzer_dotdot_component_not_traversal() {
     let name =
         crate::http::probe::filename_from_disposition(Some(header)).expect("filename is present");
     let safe = crate::io::sanitize_filename(&name);
-    assert_eq!(safe, "..*etcmensswd");
+    // The portable sanitizer replaces Windows-illegal `*` per character;
+    // the component-safety property of this regression is unchanged.
+    assert_eq!(safe, ".._etcmensswd");
     let mut components = std::path::Path::new(&safe).components();
     assert!(matches!(
         components.next(),

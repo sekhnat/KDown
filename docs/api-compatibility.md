@@ -17,10 +17,11 @@ From this cleanup forward, the crate follows SemVer:
 - **PATCH**: bug fixes, performance work, documentation.
 
 ### Exhaustiveness
-
 The expansion-prone public enums are `#[non_exhaustive]`: `DownloadRunError`,
-`ErrorCategory`, `FailureDomain`, `Retryability` and `Event`. Callers must
-handle an unknown-variant arm for these, so adding a variant is a MINOR change.
+`ErrorCategory`, `FailureDomain`, `Retryability`, `Event`, `OverwritePolicy`
+and `ResumePolicy`. Callers must handle an unknown-variant arm for these, so
+adding a variant is a MINOR change (`OverwritePolicy::Rename` in the
+automatic-filename-resolution change was one such addition).
 
 `CancelMode` and `JobState` are exhaustive as shipped: adding a variant to
 either is a MAJOR (breaking) change unless it first gains `#[non_exhaustive]`
