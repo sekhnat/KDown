@@ -527,7 +527,7 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
     // MemoryCapExceeded refusals on legitimate deliveries.
     let mut cfg = EngineConfig {
         transfer_memory: TransferMemoryConfig {
-            aggregate_max_bytes: 2 * 1024 * 1024,
+            aggregate_max_bytes: 4 * 1024 * 1024,
             job_max_bytes: 512 * 1024,
             network_ingress_max_bytes: 512 * 1024,
             frames_max_bytes: 512 * 1024,
@@ -548,7 +548,9 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
     };
     cfg.read_buffer_size = 64 * 1024;
     // The connection-ingress carve-out (4 × 128 KiB footprint) plus one
-    // job cap must fit the aggregate (validated): cap the connections.
+    // The connection-ingress carve-out (4 × 576 KiB footprint: the 512 KiB
+    // window + 64 KiB header allowance) plus one job cap must fit the
+    // aggregate (validated): cap the connections.
     cfg.max_connections_total = 4;
     cfg.max_connections_per_origin = 4;
     cfg.pool.max_total = 4;

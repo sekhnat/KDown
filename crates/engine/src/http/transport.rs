@@ -181,14 +181,19 @@ impl IngressProfile {
     /// allowance, so the reservation covers whatever ALPN negotiates.
     #[must_use]
     pub(crate) fn from_config(cfg: &EngineConfig) -> Self {
-        const INGRESS_WINDOW_CAP: u64 = 128 * 1024;
+        use crate::config::INGRESS_WINDOW_CAP;
         const MAX_HEADER_LIST_BYTES: u64 = 64 * 1024;
         let ingress_max = cfg.transfer_memory.network_ingress_max_bytes;
         let frame = u64::from(cfg.read_buffer_size);
         let window = INGRESS_WINDOW_CAP.min(ingress_max);
         let h1_buf = frame.min(ingress_max);
         let http2_connection_window = window;
-        let http2_stream_window = window.min(frame);
+        // Per-stream credit tracks the connection ceiling: the
+        // connection-level window bounds the connection's total buffered
+        // ingress (the ledger footprint), so a separate read-buffer
+        // coupling would re-cap every stream at window/RTT and throttle
+        // single-stream WAN transfers.
+        let http2_stream_window = window;
         let http2_max_header_list = MAX_HEADER_LIST_BYTES.min(ingress_max);
         let http1_footprint = h1_buf + http2_max_header_list;
         let http2_footprint = http2_connection_window + http2_max_header_list;

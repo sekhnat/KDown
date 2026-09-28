@@ -24,16 +24,17 @@ use kdown_engine::{
 async fn ingress_profile_derives_from_transfer_memory_config() {
     let cfg = EngineConfig::default();
     let profile = crate::http::transport::IngressProfile::from_config(&cfg);
-    // Defaults: 128 KiB frame quantum and windows, 64 KiB header ceiling,
-    // footprint = window + header metadata.
+    // Defaults: 128 KiB h1 frame, 2 MiB h2 flow-control windows (WAN
+    // realistic: window/RTT governs single-connection throughput),
+    // 64 KiB header ceiling; footprint = window + header metadata.
     assert_eq!(profile.http1_read_buf_exact, 128 * 1024);
     assert_eq!(profile.http1_max_buf, 128 * 1024);
-    assert_eq!(profile.http2_connection_window, 128 * 1024);
-    assert_eq!(profile.http2_stream_window, 128 * 1024);
+    assert_eq!(profile.http2_connection_window, 2 * 1024 * 1024);
+    assert_eq!(profile.http2_stream_window, 2 * 1024 * 1024);
     assert_eq!(profile.http2_max_header_list, 64 * 1024);
     assert_eq!(
         profile.connection_footprint,
-        128 * 1024 + 64 * 1024,
+        2 * 1024 * 1024 + 64 * 1024,
         "worst-case footprint: window/buffer + header allowance"
     );
 
@@ -44,7 +45,7 @@ async fn ingress_profile_derives_from_transfer_memory_config() {
     let profile = crate::http::transport::IngressProfile::from_config(&small);
     assert_eq!(profile.http1_read_buf_exact, 16 * 1024);
     assert_eq!(profile.http2_connection_window, 64 * 1024);
-    assert_eq!(profile.http2_stream_window, 16 * 1024);
+    assert_eq!(profile.http2_stream_window, 64 * 1024);
     assert_eq!(profile.http2_max_header_list, 64 * 1024);
     assert_eq!(profile.connection_footprint, 64 * 1024 + 64 * 1024);
 

@@ -23,6 +23,15 @@ fn invalid(field: &'static str, reason: impl Into<String>) -> ConfigurationError
     }
 }
 
+/// Bounded HTTP/2 flow-control ceiling (design D3, task 3.3): the largest
+/// connection/stream receive window the transport advertises. WAN-realistic
+/// throughput needs bytes-in-flight ≈ bandwidth × RTT — a 128 KiB window
+/// caps one connection at window/RTT (a few MB/s on typical CDN RTTs), a
+/// cap no number of multiplexed streams can exceed. The per-connection
+/// ingress footprint reserves exactly this worst case from the transfer
+/// ledger, so the bound stays memory-accounted end to end.
+pub(crate) const INGRESS_WINDOW_CAP: u64 = 2 * 1024 * 1024;
+
 /// Policy for handling an existing destination at final publication (§14.6).
 ///
 /// `FailIfExists` is rejected early when the destination exists and is enforced
@@ -314,9 +323,14 @@ pub struct TransferMemoryConfig {
 impl Default for TransferMemoryConfig {
     fn default() -> Self {
         Self {
-            aggregate_max_bytes: 64 * 1024 * 1024,
+            // WAN-realistic defaults: the h2 flow-control windows scale
+            // from INGRESS_WINDOW_CAP (2 MiB), so the worst-case
+            // connection reserve is 256 × (2 MiB + 64 KiB) ≈ 528 MiB.
+            // This bounds the GUARANTEE, not actual usage — real
+            // buffered ingress stays at in-flight data.
+            aggregate_max_bytes: 1024 * 1024 * 1024,
             job_max_bytes: 8 * 1024 * 1024,
-            network_ingress_max_bytes: 1024 * 1024,
+            network_ingress_max_bytes: 8 * 1024 * 1024,
             frames_max_bytes: 2 * 1024 * 1024,
             writer_max_bytes: 2 * 1024 * 1024,
             checkpoint_max_bytes: 1024 * 1024,
@@ -326,8 +340,8 @@ impl Default for TransferMemoryConfig {
 
 impl TransferMemoryConfig {
     /// Worst-case buffered-ingress footprint of ONE transport connection
-    /// (design D3, task 3.3): the bounded ingress window (or HTTP/1 read
-    /// buffer, the smaller bound here) plus the response-header metadata
+    /// (design D3, task 3.3): the flow-control window (or HTTP/1 read
+    /// buffer, whichever is larger) plus the response-header metadata
     /// allowance. `read_buffer_size` in bytes.
     ///
     /// The engine reserves `max_connections_total` of these out of the
@@ -335,7 +349,7 @@ impl TransferMemoryConfig {
     /// footprint is known and accounted BEFORE any connection exists.
     #[must_use]
     pub fn connection_ingress_footprint(&self, read_buffer_size: u32) -> u64 {
-        const INGRESS_WINDOW_CAP: u64 = 128 * 1024;
+        // Module-level ceiling shared with the transport's ingress profile.
         const MAX_HEADER_LIST_BYTES: u64 = 64 * 1024;
         let frame = u64::from(read_buffer_size);
         let window = INGRESS_WINDOW_CAP.min(self.network_ingress_max_bytes);
