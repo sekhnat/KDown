@@ -1,4 +1,5 @@
 /target
+@fuzz/target/
 /artifacts
 __pycache__/
 crates/engine/benches/results/suite/pr-smoke/
