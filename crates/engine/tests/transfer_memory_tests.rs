@@ -474,8 +474,8 @@ fn rss_kib() -> Option<u64> {
 /// runtime stacks) rather than folded into the managed numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
-    // Paced server: 64 KiB every 20 ms per connection — slow enough that
-    // sampling catches the pipeline mid-flight across many jobs.
+    // Paced server: 128 KiB every 20 ms per connection — large enough to
+    // exercise coalesced frames while sampling the pipeline across many jobs.
     let content = Arc::new(vec![0x44_u8; 512 * 1024]);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -508,7 +508,7 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
                     )
                     .await
                     .ok();
-                for chunk in content.chunks(64 * 1024) {
+                for chunk in content.chunks(128 * 1024) {
                     if socket.write_all(chunk).await.is_err() {
                         return;
                     }
@@ -519,19 +519,19 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
         }
     });
 
-    // Caps sized for the transport's actual delivery granularity: hyper may
-    // hand over a coalesced multi-chunk body frame (a 120 KiB atomic chunk
-    // was observed on CI at 64 KiB write pacing), and the ledger refuses an
-    // atomic frame that cannot fit its component cap. The pipeline stays
-    // oversubscribed (8 × 512 KiB job caps over a 2 MiB aggregate) while
-    // never refusing a legitimate single delivery.
+    // The test bounds a 512 KiB response, not individual transport frames:
+    // hyper can coalesce the paced 128 KiB writes into larger body frames.
+    // Every component that holds an atomic frame (including the writer) must
+    // admit the entire bounded response while eight job caps still exceed the
+    // shared 2 MiB aggregate cap. A smaller writer cap caused CI-only
+    // MemoryCapExceeded refusals on legitimate deliveries.
     let mut cfg = EngineConfig {
         transfer_memory: TransferMemoryConfig {
             aggregate_max_bytes: 2 * 1024 * 1024,
             job_max_bytes: 512 * 1024,
             network_ingress_max_bytes: 512 * 1024,
             frames_max_bytes: 512 * 1024,
-            writer_max_bytes: 64 * 1024,
+            writer_max_bytes: 512 * 1024,
             checkpoint_max_bytes: 64 * 1024,
         },
         // Legacy budgets subordinate to the new caps.
@@ -554,12 +554,6 @@ async fn adversarial_multi_job_profile_respects_caps_with_rss_observed() {
     cfg.pool.max_total = 4;
     cfg.pool.max_per_origin = 4;
     cfg.checkpoint_flush_interval = std::time::Duration::from_millis(50);
-    // The connection-ingress carve-out (4 x 128 KiB) plus one job cap must
-    // fit the aggregate (validated): cap the connection count.
-    cfg.max_connections_total = 4;
-    cfg.max_connections_per_origin = 4;
-    cfg.pool.max_total = 4;
-    cfg.pool.max_per_origin = 4;
     let transport = kdown_engine::HttpTransport::from_config(&cfg).expect("transport");
     let ledger = transport.ledger();
     let aggregate_cap = ledger.aggregate_cap();
