@@ -50,8 +50,24 @@ export const legalActions: Record<UiStatus, readonly JobAction[]> = {
   Completed: ['reveal', 'remove'],
 }
 
-/** The engine snapshot is authoritative for live states. */
+/**
+ * Durable states a user (or the host) commanded directly. They win over
+ * engine snapshot labels: the engine's cooperative pause can leave its own
+ * state at Running until workers notice, and a terminal snapshot label
+ * must never outshine the durable verdict.
+ */
+const durableWins: ReadonlySet<string> = new Set([
+  'Paused',
+  'Completed',
+  'Cancelled',
+  'Failed',
+])
+
+/** The engine snapshot is authoritative for live Active-run states. */
 export function displayStatus(job: JobView): UiStatus {
+  if (durableWins.has(job.status)) {
+    return job.status as UiStatus
+  }
   const label = job.snapshot?.stateLabel
   if (label && label in legalActions) {
     return label as UiStatus

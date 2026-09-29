@@ -501,11 +501,16 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
         self.registry
             .compare_and_set_desired(job_id, expected, DesiredState::Paused)
             .await?;
-        if let Some(run) = self.active.get(&job_id) {
+        if let Some(run) = self.active.get_mut(&job_id) {
             run.handle.pause()?;
             self.registry
                 .mark_status(job_id, DurableJobStatus::Paused)
                 .await?;
+            // The sampler broadcasts from this record; a stale launch-time
+            // capture would flip the UI back to a pre-pause state.
+            if let Ok(fresh) = self.registry.load_job(job_id).await {
+                run.job = fresh;
+            }
         }
         self.broadcast_record(job_id).await;
         let job = self.registry.load_job(job_id).await?;
@@ -525,11 +530,14 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
         self.registry
             .compare_and_set_desired(job_id, expected, DesiredState::Running)
             .await?;
-        if let Some(run) = self.active.get(&job_id) {
+        if let Some(run) = self.active.get_mut(&job_id) {
             run.handle.resume_now()?;
             self.registry
                 .mark_status(job_id, DurableJobStatus::Active)
                 .await?;
+            if let Ok(fresh) = self.registry.load_job(job_id).await {
+                run.job = fresh;
+            }
         }
         self.broadcast_record(job_id).await;
         let job = self.registry.load_job(job_id).await?;
@@ -602,7 +610,11 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
 
     /// Records a terminal attempt outcome and promotes queued jobs.
     async fn finalize(&mut self, job_id: JobId, attempt_id: AttemptId, outcome: EngineOutcome) {
-        self.active.remove(&job_id);
+        // Capture the resolved destination while the handle still exists.
+        let final_path = self
+            .active
+            .get(&job_id)
+            .and_then(|run| run.handle.resolved_destination());
         let attempt_outcome = match outcome {
             EngineOutcome::Completed => {
                 // Metrics come from the final handle snapshot, which the
@@ -621,13 +633,17 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
         };
         if self
             .registry
-            .finish_attempt(attempt_id, attempt_outcome)
+            .finish_attempt_with_path(attempt_id, attempt_outcome, final_path)
             .await
             .is_err()
         {
             // Already finished (duplicate completion): keep current state.
         }
+        if let Some(run) = self.active.get_mut(&job_id) {
+            run.seq = run.seq.saturating_add(1);
+        }
         self.broadcast_record(job_id).await;
+        self.active.remove(&job_id);
         self.promote_queued().await;
     }
 

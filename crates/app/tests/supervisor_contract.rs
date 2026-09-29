@@ -237,6 +237,109 @@ async fn symlink_swap_after_enqueue_fails_launch_closed() {
     }
 }
 
+#[tokio::test]
+async fn terminal_event_advances_past_last_active_snapshot() {
+    let fixture = SupervisorFixture::new(1).await;
+    let job = fixture.enqueue(fixture.intent()).await.unwrap();
+    let observed = fixture.launcher.next_launch().await;
+
+    let active_seq = {
+        let mut found = None;
+        for _ in 0..200 {
+            found = fixture
+                .events_for(job.id)
+                .into_iter()
+                .filter(|view| view.status == DurableJobStatus::Active && view.sample_seq > 0)
+                .map(|view| view.sample_seq)
+                .max();
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        found.expect("active snapshot with a positive sequence")
+    };
+
+    fixture
+        .launcher
+        .complete(observed, EngineOutcome::Cancelled)
+        .await;
+    fixture
+        .wait_for_status(job.id, DurableJobStatus::Cancelled)
+        .await;
+
+    let terminal = {
+        let mut found = None;
+        for _ in 0..200 {
+            found = fixture
+                .events_for(job.id)
+                .into_iter()
+                .find(|view| view.status == DurableJobStatus::Cancelled);
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        found.expect("cancelled terminal snapshot")
+    };
+
+    assert!(
+        terminal.sample_seq > active_seq,
+        "terminal sequence {} did not advance past active sequence {active_seq}",
+        terminal.sample_seq
+    );
+}
+
 fn fixture_signed_url() -> &'static str {
     SIGNED_URL
+}
+
+/// A pause must keep flowing through subsequent samples: the sampler
+/// broadcasts the CURRENT durable record, not the launch-time capture, so
+/// the UI never flaps back to a pre-pause state.
+#[tokio::test]
+async fn paused_samples_carry_the_paused_durable_status() {
+    let fixture = SupervisorFixture::new(1).await;
+    let job = fixture.enqueue(fixture.intent()).await.unwrap();
+
+    let pre_pause_max_seq = {
+        let mut found = 0u64;
+        for _ in 0..200 {
+            found = fixture
+                .events_for(job.id)
+                .into_iter()
+                .filter(|view| view.status == DurableJobStatus::Active && view.sample_seq > 0)
+                .map(|view| view.sample_seq)
+                .max()
+                .unwrap_or(found);
+            if found > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        found
+    };
+    assert!(pre_pause_max_seq > 0, "no active sample observed");
+
+    let current = fixture.registry.load_job(job.id).await.unwrap();
+    let view = fixture
+        .handle
+        .pause(job.id, current.control_version)
+        .await
+        .unwrap();
+    assert_eq!(view.status, DurableJobStatus::Paused);
+
+    // Give the sampler at least two 250ms ticks after the pause.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let paused_samples = fixture
+        .events_for(job.id)
+        .into_iter()
+        .filter(|view| {
+            view.status == DurableJobStatus::Paused && view.sample_seq > pre_pause_max_seq
+        })
+        .count();
+    assert!(
+        paused_samples >= 1,
+        "no post-pause sample carried the Paused status (pre_pause_max_seq={pre_pause_max_seq})"
+    );
 }

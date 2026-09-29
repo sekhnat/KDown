@@ -6,6 +6,18 @@ All notable changes to KDown Engine are documented here.
 
 ### Added
 
+- **Local web download manager (`kdown-app serve`)**: a loopback-only host
+  serving a bundled dark-mode single-page UI — first-run download-folder
+  setup, a live dashboard with SSE-driven telemetry (received bytes, wire
+  rate, elapsed time), a new-download drawer with conflict-policy choice,
+  pause/resume/cancel with explicit artifact handling (keep partial,
+  delete partial, keep file discard checkpoint), retry, reveal, history
+  with filters and cursor pagination, root and transfer-limit settings,
+  and desktop notifications. Interrupted downloads recover automatically
+  on the next start. The API enforces same-origin + CSRF on every mutation,
+  loopback-only binding, redacted job payloads, and a strict CSP. Linux
+  only; see docs/web-ui.md and docs/security-local-ui.md.
+
 ### Fixed
 
 - HTTP/2 flow-control windows no longer throttle WAN transfers: the

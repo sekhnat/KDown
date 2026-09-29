@@ -137,7 +137,10 @@ async fn security_headers(
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self'; \
+            // style-src allows inline styles: the SPA sets presentation
+            // styles through React's style attribute, which is not a
+            // script-injection vector. Scripts stay 'self'-only.
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
              img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
              base-uri 'none'; form-action 'self'",
         ),

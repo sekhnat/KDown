@@ -8,9 +8,10 @@ use clap::Parser;
 use kdown_app::api::AppState;
 use kdown_app::cli::{validate_listen, Cli};
 use kdown_app::engine_adapter::KdownEngineLauncher;
+use kdown_app::events::EventBroker;
 use kdown_app::path_policy::PathPolicy;
 use kdown_app::registry::Registry;
-use kdown_app::supervisor::{spawn_supervisor, RecoveryPlanner, SupervisorLimits};
+use kdown_app::supervisor::{spawn_supervisor_with_broker, RecoveryPlanner, SupervisorLimits};
 
 fn default_state_dir() -> PathBuf {
     if let Some(state) = dirs::state_dir() {
@@ -58,7 +59,10 @@ async fn run_serve(
 
     let settings = registry.load_settings().await?;
     let policy = PathPolicy::new(registry.clone());
-    let supervisor = spawn_supervisor(
+    // One shared broker: the supervisor publishes, /api/v1/events serves.
+    let broker = EventBroker::new(256);
+    let supervisor = spawn_supervisor_with_broker(
+        broker.clone(),
         registry.clone(),
         policy,
         launcher,
@@ -77,7 +81,8 @@ async fn run_serve(
     planner.recover_startup().await?;
 
     let suggested = dirs::download_dir().map(|p| p.to_string_lossy().into_owned());
-    let state = AppState::with_suggestion(registry, supervisor.clone(), suggested);
+    let state =
+        AppState::with_suggestion(registry, supervisor.clone(), suggested).with_events(broker);
 
     #[cfg(feature = "bundled-web")]
     let app = {
@@ -104,9 +109,14 @@ async fn run_serve(
             .spawn();
     }
 
-    // Graceful shutdown on SIGINT/SIGTERM (Unix) or Ctrl+C.
+    // Graceful shutdown on SIGINT/SIGTERM (Unix) or Ctrl+C: stop admission,
+    // cancel active runs preserving resumable artifacts, give in-flight
+    // finalizations a moment to persist, then exit. The process exits
+    // directly because SSE responses never end on their own — a graceful
+    // axum drain would wait for them forever. Recovery re-classifies any
+    // attempt that did not finish, so a missed finalize is safe.
     let shutdown_supervisor = supervisor.clone();
-    let shutdown_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -120,16 +130,16 @@ async fn run_serve(
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        shutdown_supervisor.shutdown().await
+        if let Err(error) = shutdown_supervisor.shutdown().await {
+            eprintln!("supervisor shutdown failed: {error}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        std::process::exit(0);
     });
 
     let serve_result = axum::serve(listener, app).await;
-    let shutdown_result = shutdown_task
-        .await
-        .map_err(|_| kdown_app::error::AppError::ServiceDegraded)?;
-
     serve_result.map_err(|_| kdown_app::error::AppError::ServiceDegraded)?;
-    shutdown_result
+    Ok(())
 }
 
 fn main() {

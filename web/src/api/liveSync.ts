@@ -74,6 +74,7 @@ export interface LiveSyncDeps {
   replaceCaches(collections: Collections): void
   applySnapshot(view: JobView): void
   markStale(): void
+  onPhaseChange?(phase: LivePhase): void
 }
 
 export type LivePhase = 'connecting' | 'syncing' | 'live' | 'stale'
@@ -86,6 +87,11 @@ interface SeenRevision {
 
 export class LiveSync {
   private currentPhase: LivePhase = 'connecting'
+
+  private setPhase(phase: LivePhase) {
+    this.currentPhase = phase
+    this.deps.onPhaseChange?.(phase)
+  }
   private epoch = ''
   private buffer: EventEnvelope[] = []
   private seen = new Map<string, SeenRevision>()
@@ -123,13 +129,13 @@ export class LiveSync {
     this.seen.clear()
     this.buffer = []
     this.deps.replaceCaches(collections)
-    this.currentPhase = 'live'
+    this.setPhase('live')
   }
 
   private onEvent(envelope: EventEnvelope): void {
     if (envelope.kind === 'hello') {
       this.epoch = envelope.streamEpoch
-      this.currentPhase = 'syncing'
+      this.setPhase('syncing')
       void this.deps
         .fetchCollections()
         .then((collections) => {
@@ -149,7 +155,7 @@ export class LiveSync {
               this.applySnapshot(pending)
             }
           }
-          this.currentPhase = 'live'
+          this.setPhase('live')
         })
         .catch(() => {
           // Collection fetch failed: stay stale until a reconnect.
@@ -174,10 +180,10 @@ export class LiveSync {
     }
     if (envelope.kind === 'service.degraded') {
       this.deps.markStale()
-      this.currentPhase = 'stale'
+      this.setPhase('stale')
       void this.deps.fetchCollections().then((collections) => {
         this.deps.replaceCaches(collections)
-        this.currentPhase = 'live'
+        this.setPhase('live')
       })
     }
   }
@@ -209,7 +215,7 @@ export class LiveSync {
   }
 
   private onDisconnected(): void {
-    this.currentPhase = 'stale'
+    this.setPhase('stale')
     this.buffer = []
     this.deps.markStale()
   }

@@ -25,7 +25,7 @@ export function HistoryPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
   const query = useInfiniteQuery({
-    queryKey: queryKeys.jobs.list({ status, source }),
+    queryKey: queryKeys.jobs.history({ status, source }),
     queryFn: ({ pageParam }) =>
       api.listJobs({
         status: status || undefined,
