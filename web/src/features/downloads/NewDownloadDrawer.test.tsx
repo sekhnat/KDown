@@ -64,7 +64,8 @@ describe('NewDownloadDrawer', () => {
     await user.click(screen.getByRole('button', { name: /start download/i }))
 
     await waitFor(() => expect(dialog).not.toBeVisible())
-    expect(await screen.findByTestId('job-id')).toHaveTextContent('job-new')
+    // The real detail page renders the created job's display source.
+    expect(await screen.findByText(/file\.iso/i)).toBeVisible()
   })
 
   it('returns focus to the New Download button after Escape', async () => {

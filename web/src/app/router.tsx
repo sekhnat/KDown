@@ -1,20 +1,8 @@
-import { createBrowserRouter, Navigate, Outlet, useParams } from 'react-router-dom'
+import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom'
 import { AppShell } from './AppShell'
-import { DownloadsPage, HistoryPage, SettingsPage } from './pages'
+import { DownloadsPage, HistoryPage, JobDetailRoute, SettingsPage } from './pages'
 import { FirstRunSetup } from '../features/settings/FirstRunSetup'
 import { useBootstrapQuery } from '../features/settings/rootQueries'
-
-function JobDetailStub() {
-  const { jobId } = useParams()
-  return (
-    <section aria-label="Job detail">
-      <h1>
-        Job <span data-testid="job-id">{jobId}</span>
-      </h1>
-      <p>Detail telemetry arrives with the dashboard task.</p>
-    </section>
-  )
-}
 
 /** Blocks every app route until at least one root exists. */
 function FirstRunGate() {
@@ -41,7 +29,7 @@ export const router = createBrowserRouter([
         children: [
           { index: true, element: <Navigate to="/downloads" replace /> },
           { path: 'downloads', element: <DownloadsPage /> },
-          { path: 'downloads/:jobId', element: <JobDetailStub /> },
+          { path: 'downloads/:jobId', element: <JobDetailRoute /> },
           { path: 'history', element: <HistoryPage /> },
           { path: 'settings', element: <SettingsPage /> },
         ],

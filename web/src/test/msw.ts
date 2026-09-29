@@ -96,6 +96,12 @@ export const handlers = [
     await delay(0)
     return HttpResponse.json(jobDto('job-new'), { status: 201 })
   }),
+  http.get('*/api/v1/jobs/:id', ({ params }) =>
+    HttpResponse.json({
+      job: jobDto(String(params.id)),
+      attempts: [],
+    }),
+  ),
 ]
 
 export function jobDto(id: string) {

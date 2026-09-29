@@ -4,6 +4,7 @@
  * JSON only. Console output never contains the token or full source URLs.
  */
 import type { components } from './schema'
+import type { JobView as LiveJobView } from './liveSync'
 
 type ApiErrorEnvelopeDto = components['schemas']['ApiErrorEnvelope']
 type JobViewDto = components['schemas']['JobViewDto']
@@ -15,30 +16,8 @@ type JobPageDto = components['schemas']['JobPageDto']
 type JobDetailDto = components['schemas']['JobDetailDto']
 
 /** App-facing camelCase view mapped from the wire DTO. */
-export interface JobView {
-  id: string
-  status: string
-  desiredState: string
-  controlVersion: number
-  attemptId: string | null
-  sampleSeq: number
-  sourceDisplay: string
-  rootId: string
-  rootLabel: string
-  relativeDirectory: string | null
-  filenameOverride: string | null
-  destinationDisplay: string | null
-  createdAt: number
-  updatedAt: number
-  snapshot: {
-    stateLabel: string
-    bytesReceived: number
-    networkBytes: number
-    reusedBytes: number
-    retries: number
-    elapsedMs: number
-  } | null
-}
+export type JobView = LiveJobView
+export type { EngineSnapshotView } from './liveSync'
 
 export interface Bootstrap {
   csrfToken: string
