@@ -1,6 +1,7 @@
 import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom'
 import { AppShell } from './AppShell'
-import { DownloadsPage, HistoryPage, JobDetailRoute, SettingsPage } from './pages'
+import { DownloadsPage, HistoryPage, JobDetailRoute } from './pages'
+import { SettingsPage } from '../features/settings/SettingsPage'
 import { FirstRunSetup } from '../features/settings/FirstRunSetup'
 import { useBootstrapQuery } from '../features/settings/rootQueries'
 

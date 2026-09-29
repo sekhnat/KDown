@@ -117,7 +117,7 @@ export function jobDto(id: string) {
     root_label: 'Downloads',
     relative_directory: null,
     filename_override: null,
-    destination_display: null,
+    destination_display: `${id}.iso`,
     created_at: 0,
     updated_at: 0,
     snapshot: null,

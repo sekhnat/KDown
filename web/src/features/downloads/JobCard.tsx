@@ -54,7 +54,7 @@ export function JobCard({ job, livePhase, onCancelRequested }: JobCardProps) {
       </header>
       <div
         role="progressbar"
-        aria-valuetext={received === null ? 'indeterminate' : `${formatBytes(received)} received`}
+        aria-valuetext="indeterminate"
         style={{ height: '0.5rem', background: 'var(--border)', borderRadius: 999 }}
       >
         <div

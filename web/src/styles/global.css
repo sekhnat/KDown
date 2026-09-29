@@ -134,3 +134,19 @@ a {
   font-variant-numeric: tabular-nums;
   font-family: var(--font-mono);
 }
+
+.history-row {
+  border-bottom: 1px solid var(--border);
+  padding: 0.5rem 0;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
