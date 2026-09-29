@@ -5,3 +5,4 @@ __pycache__/
 crates/engine/benches/results/suite/pr-smoke/
 .pi/
 .omp/
+.worktrees/
