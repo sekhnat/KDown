@@ -27,9 +27,11 @@ use crate::path_policy::{validate_filename, ResolvedDestination};
 use crate::registry::Registry;
 
 pub mod command;
+pub mod recovery;
 
 pub use crate::events::SupervisorEvent;
 pub use command::SupervisorCommand;
+pub use recovery::{classify, RecoveryAction, RecoveryPlanner};
 
 /// Completion futures tracked by the actor, tagged with their job/attempt.
 type CompletionStream = FuturesUnordered<
@@ -90,8 +92,27 @@ impl SupervisorHandle {
 
     /// Admits a persisted job for queueing/launch.
     pub async fn enqueue(&self, job_id: JobId) -> Result<JobView, AppError> {
-        self.request(|reply| SupervisorCommand::Enqueue { job_id, reply })
-            .await
+        self.request(|reply| SupervisorCommand::Enqueue {
+            job_id,
+            attempt: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Admits a job whose recovery attempt already exists; the supervisor
+    /// launches against that attempt instead of creating a new one.
+    pub(crate) async fn enqueue_recovered(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+    ) -> Result<JobView, AppError> {
+        self.request(|reply| SupervisorCommand::Enqueue {
+            job_id,
+            attempt: Some(attempt_id),
+            reply,
+        })
+        .await
     }
 
     /// Requests pause; stale duplicates conflict.
@@ -254,8 +275,12 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
 
     async fn handle_command(&mut self, command: SupervisorCommand) {
         match command {
-            SupervisorCommand::Enqueue { job_id, reply } => {
-                let _ = reply.send(self.enqueue(job_id).await);
+            SupervisorCommand::Enqueue {
+                job_id,
+                attempt,
+                reply,
+            } => {
+                let _ = reply.send(self.enqueue(job_id, attempt).await);
             }
             SupervisorCommand::Pause {
                 job_id,
@@ -305,13 +330,27 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
             }
             SupervisorCommand::Shutdown { reply } => {
                 self.shutting_down = true;
+                // Stop admission and preserve resumable artifacts. The
+                // resulting completions record `Interrupted`, never a user
+                // cancellation, and desired state stays untouched.
+                for run in self.active.values() {
+                    let _ = run
+                        .handle
+                        .cancel_with(CancelArtifactPolicy::PreservePartial);
+                }
                 let _ = reply.send(Ok(()));
             }
         }
     }
 
     /// Admits a persisted job: launch when a slot is open, otherwise queue.
-    async fn enqueue(&mut self, job_id: JobId) -> Result<JobView, AppError> {
+    /// A prebound attempt (recovery) is launched against directly; a queued
+    /// prebound job keeps its attempt for the later promotion.
+    async fn enqueue(
+        &mut self,
+        job_id: JobId,
+        prebound: Option<AttemptId>,
+    ) -> Result<JobView, AppError> {
         let job = self.registry.load_job(job_id).await?;
         if job.status.is_terminal() {
             return Err(AppError::InvalidTransition);
@@ -320,7 +359,8 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
             self.queue.push_back(job_id);
             return Ok(job_view(&job, job.current_attempt_id, 0, None));
         }
-        self.launch_job(&job, AttemptReason::Initial).await?;
+        self.launch_job(&job, AttemptReason::Initial, prebound)
+            .await?;
         let job = self.registry.load_job(job_id).await?;
         let attempt_id = job.current_attempt_id;
         Ok(job_view(&job, attempt_id, 0, None))
@@ -328,12 +368,21 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
 
     /// Persists the attempt and status, resolves the destination, and
     /// launches the engine — in that order, with no open transaction.
-    async fn launch_job(&mut self, job: &JobRecord, reason: AttemptReason) -> Result<(), AppError> {
-        let launch_key = crate::domain::LaunchKey::new();
-        let attempt = self
-            .registry
-            .begin_attempt_once(job.id, reason, launch_key)
-            .await?;
+    async fn launch_job(
+        &mut self,
+        job: &JobRecord,
+        reason: AttemptReason,
+        prebound: Option<AttemptId>,
+    ) -> Result<(), AppError> {
+        let attempt = match prebound {
+            Some(attempt_id) => self.registry.load_attempt(attempt_id).await?,
+            None => {
+                let launch_key = crate::domain::LaunchKey::new();
+                self.registry
+                    .begin_attempt_once(job.id, reason, launch_key)
+                    .await?
+            }
+        };
         self.registry
             .mark_status(job.id, DurableJobStatus::Active)
             .await?;
@@ -529,7 +578,7 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
             self.queue.push_back(job_id);
         } else {
             let job = self.registry.load_job(job_id).await?;
-            self.launch_job(&job, AttemptReason::Retry).await?;
+            self.launch_job(&job, AttemptReason::Retry, None).await?;
         }
         self.broadcast_record(job_id).await;
         let job = self.registry.load_job(job_id).await?;
@@ -550,6 +599,9 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
                 detail,
                 metrics: None,
             },
+            // A cancellation that shutdown itself requested is an
+            // interruption of host-owned work, not user intent.
+            EngineOutcome::Cancelled if self.shutting_down => AttemptOutcome::Interrupted,
             EngineOutcome::Cancelled => AttemptOutcome::Cancelled,
         };
         if self
@@ -590,7 +642,12 @@ impl<L: EngineLauncher, R: LaunchResolver> Actor<L, R> {
                     self.broadcast_record(job_id).await;
                 }
                 DesiredState::Running => {
-                    if let Err(error) = self.launch_job(&job, AttemptReason::Initial).await {
+                    // A queued job can already carry an unfinished attempt
+                    // (recovery); reuse it instead of creating a second one.
+                    if let Err(error) = self
+                        .launch_job(&job, AttemptReason::Initial, job.current_attempt_id)
+                        .await
+                    {
                         // Launch failure already recorded the durable failure.
                         let _ = error;
                     }

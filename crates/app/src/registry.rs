@@ -53,7 +53,8 @@ impl Registry {
             .filename(path.as_ref())
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(10));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
@@ -705,5 +706,77 @@ impl Registry {
         .await
         .map_err(db_err)?;
         self.load_settings().await
+    }
+}
+
+impl Registry {
+    /// Lists every nonterminal job; the recovery planner classifies these
+    /// at startup.
+    pub async fn list_recoverable(&self) -> Result<Vec<JobRecord>, AppError> {
+        let rows = sqlx::query(
+            "SELECT * FROM jobs WHERE status NOT IN ('completed', 'failed', 'cancelled') \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(job_from_row).collect()
+    }
+
+    /// Begins the recovery attempt carrying this process's `startup_key`,
+    /// or returns the attempt this startup already created. A prior
+    /// process's unfinished attempt is marked `Interrupted` first, so a
+    /// crash between persistence and launch yields exactly one recovery
+    /// attempt. The boolean reports whether this call created the attempt;
+    /// only its caller enqueues the job.
+    pub async fn begin_recovery_attempt_once(
+        &self,
+        job_id: JobId,
+        startup_key: LaunchKey,
+    ) -> Result<(AttemptRecord, bool), AppError> {
+        self.load_job(job_id).await?;
+        // BEGIN IMMEDIATE: the check-then-insert sequence must hold the
+        // write lock from the start, or two concurrent recovery passes can
+        // both pass the existence check and deadlock on upgrade.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        if let Some(existing) = attempt_by_launch_key(&mut tx, job_id, startup_key).await? {
+            return Ok((existing, false));
+        }
+        let now = now_millis();
+        sqlx::query(
+            "UPDATE attempts SET finished_at = ?, outcome = 'interrupted', \
+             failure_code = NULL, failure_detail = NULL, metrics_json = NULL \
+             WHERE job_id = ? AND finished_at IS NULL",
+        )
+        .bind(now)
+        .bind(job_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let id = AttemptId::new();
+        sqlx::query(
+            "INSERT INTO attempts (id, job_id, launch_key, reason, started_at) \
+             VALUES (?, ?, ?, 'recovery', ?)",
+        )
+        .bind(id.to_string())
+        .bind(job_id.to_string())
+        .bind(startup_key.to_string())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE jobs SET current_attempt_id = ? WHERE id = ?")
+            .bind(id.to_string())
+            .bind(job_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        let attempt = self.load_attempt(id).await?;
+        Ok((attempt, true))
     }
 }

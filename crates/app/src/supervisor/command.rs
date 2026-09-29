@@ -12,6 +12,8 @@ use crate::error::AppError;
 pub enum SupervisorCommand {
     Enqueue {
         job_id: JobId,
+        /// Recovery reuses its already-created attempt.
+        attempt: Option<AttemptId>,
         reply: oneshot::Sender<Result<JobView, AppError>>,
     },
     Pause {
