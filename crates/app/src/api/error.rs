@@ -101,6 +101,7 @@ impl ApiError {
             AppError::EngineLaunch(_) | AppError::DesktopReveal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            AppError::ListenNotLoopback => StatusCode::FORBIDDEN,
         };
         let field_errors = match &error {
             AppError::InvalidSourceUrl(_)

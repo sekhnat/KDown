@@ -60,6 +60,9 @@ pub enum AppError {
     /// Revealing a file in the desktop file manager failed.
     #[error("the desktop file manager could not be opened")]
     DesktopReveal(String),
+    /// The requested listen address is not loopback.
+    #[error("the service only accepts loopback listen addresses")]
+    ListenNotLoopback,
 }
 
 impl AppError {
@@ -82,6 +85,7 @@ impl AppError {
             Self::EngineLaunch(_) => "engine_launch_failed",
             Self::ServiceDegraded => "service_degraded",
             Self::DesktopReveal(_) => "desktop_reveal_failed",
+            Self::ListenNotLoopback => "listen_not_loopback",
         }
     }
 

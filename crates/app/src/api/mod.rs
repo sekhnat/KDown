@@ -1,6 +1,7 @@
 //! The secure Axum shell: one origin, loopback hosts only, JSON mutations
 //! guarded by a per-process CSRF token, and a stable error envelope.
 
+pub mod assets;
 pub mod dto;
 pub mod error;
 pub mod jobs;
@@ -119,8 +120,9 @@ async fn bootstrap(
     Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
 }
 
-/// JSON 404 for every unmatched API path; the SPA fallback (Task 13) never
-/// masks these.
+/// JSON 404 for unmatched API paths inside the nested scope; the outer
+/// asset fallback also emits this shape for `/api/*` misses.
+#[allow(dead_code)]
 async fn api_not_found() -> error::ApiError {
     error::ApiError::not_found()
 }
@@ -189,6 +191,13 @@ async fn mutation_guard(
 /// Builds the API router. CORS is deliberately not enabled: UI and API
 /// share one origin, and no permissive CORS header is ever emitted.
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_web_dir(state, None)
+}
+
+/// Builds the full router: the API plus, when a web directory is
+/// configured, static assets with SPA fallback. The API's JSON 404 stays
+/// scoped under `/api/v1`; missing `/assets/*` never serves HTML.
+pub fn build_router_with_web_dir(state: AppState, web_dir: Option<std::path::PathBuf>) -> Router {
     let api = Router::new()
         .route("/bootstrap", get(bootstrap))
         .route("/events", get(sse::stream))
@@ -200,8 +209,9 @@ pub fn build_router(state: AppState) -> Router {
             mutation_guard,
         ))
         .with_state(state);
+    let assets = assets::router(web_dir);
     Router::new()
         .nest("/api/v1", api)
-        .fallback(api_not_found)
+        .merge(assets)
         .layer(axum::middleware::from_fn(security_headers))
 }
