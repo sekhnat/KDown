@@ -458,3 +458,24 @@ pub struct RootRecord {
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+/// Display-safe job view for API responses and SSE snapshots. Query values
+/// and credentials never appear: the source URL is redacted and filesystem
+/// paths are reduced to relative display form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobView {
+    pub id: JobId,
+    pub status: DurableJobStatus,
+    pub desired_state: DesiredState,
+    pub control_version: ControlVersion,
+    pub attempt_id: Option<AttemptId>,
+    /// Per-attempt monotonic sample sequence; a new attempt restarts at 0.
+    pub sample_seq: u64,
+    pub source_display: String,
+    pub root_id: RootId,
+    pub relative_directory: Option<String>,
+    pub filename_override: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub snapshot: Option<crate::engine_adapter::EngineSnapshotView>,
+}
