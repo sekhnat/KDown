@@ -1,0 +1,32 @@
+:root {
+  color-scheme: dark;
+  /* Ocean Precision tokens (spec §6.7): dark-only, AA contrast. */
+  --canvas: #07111f;
+  --surface: #101f32;
+  --border: #1b304a;
+  --accent: #3be0c5;
+  --data: #68a7ff;
+  --text: #e9f2ff;
+  --text-muted: #9fb3cc;
+  --warning: #f2b95c;
+  --danger: #ff7b72;
+  --radius-small: 8px;
+  --radius-medium: 12px;
+  --radius-large: 18px;
+  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", monospace;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto;
+    transition: none !important;
+    animation: none !important;
+  }
+}

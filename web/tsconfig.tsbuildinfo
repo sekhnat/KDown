@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/test-setup.ts","./src/api/client.ts","./src/api/liveSync.test.ts","./src/api/liveSync.ts","./src/api/liveSyncHarness.ts","./src/api/queryKeys.ts","./src/api/schema.d.ts","./src/app/App.tsx","./src/app/AppShell.test.tsx","./src/app/AppShell.tsx","./src/app/pages.tsx","./src/app/router.tsx","./vite.config.ts","./vitest.config.ts"],"version":"5.9.3"}

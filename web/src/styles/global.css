@@ -1,0 +1,136 @@
+@import './tokens.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--text);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--data);
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-small);
+}
+
+.skip-link:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+  z-index: 10;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 15rem 1fr;
+  min-height: 100vh;
+}
+
+/* Compact icon rail from 640 px through 1023 px. */
+@media (max-width: 1023px) {
+  .shell {
+    grid-template-columns: 4rem 1fr;
+  }
+  .shell .nav-label {
+    display: none;
+  }
+}
+
+/* Bottom navigation below 640 px. */
+@media (max-width: 639px) {
+  .shell {
+    grid-template-columns: 1fr;
+    padding-bottom: 4.5rem;
+  }
+  .rail {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    flex-direction: row;
+    justify-content: space-around;
+    border-top: 1px solid var(--border);
+    border-right: none;
+  }
+  .shell .nav-label {
+    display: none;
+  }
+  .bottom-nav-label {
+    display: block;
+    font-size: 0.65rem;
+  }
+  .touch-target {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem 0.5rem;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+.rail a {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius-medium);
+}
+
+.rail a[aria-current='page'] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.content {
+  padding: 1.5rem;
+  min-width: 0;
+}
+
+.connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.connection-status[data-phase='live'] {
+  color: var(--accent);
+}
+
+.connection-status[data-phase='stale'] {
+  color: var(--warning);
+}
+
+.telemetry {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}

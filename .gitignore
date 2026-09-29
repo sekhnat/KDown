@@ -6,3 +6,7 @@ crates/engine/benches/results/suite/pr-smoke/
 .pi/
 .omp/
 .worktrees/
+web/node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
