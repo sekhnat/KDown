@@ -36,8 +36,7 @@
 //! server-side wire accounting for amplification records (stats responses
 //! do not count toward the validator flip or payload counters).
 
-use std::fs::File;
-use std::io::{BufReader, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -428,17 +427,14 @@ fn tls_server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> tokio_rustls::rustls::ServerConfig {
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(
-        File::open(cert_path).expect("open cert"),
-    ))
-    .collect::<Result<_, _>>()
-    .expect("parse cert pem");
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .expect("open cert")
+        .collect::<Result<_, _>>()
+        .expect("parse cert pem");
     let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path).expect("open key")))
-            .expect("parse key pem")
-            .expect("key present");
+        PrivateKeyDer::from_pem_file(key_path).expect("parse key pem");
     let mut config = tokio_rustls::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

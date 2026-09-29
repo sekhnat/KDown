@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use hyper_util::client::legacy::connect::Connected;
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use tower_service::Service;
 use tracing::debug;
 
@@ -223,7 +224,7 @@ impl TlsSettings {
                     DownloadError::Tls(format!("read CA bundle {}: {e}", path.display()))
                 })?;
                 let mut ok = 0usize;
-                for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
                     let cert =
                         cert.map_err(|e| DownloadError::Tls(format!("parse CA bundle: {e}")))?;
                     roots
