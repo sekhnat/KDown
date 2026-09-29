@@ -17,6 +17,8 @@
   "type": "module",
   "private": true,
   "dependencies": {
+    "@fontsource-variable/familjen-grotesk": "5.3.0",
+    "@fontsource-variable/martian-mono": "5.3.0",
     "@radix-ui/react-alert-dialog": "1.1.23",
     "@radix-ui/react-dialog": "1.1.23",
     "@radix-ui/react-dropdown-menu": "2.1.24",

@@ -26,7 +26,7 @@ export function JobControls({ job, livePhase, onAction, onCancelRequested }: Job
   const actions = actionsFor(job)
   const stale = livePhase !== 'live'
   return (
-    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+    <div className="job-actions">
       {actions.map((action) =>
         action === 'cancel' ? (
           <button

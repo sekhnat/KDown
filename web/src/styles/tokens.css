@@ -1,19 +1,47 @@
+@import '@fontsource-variable/familjen-grotesk';
+@import '@fontsource-variable/martian-mono';
+
+/*
+ * Ledger tokens. Ink on chalk by day, periwinkle on night ink after dark.
+ * Ultramarine (fetched bytes) is the only accent; marigold marks retries
+ * and re-sent bytes; rose marks failure. Text pairs meet WCAG AA.
+ */
 :root {
-  color-scheme: dark;
-  /* Ocean Precision tokens (spec §6.7): dark-only, AA contrast. */
-  --canvas: #07111f;
-  --surface: #101f32;
-  --border: #1b304a;
-  --accent: #3be0c5;
-  --data: #68a7ff;
-  --text: #e9f2ff;
-  --text-muted: #9fb3cc;
-  --warning: #f2b95c;
-  --danger: #ff7b72;
-  --radius-small: 8px;
-  --radius-medium: 12px;
-  --radius-large: 18px;
-  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", monospace;
+  color-scheme: light dark;
+  --canvas: #ecedf3;
+  --surface: #f9f9fc;
+  --border: #cfd1de;
+  --rule: #b4b7cb;
+  --accent: #3a2fd8;
+  --accent-ink: #ffffff;
+  --data: #3a2fd8;
+  --banked: #6d6b86;
+  --text: #17152b;
+  --text-muted: #55536e;
+  --warning: #8f5800;
+  --danger: #b81c46;
+  --radius-small: 4px;
+  --radius-medium: 6px;
+  --radius-large: 10px;
+  --font-ui: 'Familjen Grotesk Variable', 'Familjen Grotesk', system-ui, sans-serif;
+  --font-mono: 'Martian Mono Variable', 'Martian Mono', ui-monospace, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --canvas: #12111c;
+    --surface: #1c1b2b;
+    --border: #2f2d45;
+    --rule: #47456a;
+    --accent: #948cff;
+    --accent-ink: #12111c;
+    --data: #948cff;
+    --banked: #8c8aa8;
+    --text: #ecebf7;
+    --text-muted: #a9a7c4;
+    --warning: #f0b93a;
+    --danger: #ff7a93;
+  }
 }
 
 :focus-visible {
