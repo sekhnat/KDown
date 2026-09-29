@@ -21,67 +21,72 @@ export interface JobCardProps {
   onCancelRequested(job: JobView): void
 }
 
-/** One dashboard card: identity, state, progress, and legal controls. */
+/**
+ * One dashboard row: identity, state, a byte tape, and legal controls.
+ * The engine does not report a total size, so the tape shows what the
+ * bytes on disk are made of instead of a percentage: bytes banked from an
+ * earlier checkpoint, bytes fetched this run, and bytes sent again.
+ */
 export function JobCard({ job, livePhase, onCancelRequested }: JobCardProps) {
   const status = displayStatus(job)
-  const received = job.snapshot?.bytesReceived ?? null
-  // The engine snapshot does not yet expose total size in v1 views; the
-  // progress bar is indeterminate until it does.
+  const snapshot = job.snapshot
+  const received = snapshot?.bytesReceived ?? null
+  const banked = Math.min(snapshot?.reusedBytes ?? 0, received ?? 0)
+  const fetched = Math.max((received ?? 0) - banked, 0)
+  const resent = Math.max((snapshot?.networkBytes ?? 0) - fetched, 0)
   const rate =
-    job.snapshot && job.snapshot.elapsedMs > 0
-      ? job.snapshot.bytesReceived / (job.snapshot.elapsedMs / 1000)
-      : null
+    snapshot && snapshot.elapsedMs > 0 ? snapshot.bytesReceived / (snapshot.elapsedMs / 1000) : null
   return (
-    <article
-      aria-label={`Job ${job.sourceDisplay}`}
-      style={{
-        background: 'var(--surface)',
-        border: '1px solid var(--border)',
-        borderRadius: 'var(--radius-medium)',
-        padding: '1rem',
-        display: 'grid',
-        gap: '0.5rem',
-      }}
-    >
-      <header style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        <span aria-hidden="true">{statusGlyph(status)}</span>
-        <strong style={{ marginRight: 'auto' }}>
+    <article aria-label={`Job ${job.sourceDisplay}`} className="job-row">
+      <header className="job-head">
+        <h3 className="job-name">
           <Link to={`/downloads/${job.id}`}>{job.destinationDisplay ?? job.sourceDisplay}</Link>
-        </strong>
-        <span data-status={status}>
-          {statusGlyph(status)} {status}
+        </h3>
+        <span className="job-status" data-status={status}>
+          <span aria-hidden="true">{statusGlyph(status)} </span>
+          {status}
         </span>
       </header>
       <div
         role="progressbar"
         aria-valuetext="indeterminate"
-        style={{ height: '0.5rem', background: 'var(--border)', borderRadius: 999 }}
+        aria-label={
+          received === null
+            ? 'Bytes on disk: not reported yet'
+            : `Bytes on disk: ${formatBytes(banked)} banked, ${formatBytes(fetched)} fetched this run, ${formatBytes(resent)} sent again`
+        }
+        className="tape"
       >
-        <div
-          style={{
-            width: received === null ? '30%' : `${Math.min(100, (received / Math.max(received, 1)) * 100)}%`,
-            background: 'var(--accent)',
-            height: '100%',
-            borderRadius: 999,
-          }}
-        />
+        <i className="banked" style={{ flexGrow: banked }} />
+        <i className="fetched" style={{ flexGrow: fetched }} />
+        {resent > 0 ? <i className="resent" /> : null}
+        <i className="unknown" style={{ flexGrow: Math.max((received ?? 0) * 0.4, 1) }} />
       </div>
-      <dl
-        className="telemetry"
-        style={{ display: 'flex', gap: '1rem', margin: 0, fontSize: '0.85rem' }}
-      >
+      <dl className="tape-legend telemetry">
         <div>
-          <dt style={{ display: 'inline' }}>Received: </dt>
-          <dd style={{ display: 'inline', margin: 0 }}>{formatBytes(received)}</dd>
+          <dt>Received</dt>
+          <dd className="figure">{formatBytes(received)}</dd>
         </div>
         <div>
-          <dt style={{ display: 'inline' }}>Rate: </dt>
-          <dd style={{ display: 'inline', margin: 0 }}>{formatRate(rate)}</dd>
+          <dt>Rate</dt>
+          <dd className="figure">{formatRate(rate)}</dd>
         </div>
         <div>
-          <dt style={{ display: 'inline' }}>ETA: </dt>
-          <dd style={{ display: 'inline', margin: 0 }}>—</dd>
+          <dt>ETA</dt>
+          <dd className="figure">—</dd>
         </div>
+        {banked > 0 ? (
+          <div>
+            <dt>Resumed from checkpoint</dt>
+            <dd className="figure">{formatBytes(banked)}</dd>
+          </div>
+        ) : null}
+        {snapshot && snapshot.retries > 0 ? (
+          <div>
+            <dt>Retries</dt>
+            <dd className="figure">{snapshot.retries}</dd>
+          </div>
+        ) : null}
       </dl>
       <JobControls
         job={job}

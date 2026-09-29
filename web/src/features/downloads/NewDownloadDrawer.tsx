@@ -61,7 +61,7 @@ export function NewDownloadDrawer() {
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay />
+          <Dialog.Overlay className="scrim" />
           <Dialog.Content
             aria-describedby="new-download-description"
             style={{
@@ -92,7 +92,7 @@ export function NewDownloadDrawer() {
 
       <AlertDialog.Root open={confirmDiscard} onOpenChange={setConfirmDiscard}>
         <AlertDialog.Portal>
-          <AlertDialog.Overlay />
+          <AlertDialog.Overlay className="scrim" />
           <AlertDialog.Content
             style={{
               position: 'fixed',

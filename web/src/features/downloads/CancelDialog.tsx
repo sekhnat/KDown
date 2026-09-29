@@ -41,14 +41,8 @@ export function CancelDialog({ job, open, onConfirm, onDismiss }: CancelDialogPr
       role="dialog"
       aria-modal="true"
       aria-labelledby="cancel-dialog-title"
-      style={{
-        position: 'fixed',
-        inset: 0,
-        display: 'grid',
-        placeItems: 'center',
-        background: 'rgba(2, 8, 16, 0.7)',
-        zIndex: 20,
-      }}
+      className="cancel-scrim"
+      style={{ position: 'fixed', inset: 0, display: 'grid', placeItems: 'center', zIndex: 20 }}
       onClick={onDismiss}
     >
       <div
@@ -59,6 +53,7 @@ export function CancelDialog({ job, open, onConfirm, onDismiss }: CancelDialogPr
           borderRadius: 'var(--radius-large)',
           padding: '1.5rem',
           maxWidth: '28rem',
+          margin: '1rem',
         }}
         onClick={(event) => event.stopPropagation()}
       >

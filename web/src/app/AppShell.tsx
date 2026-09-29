@@ -1,13 +1,14 @@
 import { Component, type ErrorInfo, type ReactNode, createContext, useContext } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
+import { Download, History, Settings, type LucideIcon } from 'lucide-react'
 import type { LivePhase } from '../api/liveSync'
 
 export const LivePhaseContext = createContext<LivePhase>('connecting')
 
-const primaryLinks = [
-  { to: '/downloads', label: 'Downloads' },
-  { to: '/history', label: 'History' },
-  { to: '/settings', label: 'Settings' },
+const primaryLinks: { to: string; label: string; icon: LucideIcon }[] = [
+  { to: '/downloads', label: 'Downloads', icon: Download },
+  { to: '/history', label: 'History', icon: History },
+  { to: '/settings', label: 'Settings', icon: Settings },
 ]
 
 const phaseLabel: Record<LivePhase, string> = {
@@ -22,7 +23,7 @@ function NavLinks({ labelled }: { labelled: boolean }) {
     <>
       {primaryLinks.map((link) => (
         <NavLink key={link.to} to={link.to} className="touch-target">
-          <span aria-hidden="true" data-icon={link.label} />
+          <link.icon aria-hidden="true" size={20} strokeWidth={1.75} />
           <span className={labelled ? 'nav-label' : 'bottom-nav-label'}>{link.label}</span>
         </NavLink>
       ))}
@@ -70,19 +71,14 @@ export function AppShell() {
       <a className="skip-link" href="#main-content">
         Skip to main content
       </a>
-      <nav aria-label="Primary" className="rail">
+      <nav aria-label="Primary" className="rail desktop-rail">
+        <div className="mark" aria-hidden="true">
+          K<span>Down</span>
+        </div>
         <NavLinks labelled />
       </nav>
-      <div>
-        <header
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            padding: '0.75rem 1.5rem',
-            borderBottom: '1px solid var(--border)',
-          }}
-        >
-          <strong>KDown</strong>
+      <div className="content-wrap">
+        <header className="topbar">
           <span className="connection-status" role="status" data-phase={phase}>
             {phaseLabel[phase]}
           </span>

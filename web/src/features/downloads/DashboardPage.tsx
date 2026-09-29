@@ -42,35 +42,28 @@ export function DashboardPage({ jobs, livePhase }: DashboardPageProps) {
 
   return (
     <section aria-labelledby="downloads-heading">
-      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '1rem', flexWrap: 'wrap' }}>
         <h1 id="downloads-heading" style={{ marginRight: 'auto' }}>
           Downloads
         </h1>
         <NewDownloadDrawer />
       </div>
 
-      <dl
-        className="telemetry"
-        style={{ display: 'flex', gap: '2rem', margin: '1rem 0', flexWrap: 'wrap' }}
-      >
-        <div>
-          <dt>Effective rate</dt>
-          <dd>{aggregateRate > 0 ? `${(aggregateRate / 1024).toFixed(1)} KiB/s` : '—'}</dd>
-        </div>
-        <div>
-          <dt>Active</dt>
-          <dd>{activeCount} active</dd>
-        </div>
-        <div>
-          <dt>Queued</dt>
-          <dd>{queuedCount} queued</dd>
-        </div>
-      </dl>
+      <p className="status-sentence telemetry">
+        <span>{activeCount} active</span> and <span>{queuedCount} queued</span>
+        {aggregateRate > 0 ? (
+          <>
+            , moving <span className="figure">{(aggregateRate / 1024).toFixed(1)} KiB/s</span>
+          </>
+        ) : null}
+      </p>
 
       {nonTerminal.length === 0 ? (
-        <p>No active downloads. Start one with New download.</p>
+        <div className="empty">
+          <p>No active downloads. Start one with New download.</p>
+        </div>
       ) : (
-        <div style={{ display: 'grid', gap: '0.75rem' }}>
+        <div className="job-list">
           {nonTerminal.map((job) => (
             <JobCard key={job.id} job={job} livePhase={livePhase} onCancelRequested={() => undefined} />
           ))}
@@ -80,19 +73,17 @@ export function DashboardPage({ jobs, livePhase }: DashboardPageProps) {
       {recentTerminal.length > 0 ? (
         <>
           <h2>Recent history</h2>
-          <ul style={{ listStyle: 'none', padding: 0, display: 'grid', gap: '0.5rem' }}>
+          <ul className="recent">
             {recentTerminal.map((job) => (
               <li key={job.id}>
-                {job.destinationDisplay ?? job.sourceDisplay} — {job.status}
+                <span className="name">{job.destinationDisplay ?? job.sourceDisplay}</span>
+                <span>{job.status}</span>
               </li>
             ))}
           </ul>
         </>
       ) : null}
 
-      <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-        Completed bytes today are shown per job in history.
-      </p>
       <span aria-live="polite" className="visually-hidden-live" />
     </section>
   )
