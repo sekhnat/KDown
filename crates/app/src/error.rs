@@ -42,6 +42,15 @@ pub enum AppError {
     /// A configured root was not found, is disabled, or is invalid.
     #[error("the download root is unavailable")]
     RootUnavailable,
+    /// A nonterminal job still references the root.
+    #[error("an active download still uses this download root")]
+    RootInUse,
+    /// The destination could not be created or re-verified inside the root.
+    #[error("the destination could not be prepared inside the download root")]
+    DestinationUnavailable,
+    /// A settings value is outside its supported range.
+    #[error("the settings values are not valid")]
+    InvalidSettings,
     /// Engine construction or launch failed before any transfer began.
     #[error("the download engine could not be started")]
     EngineLaunch(String),
@@ -64,6 +73,9 @@ impl AppError {
             Self::Persistence => "persistence_failed",
             Self::DestinationOutsideRoot => "destination_outside_root",
             Self::RootUnavailable => "root_unavailable",
+            Self::RootInUse => "root_in_use",
+            Self::DestinationUnavailable => "destination_unavailable",
+            Self::InvalidSettings => "invalid_settings",
             Self::EngineLaunch(_) => "engine_launch_failed",
             Self::ServiceDegraded => "service_degraded",
         }

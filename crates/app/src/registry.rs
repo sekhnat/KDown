@@ -8,11 +8,12 @@
 use crate::domain::{
     AttemptId, AttemptMetrics, AttemptOutcome, AttemptReason, AttemptRecord, ConflictPolicy,
     ControlVersion, DesiredState, DurableJobStatus, JobId, JobIntent, JobRecord, LaunchKey, RootId,
-    SourceUrl,
+    RootRecord, SourceUrl,
 };
 use crate::error::AppError;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Pool, Row, Sqlite};
+use std::path::{Path, PathBuf};
 
 /// Durable registry. Cheap to clone; the pool owns connections.
 #[derive(Clone)]
@@ -385,11 +386,13 @@ fn job_from_row(row: &SqliteRow) -> Result<JobRecord, AppError> {
     let created_at: i64 = row.try_get("created_at").map_err(db_err)?;
     let updated_at: i64 = row.try_get("updated_at").map_err(db_err)?;
 
+    let root_id = RootId::from_uuid(uuid_db(&root_id)?);
     Ok(JobRecord {
         id: JobId::from_uuid(uuid_db(&id)?),
+        root_id,
         intent: JobIntent {
             source: SourceUrl::parse(&source_url).map_err(|_| AppError::Persistence)?,
-            root_id: RootId::from_uuid(uuid_db(&root_id)?),
+            root_id,
             relative_directory,
             filename_override,
             conflict_policy: ConflictPolicy::from_db(&conflict_policy)
@@ -452,5 +455,255 @@ fn attempt_from_row(row: &SqliteRow) -> Result<AttemptRecord, AppError> {
 impl AttemptMetrics {
     fn parse_from_db(json: &Option<String>) -> Option<Self> {
         json.as_deref().and_then(parse_metrics)
+    }
+}
+
+/// Typed global settings. `rate_limit_bytes_per_second` is `None` when the
+/// transfer rate is unlimited.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppSettings {
+    pub active_concurrency: u32,
+    pub rate_limit_bytes_per_second: Option<u64>,
+    pub default_root_id: Option<RootId>,
+    pub notifications_enabled: bool,
+    pub startup_mode: StartupMode,
+}
+
+/// How the service was started; interactive manual launches may open the
+/// browser while service units never do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupMode {
+    Manual,
+    Service,
+}
+
+impl StartupMode {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Service => "service",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "service" => Some(Self::Service),
+            _ => None,
+        }
+    }
+}
+
+fn root_from_row(row: &SqliteRow) -> Result<RootRecord, AppError> {
+    let id: String = row.try_get("id").map_err(db_err)?;
+    let label: String = row.try_get("label").map_err(db_err)?;
+    let canonical_path: String = row.try_get("canonical_path").map_err(db_err)?;
+    let enabled: i64 = row.try_get("enabled").map_err(db_err)?;
+    let is_default: i64 = row.try_get("is_default").map_err(db_err)?;
+    let created_at: i64 = row.try_get("created_at").map_err(db_err)?;
+    let updated_at: i64 = row.try_get("updated_at").map_err(db_err)?;
+    Ok(RootRecord {
+        id: RootId::from_uuid(uuid_db(&id)?),
+        label,
+        canonical_path: PathBuf::from(canonical_path),
+        enabled: enabled != 0,
+        is_default: is_default != 0,
+        created_at,
+        updated_at,
+    })
+}
+
+impl Registry {
+    /// Adds an existing directory as a configured download root. The path
+    /// must exist and be a directory; the stored value is its canonical
+    /// absolute form. Re-adding an already-configured directory returns the
+    /// existing record.
+    pub async fn add_root(
+        &self,
+        label: &str,
+        path: &Path,
+        make_default: bool,
+    ) -> Result<RootRecord, AppError> {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|_| AppError::RootUnavailable)?;
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(|_| AppError::RootUnavailable)?;
+        if !metadata.is_dir() {
+            return Err(AppError::RootUnavailable);
+        }
+        let canonical = canonical.to_string_lossy().into_owned();
+
+        if let Some(existing) = sqlx::query("SELECT * FROM roots WHERE canonical_path = ?")
+            .bind(&canonical)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+        {
+            let record = root_from_row(&existing)?;
+            if make_default {
+                self.set_default_root(record.id).await?;
+                return self.load_root(record.id).await;
+            }
+            return Ok(record);
+        }
+
+        let id = RootId::new();
+        let now = now_millis();
+        sqlx::query(
+            "INSERT INTO roots (id, label, canonical_path, enabled, is_default, created_at, updated_at) \
+             VALUES (?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(label)
+        .bind(&canonical)
+        .bind(i64::from(make_default))
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if make_default {
+            self.set_default_root(id).await?;
+        }
+        self.load_root(id).await
+    }
+
+    /// Loads one configured root regardless of enabled state.
+    pub async fn load_root(&self, id: RootId) -> Result<RootRecord, AppError> {
+        let row = sqlx::query("SELECT * FROM roots WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        root_from_row(&row)
+    }
+
+    /// Loads a root that must be enabled for new launches.
+    pub async fn load_enabled_root(&self, id: RootId) -> Result<RootRecord, AppError> {
+        let root = self.load_root(id).await?;
+        if !root.enabled {
+            return Err(AppError::RootUnavailable);
+        }
+        Ok(root)
+    }
+
+    /// Lists configured roots, default first.
+    pub async fn list_roots(&self) -> Result<Vec<RootRecord>, AppError> {
+        let rows = sqlx::query("SELECT * FROM roots ORDER BY is_default DESC, created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.iter().map(root_from_row).collect()
+    }
+
+    /// Enables a disabled root.
+    pub async fn enable_root(&self, id: RootId) -> Result<RootRecord, AppError> {
+        sqlx::query("UPDATE roots SET enabled = 1, updated_at = ? WHERE id = ?")
+            .bind(now_millis())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        self.load_root(id).await
+    }
+
+    /// Disables a root. Rejected while any nonterminal job references it;
+    /// a disabled default root stops being the default.
+    pub async fn disable_root(&self, id: RootId) -> Result<RootRecord, AppError> {
+        let in_use: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE root_id = ? \
+             AND status NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if in_use > 0 {
+            return Err(AppError::RootInUse);
+        }
+        let result = sqlx::query(
+            "UPDATE roots SET enabled = 0, is_default = 0, updated_at = ? WHERE id = ?",
+        )
+        .bind(now_millis())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        sqlx::query("UPDATE settings SET default_root_id = NULL WHERE default_root_id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        self.load_root(id).await
+    }
+
+    /// Records the default root.
+    pub async fn set_default_root(&self, id: RootId) -> Result<(), AppError> {
+        self.load_root(id).await?;
+        sqlx::query("UPDATE settings SET default_root_id = ?, updated_at = ? WHERE id = 1")
+            .bind(id.to_string())
+            .bind(now_millis())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Loads the typed global settings.
+    pub async fn load_settings(&self) -> Result<AppSettings, AppError> {
+        let row = sqlx::query(
+            "SELECT active_concurrency, rate_limit_bytes_per_second, default_root_id, \
+             notifications_enabled, startup_mode FROM settings WHERE id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let active_concurrency: i64 = row.try_get("active_concurrency").map_err(db_err)?;
+        let rate_limit: Option<i64> = row.try_get("rate_limit_bytes_per_second").map_err(db_err)?;
+        let default_root_id: Option<String> = row.try_get("default_root_id").map_err(db_err)?;
+        let notifications_enabled: i64 = row.try_get("notifications_enabled").map_err(db_err)?;
+        let startup_mode: String = row.try_get("startup_mode").map_err(db_err)?;
+        Ok(AppSettings {
+            active_concurrency: active_concurrency.max(0) as u32,
+            rate_limit_bytes_per_second: rate_limit.map(|v| v.max(0) as u64),
+            default_root_id: default_root_id
+                .map(|v| uuid_db(&v).map(RootId::from_uuid))
+                .transpose()?,
+            notifications_enabled: notifications_enabled != 0,
+            startup_mode: StartupMode::from_db(&startup_mode).ok_or(AppError::Persistence)?,
+        })
+    }
+
+    /// Persists typed global settings after validation.
+    pub async fn update_settings(&self, settings: AppSettings) -> Result<AppSettings, AppError> {
+        if settings.active_concurrency == 0 {
+            return Err(AppError::InvalidSettings);
+        }
+        if settings.rate_limit_bytes_per_second.is_some_and(|v| v == 0) {
+            return Err(AppError::InvalidSettings);
+        }
+        if let Some(root) = settings.default_root_id {
+            self.load_root(root).await?;
+        }
+        sqlx::query(
+            "UPDATE settings SET active_concurrency = ?, rate_limit_bytes_per_second = ?, \
+             default_root_id = ?, notifications_enabled = ?, startup_mode = ?, updated_at = ? \
+             WHERE id = 1",
+        )
+        .bind(i64::from(settings.active_concurrency))
+        .bind(settings.rate_limit_bytes_per_second.map(|v| v as i64))
+        .bind(settings.default_root_id.map(|v| v.to_string()))
+        .bind(i64::from(settings.notifications_enabled))
+        .bind(settings.startup_mode.as_db())
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        self.load_settings().await
     }
 }

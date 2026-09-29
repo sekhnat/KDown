@@ -3,4 +3,5 @@
 
 pub mod domain;
 pub mod error;
+pub mod path_policy;
 pub mod registry;

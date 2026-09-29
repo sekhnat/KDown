@@ -359,6 +359,8 @@ pub struct JobIntent {
 pub struct JobRecord {
     pub id: JobId,
     pub intent: JobIntent,
+    /// Convenience copy of `intent.root_id`.
+    pub root_id: RootId,
     pub desired_state: DesiredState,
     pub status: DurableJobStatus,
     pub control_version: ControlVersion,
@@ -442,4 +444,17 @@ pub struct AttemptRecord {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub outcome: Option<AttemptOutcome>,
+}
+
+/// A configured download root: the only place job artifacts may live.
+/// Ordinary job requests reference it by opaque ID plus relative paths.
+#[derive(Clone, Debug)]
+pub struct RootRecord {
+    pub id: RootId,
+    pub label: String,
+    pub canonical_path: std::path::PathBuf,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
