@@ -13,6 +13,13 @@ use crate::error::AppError;
 pub struct JobId(uuid::Uuid);
 
 impl JobId {
+    /// Rebuilds an identifier from its persisted string form.
+    pub(crate) fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl JobId {
     #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
@@ -36,6 +43,13 @@ impl std::fmt::Display for JobId {
 pub struct AttemptId(uuid::Uuid);
 
 impl AttemptId {
+    /// Rebuilds an identifier from its persisted string form.
+    pub(crate) fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl AttemptId {
     #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
@@ -57,6 +71,13 @@ impl std::fmt::Display for AttemptId {
 /// Opaque configured-root identifier used by all job views and commands.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RootId(uuid::Uuid);
+
+impl RootId {
+    /// Rebuilds an identifier from its persisted string form.
+    pub(crate) fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
 
 impl RootId {
     #[must_use]
@@ -83,6 +104,11 @@ impl std::fmt::Display for RootId {
 pub struct LaunchKey(uuid::Uuid);
 
 impl LaunchKey {
+    /// Rebuilds an identifier from its persisted string form.
+    pub(crate) fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
@@ -92,6 +118,12 @@ impl LaunchKey {
 impl Default for LaunchKey {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Display for LaunchKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -189,6 +221,27 @@ pub enum DesiredState {
     Cancelled,
 }
 
+impl DesiredState {
+    /// Storage representation used by the SQLite registry.
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses the storage representation.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "paused" => Some(Self::Paused),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
 /// Durable lifecycle status recorded by the host. `Queued` and `Recovering`
 /// are application states that wrap the engine's own lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -208,6 +261,35 @@ impl DurableJobStatus {
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl DurableJobStatus {
+    /// Storage representation used by the SQLite registry.
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Recovering => "recovering",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses the storage representation.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "recovering" => Some(Self::Recovering),
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
     }
 }
 
@@ -235,6 +317,29 @@ pub enum ConflictPolicy {
     Resume,
 }
 
+impl ConflictPolicy {
+    /// Storage representation used by the SQLite registry.
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::FailIfExists => "fail_if_exists",
+            Self::Overwrite => "overwrite",
+            Self::Rename => "rename",
+            Self::Resume => "resume",
+        }
+    }
+
+    /// Parses the storage representation.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "fail_if_exists" => Some(Self::FailIfExists),
+            "overwrite" => Some(Self::Overwrite),
+            "rename" => Some(Self::Rename),
+            "resume" => Some(Self::Resume),
+            _ => None,
+        }
+    }
+}
+
 /// Validated, durable creation intent for one job. Browser input never
 /// carries absolute destinations: jobs reference an opaque root plus a
 /// relative destination.
@@ -247,4 +352,94 @@ pub struct JobIntent {
     /// Optional explicit filename; empty means engine-resolved naming.
     pub filename_override: Option<String>,
     pub conflict_policy: ConflictPolicy,
+}
+
+/// Durable job record as stored in the registry.
+#[derive(Clone, Debug)]
+pub struct JobRecord {
+    pub id: JobId,
+    pub intent: JobIntent,
+    pub desired_state: DesiredState,
+    pub status: DurableJobStatus,
+    pub control_version: ControlVersion,
+    pub current_attempt_id: Option<AttemptId>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Why an attempt exists: the first launch, an explicit user retry, or
+/// service-startup recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptReason {
+    Initial,
+    Retry,
+    Recovery,
+}
+
+impl AttemptReason {
+    /// Storage representation used by the SQLite registry.
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Retry => "retry",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    /// Parses the storage representation.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "initial" => Some(Self::Initial),
+            "retry" => Some(Self::Retry),
+            "recovery" => Some(Self::Recovery),
+            _ => None,
+        }
+    }
+}
+
+/// Final byte counts and wall time recorded once per terminal attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttemptMetrics {
+    pub bytes_received: u64,
+    pub network_bytes: u64,
+    pub duration_ms: u64,
+}
+
+/// Terminal result of one attempt. `Interrupted` marks an attempt that a
+/// prior process owned when the service restarted; it does not change the
+/// job's durable status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptOutcome {
+    Completed(AttemptMetrics),
+    Failed {
+        code: String,
+        detail: Option<String>,
+        metrics: Option<AttemptMetrics>,
+    },
+    Cancelled,
+    Interrupted,
+}
+
+impl AttemptOutcome {
+    /// Storage representation used by the SQLite registry.
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Completed(_) => "completed",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// One durable attempt as stored in the registry.
+#[derive(Clone, Debug)]
+pub struct AttemptRecord {
+    pub id: AttemptId,
+    pub job_id: JobId,
+    pub reason: AttemptReason,
+    pub launch_key: LaunchKey,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub outcome: Option<AttemptOutcome>,
 }

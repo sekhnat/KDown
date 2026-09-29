@@ -27,9 +27,12 @@ pub enum AppError {
     #[error("the requested job was not found")]
     NotFound,
     /// A concurrent mutation changed the job first; the current state is
+    /// A concurrent mutation changed the job first; the current state is
     /// reported back to the caller.
     #[error("the job changed concurrently; the shown state is current")]
-    Conflict,
+    Conflict {
+        current: Box<crate::domain::JobRecord>,
+    },
     /// Durable persistence failed; no new engine work may start.
     #[error("the service could not record the change durably")]
     Persistence,
@@ -57,7 +60,7 @@ impl AppError {
             Self::VersionExhausted => "version_exhausted",
             Self::InvalidTransition => "invalid_transition",
             Self::NotFound => "not_found",
-            Self::Conflict => "conflict",
+            Self::Conflict { .. } => "conflict",
             Self::Persistence => "persistence_failed",
             Self::DestinationOutsideRoot => "destination_outside_root",
             Self::RootUnavailable => "root_unavailable",
@@ -66,8 +69,25 @@ impl AppError {
         }
     }
 
+    /// Returns the rejected mutation together with the current durable
+    /// state when this error is a mutation conflict, so stale commands
+    /// can be answered with live state.
+    pub fn into_conflict(self) -> Option<ConflictError> {
+        match self {
+            Self::Conflict { current } => Some(ConflictError { current: *current }),
+            _ => None,
+        }
+    }
+
     /// Whether repeating the operation unchanged can reasonably succeed.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Persistence | Self::ServiceDegraded)
     }
+}
+
+/// A rejected stale mutation plus the current durable job record.
+/// The loser of a command race receives this so it can show the real state.
+#[derive(Debug, Clone)]
+pub struct ConflictError {
+    pub current: crate::domain::JobRecord,
 }
