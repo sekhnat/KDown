@@ -439,3 +439,58 @@ pub struct UpdateSettingsRequest {
     pub notifications_enabled: bool,
     pub startup_mode: String,
 }
+
+/// One SSE stream event. `job` carries the complete display-safe view for
+/// `job.snapshot`; `hello` carries the stream epoch and build identity.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EventEnvelopeDto {
+    /// One of `hello`, `job.snapshot`, `job.removed`, `settings.changed`,
+    /// `service.degraded`.
+    pub kind: String,
+    /// Process stream epoch: changes across service restarts.
+    pub stream_epoch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobViewDto>,
+}
+
+impl EventEnvelopeDto {
+    pub fn hello(stream_epoch: String, build: String) -> Self {
+        Self {
+            kind: "hello".to_string(),
+            stream_epoch,
+            build: Some(build),
+            job: None,
+        }
+    }
+
+    pub fn job_snapshot(view: crate::domain::JobView) -> Self {
+        Self {
+            kind: "job.snapshot".to_string(),
+            // The epoch is filled by the stream layer before serialization.
+            stream_epoch: String::new(),
+            build: None,
+            job: Some(JobViewDto::from(view)),
+        }
+    }
+
+    pub fn job_removed(job_id: crate::domain::JobId, stream_epoch: String) -> Self {
+        let _ = job_id;
+        Self {
+            kind: "job.removed".to_string(),
+            stream_epoch,
+            build: None,
+            job: None,
+        }
+    }
+
+    pub fn service_degraded() -> Self {
+        Self {
+            kind: "service.degraded".to_string(),
+            stream_epoch: String::new(),
+            build: None,
+            job: None,
+        }
+    }
+}

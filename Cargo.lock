@@ -1040,6 +1040,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "http",
+ "http-body-util",
  "kdown-engine",
  "rand 0.9.5",
  "serde",
@@ -1048,6 +1049,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "url",
@@ -2393,6 +2395,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

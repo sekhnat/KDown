@@ -5,9 +5,9 @@ use utoipa::OpenApi;
 use crate::api::dto::{
     AppSettingsDto, ArtifactPolicyDto, AttemptDto, AttemptMetricsDto, AttemptOutcomeDto,
     BootstrapDto, CancelJobCommand, ConflictPolicyDto, CreateJobRequest, CreateRootRequest,
-    DesiredStateDto, DurableJobStatusDto, EngineSnapshotViewDto, JobDetailDto, JobPageDto,
-    JobViewDto, PatchRootRequest, PauseJobCommand, ResumeJobCommand, RetryJobCommand, RootDto,
-    RootSummaryDto, UpdateSettingsRequest,
+    DesiredStateDto, DurableJobStatusDto, EngineSnapshotViewDto, EventEnvelopeDto, JobDetailDto,
+    JobPageDto, JobViewDto, PatchRootRequest, PauseJobCommand, ResumeJobCommand, RetryJobCommand,
+    RootDto, RootSummaryDto, UpdateSettingsRequest,
 };
 use crate::api::error::ApiErrorEnvelope;
 
@@ -39,6 +39,7 @@ use crate::api::error::ApiErrorEnvelope;
         DesiredStateDto,
         DurableJobStatusDto,
         EngineSnapshotViewDto,
+        EventEnvelopeDto,
         JobViewDto,
         JobDetailDto,
         JobPageDto,

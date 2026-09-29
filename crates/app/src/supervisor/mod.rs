@@ -212,8 +212,23 @@ where
     L: EngineLauncher,
     R: LaunchResolver,
 {
+    spawn_supervisor_with_broker(EventBroker::new(256), registry, resolver, launcher, limits)
+}
+
+/// Spawns the supervisor actor publishing through the given broker, so the
+/// API layer subscribes to the same event source the supervisor writes.
+pub fn spawn_supervisor_with_broker<L, R>(
+    broker: EventBroker,
+    registry: Registry,
+    resolver: R,
+    launcher: L,
+    limits: SupervisorLimits,
+) -> SupervisorHandle
+where
+    L: EngineLauncher,
+    R: LaunchResolver,
+{
     let (tx, rx) = mpsc::channel(64);
-    let broker = EventBroker::new(256);
     let handle = SupervisorHandle {
         tx,
         broker: broker.clone(),

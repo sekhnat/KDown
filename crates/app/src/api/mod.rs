@@ -8,6 +8,7 @@ pub mod openapi;
 pub mod roots;
 pub mod security;
 pub mod settings;
+pub mod sse;
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Method};
@@ -32,6 +33,8 @@ pub struct AppState {
     pub suggested_download_root: Option<String>,
     /// Desktop integration for reveal actions; tests inject a no-op.
     pub desktop: std::sync::Arc<crate::platform::DesktopIntegration>,
+    /// Bounded event broker shared with the supervisor.
+    pub events: crate::events::EventBroker,
 }
 
 impl AppState {
@@ -56,7 +59,15 @@ impl AppState {
             build,
             suggested_download_root,
             desktop: std::sync::Arc::new(crate::platform::DesktopIntegration::native()),
+            events: crate::events::EventBroker::new(256),
         }
+    }
+
+    /// Overrides the event broker so the API subscribes to the same broker
+    /// the supervisor publishes through.
+    pub fn with_events(mut self, events: crate::events::EventBroker) -> Self {
+        self.events = events;
+        self
     }
 }
 
@@ -166,6 +177,7 @@ async fn mutation_guard(
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/bootstrap", get(bootstrap))
+        .route("/events", get(sse::stream))
         .merge(jobs::router())
         .merge(roots::router())
         .merge(settings::router())

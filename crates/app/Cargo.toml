@@ -19,6 +19,7 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.8", features = ["json", "tokio"] }
 http = "1"
 rand = "0.9"
@@ -29,3 +30,5 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 
 [dev-dependencies]
 tempfile = "3"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
