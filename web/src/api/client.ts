@@ -133,29 +133,34 @@ export type ArtifactPolicy = 'preserve_partial' | 'delete_partial' | 'keep_file_
 
 export class ApiClient {
   private csrf: string | null = null
-  private bootstrapPromise: Promise<Bootstrap> | null = null
 
-  /** Fetches bootstrap once per client instance; token stays in memory. */
-  bootstrap(): Promise<Bootstrap> {
-    this.bootstrapPromise ??= fetch('/api/v1/bootstrap', {
+  /**
+   * Fetches fresh session data on every call. The token stays in memory
+   * only; first-run completion relies on re-reading the bootstrap.
+   */
+  async bootstrap(): Promise<Bootstrap> {
+    const response = await fetch('/api/v1/bootstrap', {
       headers: { accept: 'application/json' },
       cache: 'no-store',
-    }).then(async (response) => {
-      if (!response.ok) {
-        throw new ApiError(await errorEnvelope(response), response.status)
-      }
-      const dto = (await response.json()) as BootstrapDto
-      this.csrf = dto.csrf_token
-      return {
-        csrfToken: dto.csrf_token,
-        origin: dto.origin,
-        build: dto.build,
-        streamEpoch: dto.stream_epoch,
-        suggestedDownloadRoot: dto.suggested_download_root ?? null,
-        roots: [],
-      }
     })
-    return this.bootstrapPromise
+    if (!response.ok) {
+      throw new ApiError(await errorEnvelope(response), response.status)
+    }
+    const dto = (await response.json()) as BootstrapDto
+    this.csrf = dto.csrf_token
+    return {
+      csrfToken: dto.csrf_token,
+      origin: dto.origin,
+      build: dto.build,
+      streamEpoch: dto.stream_epoch,
+      suggestedDownloadRoot: dto.suggested_download_root ?? null,
+      roots: (dto.roots ?? []).map((root) => ({
+        id: root.id,
+        label: root.label,
+        enabled: root.enabled,
+        isDefault: root.is_default,
+      })),
+    }
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {
@@ -180,6 +185,11 @@ export class ApiClient {
       body: body === undefined ? undefined : JSON.stringify(body),
       credentials: 'same-origin',
     })
+  }
+
+  /** Test seam: forget the cached bootstrap so each test starts fresh. */
+  resetBootstrapCache(): void {
+    this.csrf = null
   }
 
   async listJobs(params: JobListParams = {}): Promise<JobPage> {

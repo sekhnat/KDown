@@ -95,12 +95,26 @@ async fn bootstrap(
             "this service only accepts loopback hosts",
         ));
     }
+    let roots = state
+        .registry
+        .list_roots()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|root| crate::api::dto::RootSummaryDto {
+            id: root.id.0,
+            label: root.label,
+            enabled: root.enabled,
+            is_default: root.is_default,
+        })
+        .collect();
     let body = Json(BootstrapDto {
         csrf_token: state.security.csrf_token().to_string(),
         origin: state.security.origin().to_string(),
         build: state.build.clone(),
         stream_epoch: state.stream_epoch.clone(),
         suggested_download_root: state.suggested_download_root.clone(),
+        roots,
     });
     Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
 }

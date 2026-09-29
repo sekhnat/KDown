@@ -915,7 +915,7 @@
       },
       "BootstrapDto": {
         "type": "object",
-        "description": "Session/bootstrap data: the CSRF token plus service identity.",
+        "description": "Session/bootstrap data: the CSRF token plus service identity. Root\nsummaries let the SPA decide whether first-run setup is required\nwithout exposing absolute paths.",
         "required": [
           "csrf_token",
           "origin",
@@ -931,6 +931,12 @@
           },
           "origin": {
             "type": "string"
+          },
+          "roots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RootSummaryDto"
+            }
           },
           "stream_epoch": {
             "type": "string"

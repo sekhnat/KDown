@@ -141,7 +141,9 @@ impl From<crate::domain::JobRecord> for JobViewDto {
     }
 }
 
-/// Session/bootstrap data: the CSRF token plus service identity.
+/// Session/bootstrap data: the CSRF token plus service identity. Root
+/// summaries let the SPA decide whether first-run setup is required
+/// without exposing absolute paths.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BootstrapDto {
     pub csrf_token: String,
@@ -150,6 +152,8 @@ pub struct BootstrapDto {
     pub stream_epoch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_download_root: Option<String>,
+    #[serde(default)]
+    pub roots: Vec<RootSummaryDto>,
 }
 
 /// Request body for creating a job. Ordinary creation never carries

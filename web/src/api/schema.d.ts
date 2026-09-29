@@ -282,11 +282,16 @@ export interface components {
             kind: string;
             metrics?: null | components["schemas"]["AttemptMetricsDto"];
         };
-        /** @description Session/bootstrap data: the CSRF token plus service identity. */
+        /**
+         * @description Session/bootstrap data: the CSRF token plus service identity. Root
+         *     summaries let the SPA decide whether first-run setup is required
+         *     without exposing absolute paths.
+         */
         BootstrapDto: {
             build: string;
             csrf_token: string;
             origin: string;
+            roots?: components["schemas"]["RootSummaryDto"][];
             stream_epoch: string;
             suggested_download_root?: string | null;
         };

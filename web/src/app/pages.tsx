@@ -1,12 +1,16 @@
-import { Link } from 'react-router-dom'
+import { NewDownloadDrawer } from '../features/downloads/NewDownloadDrawer'
 
 /** Route placeholders; Tasks 10–12 replace these with real surfaces. */
 export function DownloadsPage() {
   return (
     <section aria-labelledby="downloads-heading">
-      <h1 id="downloads-heading">Downloads</h1>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+        <h1 id="downloads-heading" style={{ marginRight: 'auto' }}>
+          Downloads
+        </h1>
+        <NewDownloadDrawer />
+      </div>
       <p>The dashboard arrives with the download flows.</p>
-      <Link to="/downloads/new">New download</Link>
     </section>
   )
 }

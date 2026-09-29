@@ -180,3 +180,16 @@ async fn job_detail_includes_attempt_history() {
 
 #[allow(dead_code)] // path import used above
 fn _uses_path(_: &Path) {}
+
+#[tokio::test]
+async fn bootstrap_includes_root_summaries() {
+    let fixture = ApiFixture::new().await;
+    let body = json_body(fixture.get("/api/v1/bootstrap").await).await;
+    let roots = body["roots"].as_array().expect("roots array");
+    assert_eq!(roots.len(), 1);
+    assert!(roots[0]["id"].as_str().is_some());
+    assert_eq!(roots[0]["label"], "Downloads");
+    assert_eq!(roots[0]["is_default"], true);
+    // Bootstrap is not the administration surface: no absolute paths.
+    assert!(roots[0].get("canonical_path").is_none());
+}
