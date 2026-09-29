@@ -444,6 +444,8 @@ pub struct AttemptRecord {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub outcome: Option<AttemptOutcome>,
+    /// Resolved final artifact path once the attempt completed.
+    pub final_path: Option<std::path::PathBuf>,
 }
 
 /// A configured download root: the only place job artifacts may live.

@@ -3,18 +3,21 @@
 
 pub mod dto;
 pub mod error;
+pub mod jobs;
 pub mod openapi;
+pub mod roots;
 pub mod security;
+pub mod settings;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 
 use crate::registry::Registry;
 use crate::supervisor::SupervisorHandle;
-use dto::{BootstrapDto, CreateJobRequest, JobViewDto};
+use dto::BootstrapDto;
 
 /// Shared application state for handlers.
 #[derive(Clone, Debug)]
@@ -27,6 +30,8 @@ pub struct AppState {
     pub build: String,
     /// The XDG Downloads directory suggestion for first-run setup.
     pub suggested_download_root: Option<String>,
+    /// Desktop integration for reveal actions; tests inject a no-op.
+    pub desktop: std::sync::Arc<crate::platform::DesktopIntegration>,
 }
 
 impl AppState {
@@ -50,6 +55,7 @@ impl AppState {
             stream_epoch,
             build,
             suggested_download_root,
+            desktop: std::sync::Arc::new(crate::platform::DesktopIntegration::native()),
         }
     }
 }
@@ -86,38 +92,6 @@ async fn bootstrap(
         suggested_download_root: state.suggested_download_root.clone(),
     });
     Ok(([(header::CACHE_CONTROL, "no-store")], body).into_response())
-}
-
-/// Creates a job: validate, persist durable intent, then enqueue. The
-/// response returns the current durable job view.
-#[utoipa::path(
-    post,
-    path = "/api/v1/jobs",
-    tag = "kdown",
-    request_body = CreateJobRequest,
-    responses(
-        (status = 201, description = "Job created", body = JobViewDto),
-        (status = 422, description = "Validation failure", body = error::ApiErrorEnvelope),
-        (status = 503, description = "Service degraded", body = error::ApiErrorEnvelope)
-    )
-)]
-async fn create_job(
-    State(state): State<AppState>,
-    Json(request): Json<CreateJobRequest>,
-) -> Result<(StatusCode, Json<JobViewDto>), error::ApiError> {
-    let intent = crate::domain::JobIntent {
-        source: crate::domain::SourceUrl::parse(&request.source_url)?,
-        root_id: crate::domain::RootId::from_uuid(request.root_id),
-        relative_directory: request.relative_directory,
-        filename_override: request.filename_override,
-        conflict_policy: request.conflict_policy.map(Into::into).unwrap_or_default(),
-    };
-    // Root must exist and be enabled before intent is persisted.
-    state.registry.load_enabled_root(intent.root_id).await?;
-    let record = state.registry.insert_job(intent).await?;
-    state.supervisor.enqueue(record.id).await?;
-    let fresh = state.registry.load_job(record.id).await?;
-    Ok((StatusCode::CREATED, Json(JobViewDto::from(fresh))))
 }
 
 /// JSON 404 for every unmatched API path; the SPA fallback (Task 13) never
@@ -192,7 +166,9 @@ async fn mutation_guard(
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/bootstrap", get(bootstrap))
-        .route("/jobs", post(create_job))
+        .merge(jobs::router())
+        .merge(roots::router())
+        .merge(settings::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             mutation_guard,

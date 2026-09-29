@@ -3,8 +3,11 @@
 use utoipa::OpenApi;
 
 use crate::api::dto::{
-    BootstrapDto, ConflictPolicyDto, CreateJobRequest, DesiredStateDto, DurableJobStatusDto,
-    EngineSnapshotViewDto, JobViewDto,
+    AppSettingsDto, ArtifactPolicyDto, AttemptDto, AttemptMetricsDto, AttemptOutcomeDto,
+    BootstrapDto, CancelJobCommand, ConflictPolicyDto, CreateJobRequest, CreateRootRequest,
+    DesiredStateDto, DurableJobStatusDto, EngineSnapshotViewDto, JobDetailDto, JobPageDto,
+    JobViewDto, PatchRootRequest, PauseJobCommand, ResumeJobCommand, RetryJobCommand, RootDto,
+    RootSummaryDto, UpdateSettingsRequest,
 };
 use crate::api::error::ApiErrorEnvelope;
 
@@ -13,7 +16,21 @@ use crate::api::error::ApiErrorEnvelope;
     info(title = "KDown Local API", version = "1.0.0"),
     paths(
         crate::api::bootstrap,
-        crate::api::create_job,
+        crate::api::jobs::create_job,
+        crate::api::jobs::list_jobs,
+        crate::api::jobs::get_job,
+        crate::api::jobs::pause_job,
+        crate::api::jobs::resume_job,
+        crate::api::jobs::cancel_job,
+        crate::api::jobs::retry_job,
+        crate::api::jobs::reveal_job,
+        crate::api::jobs::delete_job,
+        crate::api::roots::list_roots,
+        crate::api::roots::create_root,
+        crate::api::roots::get_root,
+        crate::api::roots::patch_root,
+        crate::api::settings::get_settings,
+        crate::api::settings::put_settings,
     ),
     components(schemas(
         BootstrapDto,
@@ -23,6 +40,22 @@ use crate::api::error::ApiErrorEnvelope;
         DurableJobStatusDto,
         EngineSnapshotViewDto,
         JobViewDto,
+        JobDetailDto,
+        JobPageDto,
+        AttemptDto,
+        AttemptOutcomeDto,
+        AttemptMetricsDto,
+        PauseJobCommand,
+        ResumeJobCommand,
+        RetryJobCommand,
+        CancelJobCommand,
+        ArtifactPolicyDto,
+        RootDto,
+        RootSummaryDto,
+        CreateRootRequest,
+        PatchRootRequest,
+        AppSettingsDto,
+        UpdateSettingsRequest,
         ApiErrorEnvelope,
     )),
     tags(

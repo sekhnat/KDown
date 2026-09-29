@@ -7,5 +7,6 @@ pub mod engine_adapter;
 pub mod error;
 pub mod events;
 pub mod path_policy;
+pub mod platform;
 pub mod registry;
 pub mod supervisor;

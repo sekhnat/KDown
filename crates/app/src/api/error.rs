@@ -86,18 +86,21 @@ impl ApiError {
     pub fn from_app(error: AppError) -> Self {
         let status = match &error {
             AppError::NotFound => StatusCode::NOT_FOUND,
-            AppError::Conflict { .. } | AppError::InvalidTransition => StatusCode::CONFLICT,
+            AppError::Conflict { .. } | AppError::InvalidTransition | AppError::RootInUse => {
+                StatusCode::CONFLICT
+            }
             AppError::Persistence | AppError::ServiceDegraded => StatusCode::SERVICE_UNAVAILABLE,
             AppError::InvalidSourceUrl(_)
             | AppError::UnsupportedSourceScheme
             | AppError::SourceCredentialsUnsupported
             | AppError::DestinationOutsideRoot
             | AppError::RootUnavailable
-            | AppError::RootInUse
             | AppError::DestinationUnavailable
             | AppError::InvalidSettings => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::VersionExhausted => StatusCode::CONFLICT,
-            AppError::EngineLaunch(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::EngineLaunch(_) | AppError::DesktopReveal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         let field_errors = match &error {
             AppError::InvalidSourceUrl(_)
@@ -125,6 +128,12 @@ impl ApiError {
         let current_job = match error {
             AppError::Conflict { current } => Some(crate::api::dto::JobViewDto::from(*current)),
             _ => None,
+        };
+        let code = if code == "conflict" {
+            // A rejected mutation with a stale observed version.
+            "stale_control_version".to_string()
+        } else {
+            code
         };
         Self::new(
             status,

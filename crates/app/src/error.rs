@@ -57,6 +57,9 @@ pub enum AppError {
     /// The service is degraded; mutations are rejected until it recovers.
     #[error("the service is degraded and cannot accept this action right now")]
     ServiceDegraded,
+    /// Revealing a file in the desktop file manager failed.
+    #[error("the desktop file manager could not be opened")]
+    DesktopReveal(String),
 }
 
 impl AppError {
@@ -78,6 +81,7 @@ impl AppError {
             Self::InvalidSettings => "invalid_settings",
             Self::EngineLaunch(_) => "engine_launch_failed",
             Self::ServiceDegraded => "service_degraded",
+            Self::DesktopReveal(_) => "desktop_reveal_failed",
         }
     }
 

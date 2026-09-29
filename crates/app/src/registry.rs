@@ -421,6 +421,7 @@ fn attempt_from_row(row: &SqliteRow) -> Result<AttemptRecord, AppError> {
     let failure_code: Option<String> = row.try_get("failure_code").map_err(db_err)?;
     let failure_detail: Option<String> = row.try_get("failure_detail").map_err(db_err)?;
     let metrics_json: Option<String> = row.try_get("metrics_json").map_err(db_err)?;
+    let final_path: Option<String> = row.try_get("final_path").map_err(db_err)?;
 
     let parsed_outcome = match (outcome.as_deref(), finished_at) {
         (Some(kind), Some(_)) => Some(match kind {
@@ -450,6 +451,7 @@ fn attempt_from_row(row: &SqliteRow) -> Result<AttemptRecord, AppError> {
         started_at,
         finished_at,
         outcome: parsed_outcome,
+        final_path: final_path.map(PathBuf::from),
     })
 }
 
@@ -643,6 +645,18 @@ impl Registry {
         self.load_root(id).await
     }
 
+    /// Updates a root's user-facing label.
+    pub async fn rename_root(&self, id: RootId, label: &str) -> Result<RootRecord, AppError> {
+        sqlx::query("UPDATE roots SET label = ?, updated_at = ? WHERE id = ?")
+            .bind(label)
+            .bind(now_millis())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        self.load_root(id).await
+    }
+
     /// Records the default root.
     pub async fn set_default_root(&self, id: RootId) -> Result<(), AppError> {
         self.load_root(id).await?;
@@ -778,5 +792,103 @@ impl Registry {
         tx.commit().await.map_err(db_err)?;
         let attempt = self.load_attempt(id).await?;
         Ok((attempt, true))
+    }
+}
+
+impl Registry {
+    /// Like [`Registry::finish_attempt`], additionally recording the
+    /// resolved final artifact path for completed attempts.
+    pub async fn finish_attempt_with_path(
+        &self,
+        attempt_id: AttemptId,
+        outcome: AttemptOutcome,
+        final_path: Option<std::path::PathBuf>,
+    ) -> Result<AttemptRecord, AppError> {
+        let record = self.finish_attempt(attempt_id, outcome).await?;
+        if let Some(path) = final_path {
+            sqlx::query("UPDATE attempts SET final_path = ? WHERE id = ?")
+                .bind(path.to_string_lossy().into_owned())
+                .bind(attempt_id.to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(record)
+    }
+
+    /// Removes one job's durable history: attempts and the job row. Never
+    /// touches filesystem artifacts.
+    pub async fn remove_job_history(&self, id: JobId) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("DELETE FROM attempts WHERE job_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let result = sqlx::query("DELETE FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+}
+
+/// Cursor pagination over the jobs collection: newest first, ordered by
+/// `(updated_at DESC, id DESC)` so page boundaries are stable under
+/// concurrent updates.
+#[derive(Debug, Clone, Default)]
+pub struct JobPageQuery {
+    pub status: Option<DurableJobStatus>,
+    pub source_contains: Option<String>,
+    pub created_after: Option<i64>,
+    pub created_before: Option<i64>,
+    pub cursor: Option<(i64, String)>,
+    pub limit: u32,
+}
+
+impl Registry {
+    /// Returns one page plus the cursor for the following page.
+    pub async fn list_jobs_page(
+        &self,
+        query: JobPageQuery,
+    ) -> Result<(Vec<JobRecord>, Option<(i64, String)>), AppError> {
+        let limit = query.limit.clamp(1, 200);
+        let rows = sqlx::query(
+            "SELECT * FROM jobs \
+             WHERE (?1 IS NULL OR status = ?1) \
+               AND (?2 IS NULL OR instr(source_url, ?2) > 0) \
+               AND (?3 IS NULL OR created_at >= ?3) \
+               AND (?4 IS NULL OR created_at <= ?4) \
+               AND (?5 IS NULL OR updated_at < ?5 OR (updated_at = ?5 AND id < ?6)) \
+             ORDER BY updated_at DESC, id DESC \
+             LIMIT ?7",
+        )
+        .bind(query.status.map(|s| s.as_db().to_string()))
+        .bind(query.source_contains)
+        .bind(query.created_after)
+        .bind(query.created_before)
+        .bind(query.cursor.as_ref().map(|(updated, _)| *updated))
+        .bind(query.cursor.as_ref().map(|(_, id)| id.clone()))
+        .bind(limit + 1)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let mut records: Vec<JobRecord> =
+            rows.iter().map(job_from_row).collect::<Result<_, _>>()?;
+        let next_cursor = if records.len() as u32 > limit {
+            records.pop();
+            records
+                .last()
+                .map(|last| (last.updated_at, last.id.to_string()))
+        } else {
+            None
+        };
+        Ok((records, next_cursor))
     }
 }
