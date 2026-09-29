@@ -10,7 +10,7 @@ use crate::error::AppError;
 
 /// Durable job identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct JobId(uuid::Uuid);
+pub struct JobId(pub uuid::Uuid);
 
 impl JobId {
     /// Rebuilds an identifier from its persisted string form.
@@ -40,7 +40,7 @@ impl std::fmt::Display for JobId {
 
 /// Durable attempt identifier; a new attempt resets per-attempt sequencing.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AttemptId(uuid::Uuid);
+pub struct AttemptId(pub uuid::Uuid);
 
 impl AttemptId {
     /// Rebuilds an identifier from its persisted string form.
@@ -70,7 +70,7 @@ impl std::fmt::Display for AttemptId {
 
 /// Opaque configured-root identifier used by all job views and commands.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RootId(uuid::Uuid);
+pub struct RootId(pub uuid::Uuid);
 
 impl RootId {
     /// Rebuilds an identifier from its persisted string form.
@@ -101,7 +101,7 @@ impl std::fmt::Display for RootId {
 /// One-shot launch identity: retries and recovery attempts use a fresh key,
 /// while repeated work within one accepted command or startup reuses it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct LaunchKey(uuid::Uuid);
+pub struct LaunchKey(pub uuid::Uuid);
 
 impl LaunchKey {
     /// Rebuilds an identifier from its persisted string form.
