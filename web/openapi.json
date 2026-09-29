@@ -1,0 +1,1444 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "KDown Local API",
+    "description": "Local KDown download manager service",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/v1/bootstrap": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Session bootstrap: CSRF token and service identity, released only to\naccepted loopback hosts, never cached.",
+        "operationId": "bootstrap",
+        "responses": {
+          "200": {
+            "description": "Session bootstrap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BootstrapDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unexpected host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Lists jobs with stable cursor pagination, newest first.",
+        "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque continuation cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (1-200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Durable status filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "description": "Source URL substring filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Created-at lower bound (epoch ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Created-at upper bound (epoch ms)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobPageDto"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Creates a job: validate, persist durable intent, then enqueue. The\nresponse returns the current durable job view.",
+        "operationId": "create_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Job created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobViewDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service degraded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "One job with its durable attempt history.",
+        "operationId": "get_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobDetailDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Removes a terminal job's durable history. Never touches files.",
+        "operationId": "delete_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "History removed"
+          },
+          "409": {
+            "description": "Job is not terminal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/cancel": {
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Cancels the job with an explicit artifact policy.",
+        "operationId": "cancel_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelJobCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Cancel accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobViewDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale version or illegal transition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/pause": {
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Pauses the job when the caller's version is current.",
+        "operationId": "pause_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PauseJobCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobViewDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale version or illegal transition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/resume": {
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Resumes the job when the caller's version is current.",
+        "operationId": "resume_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeJobCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Resumed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobViewDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale version or illegal transition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/retry": {
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Retries a terminal job under the same history.",
+        "operationId": "retry_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetryJobCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Retry accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobViewDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stale version or illegal transition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/reveal": {
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Reveals a completed artifact's parent directory via the desktop\nintegration. Only completed jobs with a recorded resolved destination\nqualify.",
+        "operationId": "reveal_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revealed"
+          },
+          "409": {
+            "description": "Job is not completable for reveal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/roots": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Lists configured roots with canonical paths.",
+        "operationId": "list_roots",
+        "responses": {
+          "200": {
+            "description": "Root list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RootDto"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Adds an existing directory as a configured root. This is the explicit\nauthorization step, so an absolute path is expected here.",
+        "operationId": "create_root",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Root added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RootDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Path is not an existing directory",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/roots/{id}": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "One configured root.",
+        "operationId": "get_root",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Root",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RootDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Updates label, enabled state, or default flag of a root.",
+        "operationId": "patch_root",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchRootRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Root updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RootDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Root in use",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid update",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Returns the typed global settings.",
+        "operationId": "get_settings",
+        "responses": {
+          "200": {
+            "description": "Settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppSettingsDto"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "kdown"
+        ],
+        "summary": "Validates and persists settings, then applies the transfer limits to\nthe supervisor. Lowering active concurrency never cancels running work;\nit only prevents the next launch until the count falls below the limit.",
+        "operationId": "put_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Settings saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppSettingsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiErrorEnvelope": {
+        "type": "object",
+        "description": "Machine-stable error envelope: `code` identifies the failure class,\n`message` is a safe user-facing summary, and optional fields carry\nstructured context. Secrets, URL query values, and credentials never\nappear in `message` or `detail`.",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "current_job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobViewDto"
+              }
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field_errors": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AppSettingsDto": {
+        "type": "object",
+        "description": "Typed global settings as stored.",
+        "required": [
+          "active_concurrency",
+          "notifications_enabled",
+          "startup_mode"
+        ],
+        "properties": {
+          "active_concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "default_root_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
+          "rate_limit_bytes_per_second": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "startup_mode": {
+            "type": "string",
+            "description": "One of `manual`, `service`."
+          }
+        }
+      },
+      "ArtifactPolicyDto": {
+        "type": "string",
+        "description": "What cancellation should do with partial artifacts.",
+        "enum": [
+          "preserve_partial",
+          "delete_partial",
+          "keep_file_discard_checkpoint"
+        ]
+      },
+      "AttemptDto": {
+        "type": "object",
+        "description": "One attempt in a job's durable history. Absolute paths are never\nexposed here; the job view carries relative display destinations.",
+        "required": [
+          "id",
+          "reason",
+          "started_at"
+        ],
+        "properties": {
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AttemptOutcomeDto"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": "One of `initial`, `retry`, `recovery`."
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AttemptMetricsDto": {
+        "type": "object",
+        "description": "Final byte counts and wall time of an attempt.",
+        "required": [
+          "bytes_received",
+          "network_bytes",
+          "duration_ms"
+        ],
+        "properties": {
+          "bytes_received": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "network_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "AttemptOutcomeDto": {
+        "type": "object",
+        "description": "Terminal result of one attempt, display-safe.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "One of `completed`, `failed`, `cancelled`, `interrupted`."
+          },
+          "metrics": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AttemptMetricsDto"
+              }
+            ]
+          }
+        }
+      },
+      "BootstrapDto": {
+        "type": "object",
+        "description": "Session/bootstrap data: the CSRF token plus service identity. Root\nsummaries let the SPA decide whether first-run setup is required\nwithout exposing absolute paths.",
+        "required": [
+          "csrf_token",
+          "origin",
+          "build",
+          "stream_epoch"
+        ],
+        "properties": {
+          "build": {
+            "type": "string"
+          },
+          "csrf_token": {
+            "type": "string"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "roots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RootSummaryDto"
+            }
+          },
+          "stream_epoch": {
+            "type": "string"
+          },
+          "suggested_download_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CancelJobCommand": {
+        "type": "object",
+        "description": "Cancel preconditions plus the explicit artifact choice.",
+        "required": [
+          "expected_control_version",
+          "artifact_policy"
+        ],
+        "properties": {
+          "artifact_policy": {
+            "$ref": "#/components/schemas/ArtifactPolicyDto"
+          },
+          "expected_control_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ConflictPolicyDto": {
+        "type": "string",
+        "description": "What happens when the destination already exists.",
+        "enum": [
+          "fail_if_exists",
+          "overwrite",
+          "rename",
+          "resume"
+        ]
+      },
+      "CreateJobRequest": {
+        "type": "object",
+        "description": "Request body for creating a job. Ordinary creation never carries\nabsolute destinations: an opaque root ID plus relative paths only.",
+        "required": [
+          "source_url",
+          "root_id"
+        ],
+        "properties": {
+          "conflict_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConflictPolicyDto"
+              }
+            ]
+          },
+          "filename_override": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "root_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_url": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateRootRequest": {
+        "type": "object",
+        "description": "Request to add an existing directory as a configured root.",
+        "required": [
+          "label",
+          "absolute_path"
+        ],
+        "properties": {
+          "absolute_path": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "make_default": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DesiredStateDto": {
+        "type": "string",
+        "description": "User-facing desired state.",
+        "enum": [
+          "Running",
+          "Paused",
+          "Cancelled"
+        ]
+      },
+      "DurableJobStatusDto": {
+        "type": "string",
+        "description": "Durable lifecycle status as the UI presents it.",
+        "enum": [
+          "Queued",
+          "Recovering",
+          "Active",
+          "Paused",
+          "Completed",
+          "Failed",
+          "Cancelled"
+        ]
+      },
+      "EngineSnapshotViewDto": {
+        "type": "object",
+        "description": "Display-safe telemetry snapshot.",
+        "required": [
+          "state_label",
+          "bytes_received",
+          "network_bytes",
+          "reused_bytes",
+          "retries",
+          "elapsed_ms"
+        ],
+        "properties": {
+          "bytes_received": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "network_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "retries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reused_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state_label": {
+            "type": "string"
+          }
+        }
+      },
+      "EventEnvelopeDto": {
+        "type": "object",
+        "description": "One SSE stream event. `job` carries the complete display-safe view for\n`job.snapshot`; `hello` carries the stream epoch and build identity.",
+        "required": [
+          "kind",
+          "stream_epoch"
+        ],
+        "properties": {
+          "build": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "job": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JobViewDto"
+              }
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "One of `hello`, `job.snapshot`, `job.removed`, `settings.changed`,\n`service.degraded`."
+          },
+          "stream_epoch": {
+            "type": "string",
+            "description": "Process stream epoch: changes across service restarts."
+          }
+        }
+      },
+      "JobDetailDto": {
+        "type": "object",
+        "description": "One job with its durable attempt history.",
+        "required": [
+          "job",
+          "attempts"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttemptDto"
+            }
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobViewDto"
+          }
+        }
+      },
+      "JobPageDto": {
+        "type": "object",
+        "description": "One page of the jobs collection.",
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobViewDto"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "JobViewDto": {
+        "type": "object",
+        "description": "Display-safe job view. Source URLs are redacted; filesystem paths are\nreduced to relative display form.",
+        "required": [
+          "id",
+          "status",
+          "desired_state",
+          "control_version",
+          "sample_seq",
+          "source_display",
+          "root_id",
+          "root_label",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "attempt_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "control_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "desired_state": {
+            "$ref": "#/components/schemas/DesiredStateDto"
+          },
+          "destination_display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Final display destination relative to the root, once completed."
+          },
+          "filename_override": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "relative_directory": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "root_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "root_label": {
+            "type": "string",
+            "description": "Root label; ordinary job views never carry absolute paths."
+          },
+          "sample_seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "snapshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EngineSnapshotViewDto"
+              }
+            ]
+          },
+          "source_display": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DurableJobStatusDto"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "PatchRootRequest": {
+        "type": "object",
+        "description": "Partial root update.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "make_default": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "PauseJobCommand": {
+        "type": "object",
+        "description": "Lifecycle command preconditions: the caller's last observed version.",
+        "required": [
+          "expected_control_version"
+        ],
+        "properties": {
+          "expected_control_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ResumeJobCommand": {
+        "type": "object",
+        "description": "Resume preconditions.",
+        "required": [
+          "expected_control_version"
+        ],
+        "properties": {
+          "expected_control_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RetryJobCommand": {
+        "type": "object",
+        "description": "Retry preconditions.",
+        "required": [
+          "expected_control_version"
+        ],
+        "properties": {
+          "expected_control_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RootDto": {
+        "type": "object",
+        "description": "A configured root as the administration surface presents it. This is\nthe only DTO family that may carry absolute filesystem paths.",
+        "required": [
+          "id",
+          "label",
+          "canonical_path",
+          "enabled",
+          "is_default",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "canonical_path": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "RootSummaryDto": {
+        "type": "object",
+        "description": "Root identity without filesystem paths, safe for bootstrap.",
+        "required": [
+          "id",
+          "label",
+          "enabled",
+          "is_default"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_default": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateSettingsRequest": {
+        "type": "object",
+        "description": "Full settings update (PUT semantics: every field is required).",
+        "required": [
+          "active_concurrency",
+          "notifications_enabled",
+          "startup_mode"
+        ],
+        "properties": {
+          "active_concurrency": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "default_root_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "notifications_enabled": {
+            "type": "boolean"
+          },
+          "rate_limit_bytes_per_second": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "startup_mode": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "kdown",
+      "description": "Local download management API"
+    }
+  ]
+}

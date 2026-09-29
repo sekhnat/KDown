@@ -94,6 +94,23 @@ unknown or the rate is below the engine's meaningfulness threshold
 (1 KiB/s). Exit codes: 0 success, 1 download failure, 2 usage or
 configuration error.
 
+## Desktop app: the local web UI
+
+Alongside the library, the workspace ships `kdown-app`: a local download
+manager with a browser UI. It serves a bundled single-page app and a
+loopback-only API from one process, with first-run root setup, live
+dashboard telemetry, pause/resume/cancel with explicit artifact choices,
+history, and automatic recovery after a restart.
+
+```sh
+./scripts/build_app.sh
+./target/release/kdown-app serve --open
+```
+
+See [docs/web-ui.md](docs/web-ui.md) for the walkthrough and
+[docs/security-local-ui.md](docs/security-local-ui.md) for the security
+model. Linux is the supported platform for the desktop app.
+
 ## Supported surface and versioning
 
 `kdown-engine` 0.1 was followed by a **breaking** API cleanup: success and

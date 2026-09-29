@@ -1,0 +1,12 @@
+[Unit]
+Description=KDown local download manager
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kdown-app serve
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

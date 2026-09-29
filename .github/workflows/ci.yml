@@ -184,6 +184,51 @@ jobs:
           retention-days: 90
 
 
+  web-e2e:
+    # Frontend lane (task 14): API generation drift check, lint, unit tests,
+    # frontend build, the bundled host build, and real-browser acceptance.
+    # The correctness/durability matrix and MSRV stay Node-free.
+    name: web-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: web
+      - name: API drift check (regeneration must not change tracked files)
+        run: |
+          cargo run --locked -p kdown-app --example export_openapi -- web/openapi.json
+          (cd web && npm run generate:api)
+          git diff --exit-code -- web/openapi.json web/src/api/schema.d.ts
+      - name: Lint
+        run: npm run lint
+        working-directory: web
+      - name: Unit tests
+        run: npx vitest run
+        working-directory: web
+      - name: Frontend build
+        run: npm run build
+        working-directory: web
+      - name: Bundled host build
+        run: cargo build --locked --release -p kdown-app --features bundled-web
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+      - name: Browser acceptance
+        run: ../scripts/e2e_web.sh
+        working-directory: web
+
+
   fmt:
     runs-on: ubuntu-latest
     steps:
