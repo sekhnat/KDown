@@ -38,7 +38,7 @@ type CompletionStream = FuturesUnordered<
     std::pin::Pin<Box<dyn Future<Output = (JobId, AttemptId, EngineOutcome)> + Send>>,
 >;
 
-/// Resolves launch destinations. Implemented by [`PathPolicy`]; tests may
+/// Resolves launch destinations. Implemented by [`crate::path_policy::PathPolicy`]; tests may
 /// wrap it to observe or gate resolution.
 pub trait LaunchResolver: Send + Sync + 'static {
     fn resolve_for_launch(

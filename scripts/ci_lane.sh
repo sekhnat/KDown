@@ -85,7 +85,7 @@ run_lane() {
     --artifact "$log" \
     --max-age-days "$max_age" \
     "${cmd_args[@]}" \
-    "${extra[@]}"
+    ${extra[@]+"${extra[@]}"}
   return "$failed"
 }
 
